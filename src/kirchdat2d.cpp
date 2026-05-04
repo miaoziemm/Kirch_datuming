@@ -15,947 +15,245 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ------------------------------------------------------------
-   Nearest index on a regular axis.
------------------------------------------------------------- */
-static int nearest_index(float x, float o, float d, int n)
+
+
+int main(int argc, char* argv[])
 {
-    if (n <= 0 || fabsf(d) <= 0.0f) return -1;
+    bool verb;
+    int it, nt, ih, nh, is, ns, nsg, nrg, left, right, ic, aper, shift, c, cc, hh;
+    int ir, nr, jump, sleft, sright, tap;
+    float sdatum, rdatum, length, t0, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau, delta;
+    float r, dr, s, h, coef;
+    float ***tr_in, ***tr_out, **stable, **rtable;
+    sf_file in, out, sgreen, rgreen, interm;
 
-    int i = (int)floorf((x - o) / d + 0.5f);
+    sf_init (argc,argv);
+    in = sf_input("in");
+    out = sf_output("out");
+    
+    if (!sf_getbool("verb",&verb)) verb=false;
+    /* verbosity flag */
 
-    if (i < 0 || i >= n) return -1;
-    return i;
+    if (!sf_getfloat("sdatum",&sdatum)) sf_error("Need sdatum=");
+    /* source datum depth */
+
+    if (!sf_getfloat("rdatum",&rdatum)) sf_error("Need rdatum=");
+    /* receiver datum depth */
+
+    if (!sf_getint("aperture",&aper)) aper=50;
+    /* aperture (number of traces) */
+
+    if (!sf_getint("taper",&tap)) tap=10;
+    /* taper (number of traces) */
+
+    if (!sf_getfloat("length",&length)) length=0.025;
+    /* filter length (in seconds) */
+
+    /* read input */
+    if (!sf_histint(in,"n1",&nt)) sf_error("No nt=");
+    if (!sf_histint(in,"n2",&nh)) sf_error("No nh=");
+    if (!sf_histint(in,"n3",&ns)) sf_error("No ns=");
+
+    if (!sf_histfloat(in,"o1",&t0)) sf_error("No t0=");
+    if (!sf_histfloat(in,"d1",&dt)) sf_error("No dt=");
+
+    if (!sf_histfloat(in,"o2",&h0)) sf_error("No h0=");
+    if (!sf_histfloat(in,"d2",&dh)) sf_error("No dh=");
+
+    if (!sf_histfloat(in,"o3",&s0)) sf_error("No s0=");
+    if (!sf_histfloat(in,"d3",&ds)) sf_error("No ds=");
+
+    tr_in = sf_floatalloc3(nt,nh,ns);
+    sf_floatread(tr_in[0][0],nt*nh*ns,in);
+
+    /* allocate memory for output */
+    tr_out = sf_floatalloc3(nt,nh,ns);
+
+    /* read Green's function (source) */
+    sgreen = sf_input("sgreen");
+
+    if (!sf_histint(sgreen,"n1",&nsg)) sf_error("No nsg=");
+    if (!sf_histfloat(sgreen,"o1",&sg0)) sf_error("No sg0=");
+    if (!sf_histfloat(sgreen,"d1",&dsg)) sf_error("No dsg=");
+
+    stable = sf_floatalloc2(nsg,nsg);
+    sf_floatread(stable[0],nsg*nsg,sgreen);
+    sf_fileclose(sgreen);
+
+    /* read Green's function (receiver) */
+    rgreen = sf_input("rgreen");
+
+    if (!sf_histint(rgreen,"n1",&nrg)) sf_error("No nrg=");
+    if (!sf_histfloat(rgreen,"o1",&rg0)) sf_error("No rg0=");
+    if (!sf_histfloat(rgreen,"d1",&drg)) sf_error("No drg=");
+
+    rtable = sf_floatalloc2(nrg,nrg);
+    sf_floatread(rtable[0],nrg*nrg,rgreen);
+    sf_fileclose(rgreen);
+
+    /* output intermediate traces */
+    if (NULL != sf_getstring("interm")) {
+	interm = sf_output("interm");
+    } else {
+	interm = NULL;
+    }
+
+    /* initialize */
+    filt_init(dt,length);
+
+    /* common-shot gather */
+#ifdef _OPENMP
+#pragma omp parallel for private(ih,c,left,right,ic,cc,coef,tau,dist,shift,it,delta)
+#endif
+    for (is=0; is < ns; is++) {
+	if (verb) sf_warning("Processing common-shot gather %d of %d.",is+1,ns);
+
+	for (ih=0; ih < nh; ih++) {
+
+	    c = (s0+is*ds+h0+ih*dh-rg0)/drg+0.5;
+	    if (c < 0 || c > nrg-1) sf_error("Receiver table too small.");
+
+	    /* aperture */
+	    left  = (ih-aper < 0)?    0:    ih-aper;
+	    right = (ih+aper > nh-1)? nh-1: ih+aper;
+	    
+	    for (ic=left; ic <= right; ic++) {
+		
+		cc = (s0+is*ds+h0+ic*dh-rg0)/drg+0.5;
+		if (cc < 0 || cc > nrg-1) sf_error("Receiver table too small.");
+
+		/* taper coefficient */
+		coef = 1.;
+		coef *= (ic-left  >= tap)? 1.: (ic-left)/tap;
+		coef *= (right-ic >= tap)? 1.: (right-ic)/tap;
+
+		/* time delay */
+		tau = rtable[cc][c];
+
+		/* distance */
+		dist = rdatum*rdatum+(ic-ih)*dh*(ic-ih)*dh;
+
+		/* filter (tau dependent) */
+		filt_set(tau);
+
+		shift = 0;
+		delta = 0.;
+		for (it=0; it < nt; it++) {
+		    if (((float)it)*dt < tau) 
+			continue;
+		    else if (shift == 0)
+			delta = (((float)it*dt)-tau)/dt;
+
+		    tr_out[is][ih][it] += coef/SF_PI
+			*dh*rdatum*tau/dist
+			*kirdat_pick(delta,tr_in[is][ic],shift);
+		    shift++;
+		}
+	    }
+
+	}
+    }
+
+    if (NULL != interm) sf_floatwrite(tr_out[0][0],nt*nh*ns,interm);
+
+    /* zero input */
+    for (is=0; is < ns; is++) {
+	for (ih=0; ih < nh; ih++) {
+	    for (it=0; it < nt; it++) {
+		tr_in[is][ih][it] = 0.;
+	    }
+	}
+    }
+
+    /* acquisition */
+    s = fabsf((ns-1)*ds);
+    h = fabsf((nh-1)*dh);
+
+    if (fabsf(ds) >= fabsf(dh)) {
+	dr = fabsf(dh);
+	jump = 1;
+    } else {
+	dr = fabsf(ds);
+	jump = dh/ds+0.5;
+    }
+    
+    nr = (s+h)/dr+1.5;
+
+    /* common-receiver gather */
+#ifdef _OPENMP
+#pragma omp parallel for private(r,sleft,sright,is,c,ih,left,right,ic,cc,hh,coef,tau,dist,shift,it,delta)
+#endif
+    for (ir=0; ir < nr; ir++) {
+	if (verb) sf_warning("Processing common-receiver gather %d of %d.",ir+1,nr);
+
+	r = ir*dr+((ds<=0.)?-1.:0.)*s+((dh<=0.)?-1.:0.)*h;
+	
+	/* source receiver reciprocity */
+	sleft  = (ir*dr+((ds<=0.)?-1.:0.)*s+((ds<=0.)?0.:-1.)*h)/ds+0.5;
+	sright = (ir*dr+((ds<=0.)?-1.:0.)*s+((ds<=0.)?-1.:0.)*h)/ds+0.5;
+
+	if (sleft < 0) sleft = 0;
+	if (sright > ns-1) sright = ns-1;
+	
+	/* in case of fabsf(ds)>=fabsf(dh) */
+	left = (r-sleft*ds)/dh+0.5;
+	if (left < 0 || left > nh-1) sleft++;
+
+	right = (r-sright*ds)/dh+0.5;
+	if (right < 0 || right > nh-1) sright--;
+
+	for (is=sleft; is <= sright; is=is+jump) {
+	    
+	    c = (s0+is*ds-sg0)/dsg+0.5;
+	    if (c < 0 || c > nsg-1) sf_error("Source table too small.");
+
+	    ih = (r-is*ds)/dh+0.5;
+	    
+	    /* aperture */
+	    left  = (is-jump*aper < sleft)?  sleft:  is-jump*aper;
+	    right = (is+jump*aper > sright)? sright: is+jump*aper;
+	    
+	    for (ic=left; ic <= right; ic=ic+jump) {
+		
+		cc = (s0+ic*ds-sg0)/dsg+0.5;
+		if (cc < 0 || cc > nsg-1) sf_error("Source table too small.");
+
+		hh = (r-ic*ds)/dh+0.5;
+
+		/* taper coefficient */
+		coef = 1.;
+		coef *= (ic-left  >= tap)? 1.: (ic-left)/jump/tap;
+		coef *= (right-ic >= tap)? 1.: (right-ic)/jump/tap;
+		
+		/* time delay */
+		tau = stable[cc][c];
+		
+		/* distance */
+		dist = sdatum*sdatum+(ic-is)*ds*(ic-is)*ds;
+		
+		/* filter (tau dependent) */
+		filt_set(tau);
+		
+		shift = 0;
+		delta = 0.;
+		for (it=0; it < nt; it++) {
+		    if (((float)it)*dt < tau) 
+			continue;
+		    else if (shift == 0)
+			delta = (((float)it*dt)-tau)/dt;
+		    
+		    tr_in[is][ih][it] += coef/SF_PI
+			*ds*sdatum*tau/dist
+			*pick(delta,tr_out[ic][hh],shift);
+		    shift++;
+		}
+	    }
+	}	
+    }
+
+    /* write output */
+    sf_floatwrite(tr_in[0][0],nt*nh*ns,out);
+
+    exit(0);
 }
 
-/* ------------------------------------------------------------
-   Receiver coordinate.
-
-   cmp = 0:
-       h is absolute receiver coordinate.
-       xr = h
-
-   cmp = 1:
-       h is offset.
-       xr = xs + h
------------------------------------------------------------- */
-static float receiver_x(int cmp, float xs, float h)
-{
-    return cmp ? (xs + h) : h;
-}
-
-/* ------------------------------------------------------------
-   Smooth aperture taper.
------------------------------------------------------------- */
-static float taper_coef(int i, int left, int right, int tap)
-{
-    if (tap <= 0) return 1.0f;
-    if (right <= left) return 1.0f;
-
-    int width = right - left;
-    int et = tap;
-
-    if (2 * et > width)
-        et = width / 2;
-
-    if (et <= 0) return 1.0f;
-
-    float coef = 1.0f;
-
-    int dl = i - left;
-    int dr = right - i;
-
-    if (dl < et)
-    {
-        float u = (float)dl / (float)et;
-        coef *= 0.5f * (1.0f - cosf((float)M_PI * u));
-    }
-
-    if (dr < et)
-    {
-        float u = (float)dr / (float)et;
-        coef *= 0.5f * (1.0f - cosf((float)M_PI * u));
-    }
-
-    if (coef < 0.0f) coef = 0.0f;
-    if (coef > 1.0f) coef = 1.0f;
-
-    return coef;
-}
-
-/* ------------------------------------------------------------
-   Bilinear interpolation from raw 3-D traveltime table.
-
-   Raw traveltime table layout:
-
-       n1 = nz
-       n2 = nx
-       n3 = number of source positions
-
-   In memory:
-
-       tt_raw[isrc][iz + ix * nz]
-
------------------------------------------------------------- */
-static float sample_tt_raw(
-    float **tt_raw,
-    int isrc,
-    int nsrc,
-    int nz,
-    int nx,
-    float z0,
-    float dz,
-    float x0,
-    float dx,
-    float z,
-    float x)
-{
-    if (tt_raw == NULL) return -1.0f;
-    if (isrc < 0 || isrc >= nsrc) return -1.0f;
-
-    if (nz <= 1 || nx <= 1) return -1.0f;
-    if (fabsf(dz) <= 0.0f || fabsf(dx) <= 0.0f) return -1.0f;
-
-    float fz = (z - z0) / dz;
-    float fx = (x - x0) / dx;
-
-    if (fz < 0.0f || fz > (float)(nz - 1)) return -1.0f;
-    if (fx < 0.0f || fx > (float)(nx - 1)) return -1.0f;
-
-    int iz0 = (int)floorf(fz);
-    int ix0 = (int)floorf(fx);
-
-    float wz = fz - (float)iz0;
-    float wx = fx - (float)ix0;
-
-    if (iz0 >= nz - 1)
-    {
-        iz0 = nz - 2;
-        wz = 1.0f;
-    }
-
-    if (ix0 >= nx - 1)
-    {
-        ix0 = nx - 2;
-        wx = 1.0f;
-    }
-
-    int iz1 = iz0 + 1;
-    int ix1 = ix0 + 1;
-
-    int i00 = iz0 + ix0 * nz;
-    int i10 = iz1 + ix0 * nz;
-    int i01 = iz0 + ix1 * nz;
-    int i11 = iz1 + ix1 * nz;
-
-    float v00 = tt_raw[isrc][i00];
-    float v10 = tt_raw[isrc][i10];
-    float v01 = tt_raw[isrc][i01];
-    float v11 = tt_raw[isrc][i11];
-
-    if (v00 < 0.0f || v10 < 0.0f || v01 < 0.0f || v11 < 0.0f)
-        return -1.0f;
-
-    float v0 = (1.0f - wz) * v00 + wz * v10;
-    float v1 = (1.0f - wz) * v01 + wz * v11;
-
-    return (1.0f - wx) * v0 + wx * v1;
-}
-
-/* ------------------------------------------------------------
-   Build source pairwise traveltime matrix.
-
-   Input raw source traveltime:
-
-       stable_raw[raw_source_index][iz + ix * nz]
-
-   Output pairwise table:
-
-       stable_pair[input_shot_index][output_shot_index]
-
-   Meaning:
-
-       stable_pair[ic][is]
-       = traveltime from input source xs_in(ic)
-         to output datum point (xs_out(is), sdatum)
-
------------------------------------------------------------- */
-static void build_source_pair_table(
-    float **stable_pair,
-    float **stable_raw,
-    int ns,
-    float s0,
-    float ds,
-    int sny,
-    float sy0,
-    float sdy,
-    int snz,
-    int snx,
-    float sz0,
-    float sdz,
-    float sx0,
-    float sdx,
-    float sdatum)
-{
-    for (int is_in = 0; is_in < ns; is_in++)
-    {
-        float xs_in = s0 + is_in * ds;
-        int is_raw = nearest_index(xs_in, sy0, sdy, sny);
-
-        for (int is_out = 0; is_out < ns; is_out++)
-        {
-            float xs_out = s0 + is_out * ds;
-
-            if (is_raw < 0)
-            {
-                stable_pair[is_in][is_out] = -1.0f;
-                continue;
-            }
-
-            stable_pair[is_in][is_out] = sample_tt_raw(
-                stable_raw,
-                is_raw,
-                sny,
-                snz,
-                snx,
-                sz0,
-                sdz,
-                sx0,
-                sdx,
-                sdatum,
-                xs_out
-            );
-        }
-    }
-}
-
-/* ------------------------------------------------------------
-   Build receiver pairwise traveltime matrix for one shot.
-
-   Input raw receiver traveltime:
-
-       rtable_raw[raw_receiver_index][iz + ix * nz]
-
-   Output pairwise table:
-
-       rtable_pair[input_receiver_index][output_receiver_index]
-
-   Meaning:
-
-       rtable_pair[ic][ih]
-       = traveltime from input receiver xr_in(ic)
-         to output datum point (xr_out(ih), rdatum)
-
-   For cmp=1, receiver coordinate depends on current shot xs.
------------------------------------------------------------- */
-static void build_receiver_pair_table_for_shot(
-    float **rtable_pair,
-    float **rtable_raw,
-    int cmp,
-    float xs,
-    int nh,
-    float h0,
-    float dh,
-    int rny,
-    float ry0,
-    float rdy,
-    int rnz,
-    int rnx,
-    float rz0,
-    float rdz,
-    float rx0,
-    float rdx,
-    float rdatum)
-{
-    for (int ih_in = 0; ih_in < nh; ih_in++)
-    {
-        float h_in = h0 + ih_in * dh;
-        float xr_in = receiver_x(cmp, xs, h_in);
-
-        int ir_raw = nearest_index(xr_in, ry0, rdy, rny);
-
-        for (int ih_out = 0; ih_out < nh; ih_out++)
-        {
-            float h_out = h0 + ih_out * dh;
-            float xr_out = receiver_x(cmp, xs, h_out);
-
-            if (ir_raw < 0)
-            {
-                rtable_pair[ih_in][ih_out] = -1.0f;
-                continue;
-            }
-
-            rtable_pair[ih_in][ih_out] = sample_tt_raw(
-                rtable_raw,
-                ir_raw,
-                rny,
-                rnz,
-                rnx,
-                rz0,
-                rdz,
-                rx0,
-                rdx,
-                rdatum,
-                xr_out
-            );
-        }
-    }
-}
-
-/* ------------------------------------------------------------
-   Add time-shifted trace.
-
-   tau is traveltime shift in seconds.
------------------------------------------------------------- */
-static void add_shifted_trace(
-    float *out_trace,
-    float *in_trace,
-    int nt,
-    float dt,
-    float tau,
-    float weight)
-{
-    if (out_trace == NULL || in_trace == NULL) return;
-    if (nt <= 0 || dt <= 0.0f) return;
-    if (tau < 0.0f) return;
-    if (fabsf(weight) <= 0.0f) return;
-
-    filt_set(tau);
-
-    int it0 = (int)ceilf(tau / dt);
-
-    if (it0 < 0) it0 = 0;
-    if (it0 >= nt) return;
-
-    float delta = ((float)it0 * dt - tau) / dt;
-
-    int shift = 0;
-
-    for (int it = it0; it < nt; it++)
-    {
-        float samp = kirdat_pick(delta, in_trace, shift);
-        out_trace[it] += weight * samp;
-        shift++;
-    }
-}
-
-int main(int argc, char *argv[])
-{
-    if (argc < 2)
-    {
-        kirchdat2d_help::print_help();
-        return 1;
-    }
-
-    const char *in_f = NULL;
-    const char *out_f = NULL;
-    const char *sg_f = NULL;
-    const char *rg_f = NULL;
-    const char *interm_f = NULL;
-
-    sep_t *in = NULL;
-    sep_t *out = NULL;
-    sep_t *sgreen = NULL;
-    sep_t *rgreen = NULL;
-    sep_t *interm = NULL;
-
-    int verb = 0;
-    int cmp = 0;
-    int amp = 1;
-
-    int nt = 0;
-    int nh = 0;
-    int ns = 0;
-
-    float t0 = 0.0f;
-    float dt = 0.0f;
-
-    float h0 = 0.0f;
-    float dh = 0.0f;
-
-    float s0 = 0.0f;
-    float ds = 0.0f;
-
-    float rdatum = 0.0f;
-    float sdatum = 0.0f;
-
-    int aperture = 50;
-    int raper = 50;
-    int saper = 50;
-    int tap = 10;
-
-    float length = 0.025f;
-
-    float ***tr_in = NULL;
-    float ***tr_rec = NULL;
-    float ***tr_out = NULL;
-
-    /*
-       Raw traveltime tables:
-
-       n1 = nz
-       n2 = nx
-       n3 = number of source positions
-
-       raw_table[isrc][iz + ix * nz]
-    */
-    float **rtable_raw = NULL;
-    float **stable_raw = NULL;
-
-    /*
-       Pairwise traveltime tables:
-
-       rtable_pair[input_receiver][output_receiver]
-       stable_pair[input_shot][output_shot]
-    */
-    float **rtable_pair = NULL;
-    float **stable_pair = NULL;
-
-    int rnz = 0;
-    int rnx = 0;
-    int rny = 0;
-
-    float rz0 = 0.0f;
-    float rdz = 0.0f;
-
-    float rx0 = 0.0f;
-    float rdx = 0.0f;
-
-    float ry0 = 0.0f;
-    float rdy = 0.0f;
-
-    off_t rnzx = 0;
-
-    int snz = 0;
-    int snx = 0;
-    int sny = 0;
-
-    float sz0 = 0.0f;
-    float sdz = 0.0f;
-
-    float sx0 = 0.0f;
-    float sdx = 0.0f;
-
-    float sy0 = 0.0f;
-    float sdy = 0.0f;
-
-    off_t snzx = 0;
-
-    long long n_r_skip = 0;
-    long long n_s_skip = 0;
-
-    se_par_init(argc, argv);
-
-    if (!se_have_par("in"))
-        ERROR(("Need in="));
-    else
-        in_f = se_get_par_str("in");
-
-    if (!se_have_par("out"))
-        ERROR(("Need out="));
-    else
-        out_f = se_get_par_str("out");
-
-    if (!se_have_par("rdatum"))
-        ERROR(("Need rdatum="));
-    else
-        rdatum = se_get_par_float("rdatum");
-
-    if (!se_have_par("sdatum"))
-        ERROR(("Need sdatum="));
-    else
-        sdatum = se_get_par_float("sdatum");
-
-    if (!se_have_par("verb"))
-        verb = 0;
-    else
-        verb = se_get_par_int("verb");
-
-    if (!se_have_par("cmp"))
-        cmp = 0;
-    else
-        cmp = se_get_par_int("cmp");
-
-    if (!se_have_par("aperture"))
-        aperture = 50;
-    else
-        aperture = se_get_par_int("aperture");
-
-    if (!se_have_par("raper"))
-        raper = aperture;
-    else
-        raper = se_get_par_int("raper");
-
-    if (!se_have_par("saper"))
-        saper = aperture;
-    else
-        saper = se_get_par_int("saper");
-
-    if (!se_have_par("taper"))
-        tap = 10;
-    else
-        tap = se_get_par_int("taper");
-
-    if (!se_have_par("length"))
-        length = 0.025f;
-    else
-        length = se_get_par_float("length");
-
-    if (!se_have_par("amp"))
-        amp = 1;
-    else
-        amp = se_get_par_int("amp");
-
-    /*
-       amp=1:
-           use simplified Kirchhoff datuming amplitude weight.
-
-       amp=0:
-           use only aperture taper coefficient.
-           This is useful for testing kinematic extrapolation.
-    */
-
-    in = sep_open(in_f, SEP_READ, 0);
-    out = sep_open(out_f, SEP_WRITE, 0);
-
-    /*
-       Input seismic data layout:
-
-       n1 = time
-       n2 = receiver coordinate or offset
-       n3 = shot
-    */
-    nt = in->headers->n[0];
-    t0 = (float)in->headers->o[0];
-    dt = (float)in->headers->d[0];
-
-    nh = in->headers->n[1];
-    h0 = (float)in->headers->o[1];
-    dh = (float)in->headers->d[1];
-
-    ns = in->headers->n[2];
-    s0 = (float)in->headers->o[2];
-    ds = (float)in->headers->d[2];
-
-    if (nt <= 0 || nh <= 0 || ns <= 0)
-        ERROR(("Invalid input data dimensions."));
-
-    if (dt <= 0.0f)
-        ERROR(("Invalid dt."));
-
-    if (verb)
-    {
-        WARN(("Input data: nt=%d, t0=%g, dt=%g", nt, t0, dt));
-        WARN(("Input data: nh=%d, h0=%g, dh=%g", nh, h0, dh));
-        WARN(("Input data: ns=%d, s0=%g, ds=%g", ns, s0, ds));
-        WARN(("cmp=%d, rdatum=%g, sdatum=%g", cmp, rdatum, sdatum));
-        WARN(("aperture=%d, raper=%d, saper=%d, taper=%d, length=%g, amp=%d",
-              aperture, raper, saper, tap, length, amp));
-    }
-
-    off_t ndata = (off_t)nt * (off_t)nh * (off_t)ns;
-
-    tr_in  = alloc3float(nt, nh, ns);
-    tr_rec = alloc3float(nt, nh, ns);
-    tr_out = alloc3float(nt, nh, ns);
-
-    se_fsio_read_float(in->data->io, tr_in[0][0], ndata);
-
-    memset(tr_rec[0][0], 0, ndata * sizeof(float));
-    memset(tr_out[0][0], 0, ndata * sizeof(float));
-
-    /*
-       ------------------------------------------------------------
-       Read receiver-side raw traveltime table.
-
-       Required format:
-
-           n1 = nz
-           n2 = nx
-           n3 = number of receiver-source positions
-
-       n3 axis:
-           o3/d3 must be actual receiver-source coordinate.
-       ------------------------------------------------------------
-    */
-    if (fabsf(rdatum) > 0.0f)
-    {
-        if (!se_have_par("rgreen"))
-            ERROR(("Need rgreen= when rdatum is nonzero."));
-        else
-            rg_f = se_get_par_str("rgreen");
-
-        rgreen = sep_open(rg_f, SEP_READ, 0);
-
-        rnz = rgreen->headers->n[0];
-        rz0 = (float)rgreen->headers->o[0];
-        rdz = (float)rgreen->headers->d[0];
-
-        rnx = rgreen->headers->n[1];
-        rx0 = (float)rgreen->headers->o[1];
-        rdx = (float)rgreen->headers->d[1];
-
-        rny = rgreen->headers->n[2];
-        ry0 = (float)rgreen->headers->o[2];
-        rdy = (float)rgreen->headers->d[2];
-
-        rnzx = (off_t)rnz * (off_t)rnx;
-
-        if (rnz <= 0 || rnx <= 0 || rny <= 0)
-            ERROR(("Invalid rgreen dimensions."));
-
-        rtable_raw = alloc2float(rnzx, rny);
-        se_fsio_read_float(rgreen->data->io, rtable_raw[0], rnzx * rny);
-        sep_close(rgreen);
-
-        rtable_pair = alloc2float(nh, nh);
-
-        if (verb)
-        {
-            WARN(("Receiver raw traveltime table: nz=%d, z0=%g, dz=%g", rnz, rz0, rdz));
-            WARN(("Receiver raw traveltime table: nx=%d, x0=%g, dx=%g", rnx, rx0, rdx));
-            WARN(("Receiver raw traveltime table: n3=%d, y0=%g, dy=%g", rny, ry0, rdy));
-        }
-    }
-
-    /*
-       ------------------------------------------------------------
-       Read source-side raw traveltime table.
-
-       Required format:
-
-           n1 = nz
-           n2 = nx
-           n3 = number of source positions
-
-       n3 axis:
-           o3/d3 must be actual source coordinate.
-       ------------------------------------------------------------
-    */
-    if (fabsf(sdatum) > 0.0f)
-    {
-        if (!se_have_par("sgreen"))
-            ERROR(("Need sgreen= when sdatum is nonzero."));
-        else
-            sg_f = se_get_par_str("sgreen");
-
-        sgreen = sep_open(sg_f, SEP_READ, 0);
-
-        snz = sgreen->headers->n[0];
-        sz0 = (float)sgreen->headers->o[0];
-        sdz = (float)sgreen->headers->d[0];
-
-        snx = sgreen->headers->n[1];
-        sx0 = (float)sgreen->headers->o[1];
-        sdx = (float)sgreen->headers->d[1];
-
-        sny = sgreen->headers->n[2];
-        sy0 = (float)sgreen->headers->o[2];
-        sdy = (float)sgreen->headers->d[2];
-
-        snzx = (off_t)snz * (off_t)snx;
-
-        if (snz <= 0 || snx <= 0 || sny <= 0)
-            ERROR(("Invalid sgreen dimensions."));
-
-        stable_raw = alloc2float(snzx, sny);
-        se_fsio_read_float(sgreen->data->io, stable_raw[0], snzx * sny);
-        sep_close(sgreen);
-
-        stable_pair = alloc2float(ns, ns);
-
-        /*
-           Build stable_pair once.
-
-           stable_pair[ic][is]
-           = traveltime from input shot ic
-             to output datum point of shot is.
-        */
-        build_source_pair_table(
-            stable_pair,
-            stable_raw,
-            ns,
-            s0,
-            ds,
-            sny,
-            sy0,
-            sdy,
-            snz,
-            snx,
-            sz0,
-            sdz,
-            sx0,
-            sdx,
-            fabsf(sdatum)
-        );
-
-        if (verb)
-        {
-            WARN(("Source raw traveltime table: nz=%d, z0=%g, dz=%g", snz, sz0, sdz));
-            WARN(("Source raw traveltime table: nx=%d, x0=%g, dx=%g", snx, sx0, sdx));
-            WARN(("Source raw traveltime table: n3=%d, y0=%g, dy=%g", sny, sy0, sdy));
-            WARN(("Source pairwise traveltime table has been built."));
-        }
-    }
-
-    /*
-       Output headers.
-    */
-    sep_set_axis(out, 0, nt, t0, dt, "Time");
-    sep_set_axis(out, 1, nh, h0, dh, cmp ? "Offset" : "Receiver");
-    sep_set_axis(out, 2, ns, s0, ds, "Shot");
-    sep_write_headers(out);
-
-    if (se_have_par("interm"))
-    {
-        interm_f = se_get_par_str("interm");
-        interm = sep_open(interm_f, SEP_WRITE, 0);
-
-        sep_set_axis(interm, 0, nt, t0, dt, "Time");
-        sep_set_axis(interm, 1, nh, h0, dh, cmp ? "Offset" : "Receiver");
-        sep_set_axis(interm, 2, ns, s0, ds, "Shot");
-        sep_write_headers(interm);
-    }
-
-    /*
-       Initialize interpolation filter used by kirdat_pick().
-    */
-    filt_init(dt, length);
-
-    /*
-       ============================================================
-       1. Receiver-side extrapolation
-       ============================================================
-
-       For each shot, build:
-
-           rtable_pair[input_receiver][output_receiver]
-
-       Then use:
-
-           tau = rtable_pair[ic][ih]
-
-       where:
-           ic = input receiver index
-           ih = output receiver index
-    */
-    if (fabsf(rdatum) <= 0.0f)
-    {
-        memcpy(tr_rec[0][0], tr_in[0][0], ndata * sizeof(float));
-    }
-    else
-    {
-        float dzprop = fabsf(rdatum);
-        float dh_abs = fabsf(dh);
-
-        for (int is = 0; is < ns; is++)
-        {
-            float xs = s0 + is * ds;
-
-            if (verb)
-                WARN(("Receiver-side extrapolation: shot %d of %d", is + 1, ns));
-
-            /*
-               Convert raw 3-D receiver traveltime table into pairwise
-               receiver-to-receiver traveltime matrix for this shot.
-            */
-            build_receiver_pair_table_for_shot(
-                rtable_pair,
-                rtable_raw,
-                cmp,
-                xs,
-                nh,
-                h0,
-                dh,
-                rny,
-                ry0,
-                rdy,
-                rnz,
-                rnx,
-                rz0,
-                rdz,
-                rx0,
-                rdx,
-                fabsf(rdatum)
-            );
-
-            for (int ih = 0; ih < nh; ih++)
-            {
-                float h_out = h0 + ih * dh;
-                float xr_out = receiver_x(cmp, xs, h_out);
-
-                int left = ih - raper;
-                int right = ih + raper;
-
-                if (left < 0) left = 0;
-                if (right > nh - 1) right = nh - 1;
-
-                for (int ic = left; ic <= right; ic++)
-                {
-                    float h_in = h0 + ic * dh;
-                    float xr_in = receiver_x(cmp, xs, h_in);
-
-                    float tau = rtable_pair[ic][ih];
-
-                    if (tau < 0.0f)
-                    {
-                        n_r_skip++;
-                        continue;
-                    }
-
-                    float dxr = xr_in - xr_out;
-                    float dist = dzprop * dzprop + dxr * dxr;
-
-                    if (dist <= 0.0f)
-                    {
-                        n_r_skip++;
-                        continue;
-                    }
-
-                    float coef = taper_coef(ic, left, right, tap);
-
-                    float weight = coef;
-
-                    if (amp)
-                        weight = coef / (float)M_PI * dh_abs * dzprop * tau / dist;
-
-                    add_shifted_trace(
-                        tr_rec[is][ih],
-                        tr_in[is][ic],
-                        nt,
-                        dt,
-                        tau,
-                        weight
-                    );
-                }
-            }
-        }
-    }
-
-    if (interm != NULL)
-        se_fsio_write_float(interm->data->io, tr_rec[0][0], ndata);
-
-    /*
-       ============================================================
-       2. Source-side extrapolation
-       ============================================================
-
-       stable_pair was already built once:
-
-           stable_pair[input_shot][output_shot]
-
-       Then use:
-
-           tau = stable_pair[ic][is]
-
-       where:
-           ic = input shot index
-           is = output shot index
-    */
-    if (fabsf(sdatum) <= 0.0f)
-    {
-        memcpy(tr_out[0][0], tr_rec[0][0], ndata * sizeof(float));
-    }
-    else
-    {
-        float dzprop = fabsf(sdatum);
-        float ds_abs = fabsf(ds);
-
-        for (int is = 0; is < ns; is++)
-        {
-            float xs_out = s0 + is * ds;
-
-            if (verb)
-                WARN(("Source-side extrapolation: shot %d of %d", is + 1, ns));
-
-            int left = is - saper;
-            int right = is + saper;
-
-            if (left < 0) left = 0;
-            if (right > ns - 1) right = ns - 1;
-
-            for (int ih = 0; ih < nh; ih++)
-            {
-                float h_out = h0 + ih * dh;
-
-                /*
-                   Keep the physical receiver position fixed when changing source.
-                   For cmp=1, the offset of the input gather must be recomputed.
-                */
-                float xr_fixed = receiver_x(cmp, xs_out, h_out);
-
-                for (int ic = left; ic <= right; ic++)
-                {
-                    float xs_in = s0 + ic * ds;
-
-                    int hh = ih;
-
-                    if (cmp)
-                    {
-                        float h_in = xr_fixed - xs_in;
-                        hh = nearest_index(h_in, h0, dh, nh);
-                    }
-                    else
-                    {
-                        hh = ih;
-                    }
-
-                    if (hh < 0 || hh >= nh)
-                    {
-                        n_s_skip++;
-                        continue;
-                    }
-
-                    float tau = stable_pair[ic][is];
-
-                    if (tau < 0.0f)
-                    {
-                        n_s_skip++;
-                        continue;
-                    }
-
-                    float dxs = xs_in - xs_out;
-                    float dist = dzprop * dzprop + dxs * dxs;
-
-                    if (dist <= 0.0f)
-                    {
-                        n_s_skip++;
-                        continue;
-                    }
-
-                    float coef = taper_coef(ic, left, right, tap);
-
-                    float weight = coef;
-
-                    if (amp)
-                        weight = coef / (float)M_PI * ds_abs * dzprop * tau / dist;
-
-                    add_shifted_trace(
-                        tr_out[is][ih],
-                        tr_rec[ic][hh],
-                        nt,
-                        dt,
-                        tau,
-                        weight
-                    );
-                }
-            }
-        }
-    }
-
-    se_fsio_write_float(out->data->io, tr_out[0][0], ndata);
-
-    if (verb)
-    {
-        WARN(("Receiver-side skipped contributions: %lld", n_r_skip));
-        WARN(("Source-side skipped contributions: %lld", n_s_skip));
-    }
-
-    sep_close(in);
-    sep_close(out);
-
-    if (interm != NULL)
-        sep_close(interm);
-
-    return 0;
-}
