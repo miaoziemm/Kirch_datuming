@@ -1,0 +1,130 @@
+#include "../include/pqueue.h"
+
+static float **x, **xn, **x1;
+
+void sf_pqueue_init (int n)
+/*< Initialize heap with the maximum size >*/
+{
+    x = (float **) calloc ((n+1),sizeof (float *)); 
+}
+
+void sf_pqueue_start (void)
+/*< Set starting values >*/
+{
+    xn = x;
+    x1 = x+1;
+}
+
+void sf_pqueue_close (void)
+/*< Free the allocated storage >*/
+{
+    free (x);
+}
+
+void sf_pqueue_insert (float* v)
+/*< Insert an element (smallest first) >*/
+{
+    float **xi, **xq;
+    unsigned int q;
+    
+    xi = ++xn;
+    *xi = v;
+    q = (unsigned int) (xn-x);
+    for (q >>= 1; q > 0; q >>= 1) {
+	xq = x + q;
+	if (*v > **xq) break;
+	*xi = *xq; xi = xq;
+    }
+    *xi = v; 
+}
+
+void sf_pqueue_insert2 (float* v)
+/*< Insert an element (largest first) >*/
+{
+    float **xi, **xq;
+    unsigned int q;
+    
+    xi = ++xn;
+    *xi = v;
+    q = (unsigned int) (xn-x);
+    for (q >>= 1; q > 0; q >>= 1) {
+	xq = x + q;
+	if (*v < **xq) break;
+	*xi = *xq; xi = xq;
+    }
+    *xi = v; 
+}
+
+float* sf_pqueue_extract (void)
+/*< Extract the smallest element >*/
+{
+    unsigned int c;
+    int n;
+    float *v, *t;
+    float **xi, **xc;
+    
+    v = *(x1);
+    *(xi = x1) = t = *(xn--);
+    n = (int) (xn-x);
+    if (n < 0) return NULL;
+    for (c = 2; c <= (unsigned int) n; c <<= 1) {
+	xc = x + c;
+	if (c < (unsigned int) n && **xc > **(xc+1)) {
+	    c++; xc++;
+	}
+	if (*t <= **xc) break;
+	*xi = *xc; xi = xc;
+    }
+    *xi = t;
+    return v;
+}
+
+float* sf_pqueue_extract2 (void)
+/*< Extract the largest element >*/
+{
+    unsigned int c;
+    int n;
+    float *v, *t;
+    float **xi, **xc;
+    
+    v = *(x1);
+    *(xi = x1) = t = *(xn--);
+    n = (int) (xn-x);
+    if (n < 0) return NULL;
+    for (c = 2; c <= (unsigned int) n; c <<= 1) {
+	xc = x + c;
+	if (c < (unsigned int) n && **xc < **(xc+1)) {
+	    c++; xc++;
+	}
+	if (*t >= **xc) break;
+	*xi = *xc; xi = xc;
+    }
+    *xi = t;
+    return v;
+}
+
+void sf_pqueue_update (float **v)
+/*< restore the heap: the value has been altered >*/
+{
+  unsigned int c;
+  int n;
+  float **xc, **xi;
+
+  xi = v; 
+  n = (int) (xn-x); c = (unsigned int) (xi-x);
+  for (c <<= 1; c <= (unsigned int) n; c <<= 1) {
+      xc = x + c;
+      if (c < (unsigned int) n && **xc > **(xc+1)) {
+	  c++; xc++;
+      }
+      if (**v <= **xc) break;
+      *xi = *xc; xi = xc;
+  }
+  xi = v; c = (unsigned int) (xi-x);
+  for (c >>= 1; c > 0; c >>= 1) {
+      xc = x + c;
+      if (**v > **xc) break;
+      *xi = *xc; xi = xc; 
+  }
+  *xi = *v; 
+}
