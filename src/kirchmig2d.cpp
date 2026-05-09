@@ -296,23 +296,16 @@ int main(int argc, char *argv[])
         sep_read_fromsep(mig, nzx * ng, 0, &out[0], NULL);
     }
 
-    /* fork to get number of threads*/
+    /* determine number of threads without a data race */
 #ifdef _OPENMP
-#pragma omp parallel
-    {
-        nthr = omp_get_num_threads();
-    }
+    nthr = omp_get_max_threads();
 #else
     nthr = 1;
 #endif
 
     INFO((">>Using %d threads<<\n", nthr));
 
-    if (adj)
-    {
-        traces = (float **)calloc(nt, sizeof(float *));
-    }
-    else
+    if (!adj)
     {
         traces = alloc2float(nt, nthr);
     }
@@ -410,10 +403,6 @@ int main(int argc, char *argv[])
                 se_fsio_read_float(dat->data->io, trace, nt);
                 
                 doubint(nt, trace);
-                for (ithr = 0; ithr < nthr; ithr++)
-                {
-                    traces[ithr] = trace;
-                }
             }
             else
             {
@@ -480,7 +469,7 @@ int main(int argc, char *argv[])
                 ti = t1 + t2 + tau;
 
                 tx = MAX(fabsf(stablex[i] * ds), fabsf(rtablex[i] * dh));
-                kirmig_pick(adj, ti, tx * aal, out[cig ? ih : 0] + i, traces[ithr]);
+                kirmig_pick(adj, ti, tx * aal, out[cig ? ih : 0] + i, adj ? trace : traces[ithr]);
             }
 
             if (!adj)
@@ -501,7 +490,7 @@ int main(int argc, char *argv[])
             }
         } /* ih */
     }
-    INFO(("."));
+    INFO(("FINISH."));
 
     if (adj)
         se_fsio_write_float(mig->data->io, out[0], nzx * ng);
@@ -510,6 +499,28 @@ int main(int argc, char *argv[])
     sep_close(dat);
     sep_close(mig);
 
-
+    if (traces)
+        free2float(traces);
+    if (out)
+        free2float(out);
+    if (trace)
+        free1float(trace);
+    if (stable)
+        free1float(stable);
+    if (stablex)
+        free1float(stablex);
+    if (rtable)
+        free1float(rtable);
+    if (rtablex)
+        free1float(rtablex);
+    if (stbl)
+        free2float(stbl);
+    if (stblx)
+        free2float(stblx);
+    if (rtbl)
+        free2float(rtbl);
+    if (rtblx)
+        free2float(rtblx);
+        
     return 0;
 }
