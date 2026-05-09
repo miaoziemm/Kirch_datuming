@@ -46,35 +46,35 @@ endif()
 
 
 # 编译可执行文件
-add_executable(test test.cpp)
+# add_executable(test test.cpp)
 add_executable(kirchmig2d kirchmig2d.cpp)
 add_executable(eikods2d eikods2d.cpp)
-add_executable(kirchdat2d kirchdat2d.cpp)
-add_executable(shotgen shotgen.cpp)
+# add_executable(kirchdat2d kirchdat2d.cpp)
+# add_executable(shotgen shotgen.cpp)
 
 # 查找系统库（SQLite3 依赖）
 find_library(DL_LIBRARY dl)
 find_package(Threads REQUIRED)
 
 # 链接库
-target_link_libraries(test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+# target_link_libraries(test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchmig2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(eikods2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
-target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
-target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+# target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+# target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
 # 安装所有可执行文件到 bin 目录
 install(TARGETS
-    test
+    # test
     kirchmig2d
     eikods2d
-    kirchdat2d
-    shotgen
+    # kirchdat2d
+    # shotgen
 )
 
 # 确保依赖的库先编译完成
-add_dependencies(test sebasic sefs reckirch)
+# add_dependencies(test sebasic sefs reckirch)
 add_dependencies(kirchmig2d sebasic sefs reckirch)
 add_dependencies(eikods2d sebasic sefs reckirch)
-add_dependencies(kirchdat2d sebasic sefs reckirch)
-add_dependencies(shotgen sebasic sefs reckirch)
+# add_dependencies(kirchdat2d sebasic sefs reckirch)
+# add_dependencies(shotgen sebasic sefs reckirch)
