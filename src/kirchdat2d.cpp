@@ -1,7 +1,6 @@
 #include <SEBASIC/include/se_basic.h>
 #include <SEFILESYSTEM/include/se_fs.h>
 #include <SERECKIRCH/include/se_reckirch.h>
-#include "./help/kirchdat2d_help.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -16,20 +15,29 @@
 #endif
 
 
-
 int main(int argc, char* argv[])
 {
+	se_par_init(argc, argv);
     bool verb;
     int it, nt, ih, nh, is, ns, nsg, nrg, left, right, ic, aper, shift, c, cc, hh;
     int ir, nr, jump, sleft, sright, tap;
     float sdatum, rdatum, length, t0, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau, delta;
     float r, dr, s, h, coef;
     float ***tr_in, ***tr_out, **stable, **rtable;
-    sf_file in, out, sgreen, rgreen, interm;
+	sep_t *in, *out, *sgreen, *rgreen, *interm;
+	char *in_f = NULL, *out_f = NULL, *sgreen_f = NULL, *rgreen_f = NULL, *interm_f = NULL;
 
-    sf_init (argc,argv);
+	if(!se_have_par("input_file")) ERROR(("Need input_file=")); else in_f = se_get_par_str("input_file");
+	if(!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
+	if(!se_have_par("sgreen_file")) ERROR(("Need sgreen_file=")); else sgreen_f = se_get_par_str("sgreen_file");
+	if(!se_have_par("rgreen_file")) ERROR(("Need rgreen_file=")); else rgreen_f = se_get_par_str("rgreen_file");
+	
+
     in = sf_input("in");
     out = sf_output("out");
+
+
+
     
     if (!sf_getbool("verb",&verb)) verb=false;
     /* verbosity flag */
@@ -146,7 +154,7 @@ int main(int argc, char* argv[])
 
 		    tr_out[is][ih][it] += coef/SF_PI
 			*dh*rdatum*tau/dist
-			*kirdat_pick(delta,tr_in[is][ic],shift);
+			*pick(delta,tr_in[is][ic],shift);
 		    shift++;
 		}
 	    }
@@ -256,4 +264,3 @@ int main(int argc, char* argv[])
 
     exit(0);
 }
-
