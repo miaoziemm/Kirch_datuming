@@ -145,9 +145,9 @@ int main(int argc, char* argv[])
 		    else if (shift == 0)
 			delta = (((float)it*dt)-tau)/dt;
 
-		    tr_out[is][ih][it] += coef/SF_PI
+		    tr_out[is][ih][it] += coef/M_PI
 			*dh*rdatum*tau/dist
-			*pick(delta,tr_in[is][ic],shift);
+			*kirdat_pick(delta,tr_in[is][ic],shift);
 		    shift++;
 		}
 	    }
@@ -243,7 +243,7 @@ int main(int argc, char* argv[])
 		    else if (shift == 0)
 			delta = (((float)it*dt)-tau)/dt;
 		    
-		    tr_in[is][ih][it] += coef/SF_PI
+		    tr_in[is][ih][it] += coef/M_PI
 			*ds*sdatum*tau/dist
 			*kirdat_pick(delta,tr_out[ic][hh],shift);
 		    shift++;
