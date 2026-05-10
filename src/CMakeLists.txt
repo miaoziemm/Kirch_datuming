@@ -27,19 +27,19 @@ find_library(SEFILESYSTEM_LIB
     NO_DEFAULT_PATH
 )
 
-# 如果没有找到库，添加依赖到 sefilesystem 目标
-if(NOT SERECKIRCH_LIB)
-    set(SERECKIRCH_LIB reckirch)
+# 如果没有找到 SEFILESYSTEM 的静态库文件，回退为目标名 `sefs`
+if(NOT SEFILESYSTEM_LIB)
+    set(SEFILESYSTEM_LIB sefs)
 endif()
 
-# 查找 SEFILESYSTEM 库
+# 查找 SERECKIRCH 库
 find_library(SERECKIRCH_LIB
     NAMES reckirch
     PATHS ${CMAKE_BINARY_DIR}/lib
     NO_DEFAULT_PATH
 )
 
-# 如果没有找到库，添加依赖到 sefilesystem 目标
+# 如果没有找到 SERECKIRCH 的静态库文件，回退为目标名 `reckirch`
 if(NOT SERECKIRCH_LIB)
     set(SERECKIRCH_LIB reckirch)
 endif()

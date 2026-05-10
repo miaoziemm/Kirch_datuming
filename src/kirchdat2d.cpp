@@ -18,7 +18,7 @@
 int main(int argc, char* argv[])
 {
 	se_par_init(argc, argv);
-    bool verb;
+    int verb;
     int it, nt, ih, nh, is, ns, nsg, nrg, left, right, ic, aper, shift, c, cc, hh;
     int ir, nr, jump, sleft, sright, tap;
     float sdatum, rdatum, length, t0, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau, delta;
@@ -33,78 +33,71 @@ int main(int argc, char* argv[])
 	if(!se_have_par("rgreen_file")) ERROR(("Need rgreen_file=")); else rgreen_f = se_get_par_str("rgreen_file");
 	
 
-    in = sf_input("in");
-    out = sf_output("out");
-
-
-
+	in = sep_open(in_f, SEP_READ, 0);
+	out = sep_open(out_f, SEP_WRITE, 0);
+	
     
-    if (!sf_getbool("verb",&verb)) verb=false;
+	if(!se_have_par("verb")) verb = 1; else verb = se_get_par_int("verb");
     /* verbosity flag */
+	if(!se_have_par("sdatum")) ERROR(("Need sdatum=")); else sdatum = se_get_par_float("sdatum");
+	if(!se_have_par("rdatum")) ERROR(("Need rdatum=")); else rdatum = se_get_par_float("rdatum");
 
-    if (!sf_getfloat("sdatum",&sdatum)) sf_error("Need sdatum=");
-    /* source datum depth */
-
-    if (!sf_getfloat("rdatum",&rdatum)) sf_error("Need rdatum=");
-    /* receiver datum depth */
-
-    if (!sf_getint("aperture",&aper)) aper=50;
+	if(!se_have_par("aperture")) aper=50; else aper = se_get_par_int("aperture");
     /* aperture (number of traces) */
-
-    if (!sf_getint("taper",&tap)) tap=10;
+	if(!se_have_par("taper")) tap=10; else tap = se_get_par_int("taper");
     /* taper (number of traces) */
-
-    if (!sf_getfloat("length",&length)) length=0.025;
+	
+	if(!se_have_par("length")) length=0.025; else length = se_get_par_float("length");
     /* filter length (in seconds) */
 
     /* read input */
-    if (!sf_histint(in,"n1",&nt)) sf_error("No nt=");
-    if (!sf_histint(in,"n2",&nh)) sf_error("No nh=");
-    if (!sf_histint(in,"n3",&ns)) sf_error("No ns=");
+	if(in->headers->ndim < 3) ERROR(("Input must be 3D."));
+	nt = in->headers->n[0];
+	nh = in->headers->n[1];
+	ns = in->headers->n[2];
+	t0 = in->headers->o[0];
+	dt = in->headers->d[0];
+	h0 = in->headers->o[1];
+	dh = in->headers->d[1];
+	s0 = in->headers->o[2];
+	ds = in->headers->d[2];
 
-    if (!sf_histfloat(in,"o1",&t0)) sf_error("No t0=");
-    if (!sf_histfloat(in,"d1",&dt)) sf_error("No dt=");
-
-    if (!sf_histfloat(in,"o2",&h0)) sf_error("No h0=");
-    if (!sf_histfloat(in,"d2",&dh)) sf_error("No dh=");
-
-    if (!sf_histfloat(in,"o3",&s0)) sf_error("No s0=");
-    if (!sf_histfloat(in,"d3",&ds)) sf_error("No ds=");
-
-    tr_in = sf_floatalloc3(nt,nh,ns);
-    sf_floatread(tr_in[0][0],nt*nh*ns,in);
+    tr_in = alloc3float(nt,nh,ns);
+	se_fsio_read_float(in->data->io, tr_in[0][0], nt*nh*ns);
 
     /* allocate memory for output */
-    tr_out = sf_floatalloc3(nt,nh,ns);
+    tr_out = alloc3float(nt,nh,ns);
 
+	sgreen = sep_open(sgreen_f, SEP_READ, 0);
+	
     /* read Green's function (source) */
-    sgreen = sf_input("sgreen");
+	if(sgreen->headers->ndim < 2) ERROR(("Source Green's function must be 2D."));
+	nsg = sgreen->headers->n[0];
+	sg0 = sgreen->headers->o[0];
+	dsg = sgreen->headers->d[0];
 
-    if (!sf_histint(sgreen,"n1",&nsg)) sf_error("No nsg=");
-    if (!sf_histfloat(sgreen,"o1",&sg0)) sf_error("No sg0=");
-    if (!sf_histfloat(sgreen,"d1",&dsg)) sf_error("No dsg=");
-
-    stable = sf_floatalloc2(nsg,nsg);
-    sf_floatread(stable[0],nsg*nsg,sgreen);
-    sf_fileclose(sgreen);
+    stable = alloc2float(nsg,nsg);
+    se_fsio_read_float(sgreen->data->io, stable[0], nsg*nsg);
+    sep_close(sgreen);
 
     /* read Green's function (receiver) */
-    rgreen = sf_input("rgreen");
+    rgreen = sep_open(rgreen_f, SEP_READ, 0);
+	if(rgreen->headers->ndim < 2) ERROR(("Receiver Green's function must be 2D."));
+	nrg = rgreen->headers->n[0];
+	rg0 = rgreen->headers->o[0];
+	drg = rgreen->headers->d[0];
 
-    if (!sf_histint(rgreen,"n1",&nrg)) sf_error("No nrg=");
-    if (!sf_histfloat(rgreen,"o1",&rg0)) sf_error("No rg0=");
-    if (!sf_histfloat(rgreen,"d1",&drg)) sf_error("No drg=");
 
-    rtable = sf_floatalloc2(nrg,nrg);
-    sf_floatread(rtable[0],nrg*nrg,rgreen);
-    sf_fileclose(rgreen);
+    rtable = alloc2float(nrg,nrg);
+    se_fsio_read_float(rgreen->data->io, rtable[0], nrg*nrg);
+    sep_close(rgreen);
 
     /* output intermediate traces */
-    if (NULL != sf_getstring("interm")) {
-	interm = sf_output("interm");
-    } else {
-	interm = NULL;
-    }
+	if(!se_have_par("interm")) interm_f = NULL; else interm_f = se_get_par_str("interm");
+	if(interm_f != NULL) {
+		interm = sep_open(interm_f, SEP_WRITE, 0);
+	} 
+
 
     /* initialize */
     filt_init(dt,length);
@@ -114,12 +107,12 @@ int main(int argc, char* argv[])
 #pragma omp parallel for private(ih,c,left,right,ic,cc,coef,tau,dist,shift,it,delta)
 #endif
     for (is=0; is < ns; is++) {
-	if (verb) sf_warning("Processing common-shot gather %d of %d.",is+1,ns);
+	if (verb) WARN(("Processing common-shot gather %d of %d.",is+1,ns));
 
 	for (ih=0; ih < nh; ih++) {
 
 	    c = (s0+is*ds+h0+ih*dh-rg0)/drg+0.5;
-	    if (c < 0 || c > nrg-1) sf_error("Receiver table too small.");
+	    if (c < 0 || c > nrg-1) ERROR(("Receiver table too small."));
 
 	    /* aperture */
 	    left  = (ih-aper < 0)?    0:    ih-aper;
@@ -128,7 +121,7 @@ int main(int argc, char* argv[])
 	    for (ic=left; ic <= right; ic++) {
 		
 		cc = (s0+is*ds+h0+ic*dh-rg0)/drg+0.5;
-		if (cc < 0 || cc > nrg-1) sf_error("Receiver table too small.");
+		if (cc < 0 || cc > nrg-1) ERROR(("Receiver table too small."));
 
 		/* taper coefficient */
 		coef = 1.;
@@ -162,7 +155,7 @@ int main(int argc, char* argv[])
 	}
     }
 
-    if (NULL != interm) sf_floatwrite(tr_out[0][0],nt*nh*ns,interm);
+    if (NULL != interm_f) se_fsio_write_float(interm->data->io, tr_out[0][0], nt*nh*ns);
 
     /* zero input */
     for (is=0; is < ns; is++) {
@@ -192,7 +185,7 @@ int main(int argc, char* argv[])
 #pragma omp parallel for private(r,sleft,sright,is,c,ih,left,right,ic,cc,hh,coef,tau,dist,shift,it,delta)
 #endif
     for (ir=0; ir < nr; ir++) {
-	if (verb) sf_warning("Processing common-receiver gather %d of %d.",ir+1,nr);
+	if (verb) WARN(("Processing common-receiver gather %d of %d.",ir+1,nr));
 
 	r = ir*dr+((ds<=0.)?-1.:0.)*s+((dh<=0.)?-1.:0.)*h;
 	
@@ -213,7 +206,7 @@ int main(int argc, char* argv[])
 	for (is=sleft; is <= sright; is=is+jump) {
 	    
 	    c = (s0+is*ds-sg0)/dsg+0.5;
-	    if (c < 0 || c > nsg-1) sf_error("Source table too small.");
+	    if (c < 0 || c > nsg-1) ERROR(("Source table too small."));
 
 	    ih = (r-is*ds)/dh+0.5;
 	    
@@ -224,7 +217,7 @@ int main(int argc, char* argv[])
 	    for (ic=left; ic <= right; ic=ic+jump) {
 		
 		cc = (s0+ic*ds-sg0)/dsg+0.5;
-		if (cc < 0 || cc > nsg-1) sf_error("Source table too small.");
+		if (cc < 0 || cc > nsg-1) ERROR(("Source table too small."));
 
 		hh = (r-ic*ds)/dh+0.5;
 
@@ -252,7 +245,7 @@ int main(int argc, char* argv[])
 		    
 		    tr_in[is][ih][it] += coef/SF_PI
 			*ds*sdatum*tau/dist
-			*pick(delta,tr_out[ic][hh],shift);
+			*kirdat_pick(delta,tr_out[ic][hh],shift);
 		    shift++;
 		}
 	    }
@@ -260,7 +253,15 @@ int main(int argc, char* argv[])
     }
 
     /* write output */
-    sf_floatwrite(tr_in[0][0],nt*nh*ns,out);
+	se_fsio_write_float(out->data->io, tr_in[0][0], nt*nh*ns);
 
-    exit(0);
+    sep_close(in);
+	sep_close(out);
+
+	free3float(tr_in);
+	free3float(tr_out);
+	free2float(stable);
+	free2float(rtable);
+
+	return 0;
 }

@@ -69,3 +69,4 @@ Testing/
 .cache/
 build/
 cyq1/
+.vscode/
