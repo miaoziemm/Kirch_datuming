@@ -50,7 +50,8 @@ endif()
 add_executable(kirchmig2d kirchmig2d.cpp)
 add_executable(eikods2d eikods2d.cpp)
 add_executable(kirchdat2d kirchdat2d.cpp)
-# add_executable(shotgen shotgen.cpp)
+add_executable(shotgen shotgen.cpp)
+add_executable(greensol greensol.cpp)
 
 # 查找系统库（SQLite3 依赖）
 find_library(DL_LIBRARY dl)
@@ -61,7 +62,8 @@ find_package(Threads REQUIRED)
 target_link_libraries(kirchmig2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(eikods2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
-# target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
 # 安装所有可执行文件到 bin 目录
 install(TARGETS
@@ -69,7 +71,8 @@ install(TARGETS
     kirchmig2d
     eikods2d
     kirchdat2d
-    # shotgen
+    shotgen
+    greensol
 )
 
 # 确保依赖的库先编译完成
@@ -77,4 +80,5 @@ install(TARGETS
 add_dependencies(kirchmig2d sebasic sefs reckirch)
 add_dependencies(eikods2d sebasic sefs reckirch)
 add_dependencies(kirchdat2d sebasic sefs reckirch)
-# add_dependencies(shotgen sebasic sefs reckirch)
+add_dependencies(shotgen sebasic sefs reckirch)
+add_dependencies(greensol sebasic sefs reckirch)
