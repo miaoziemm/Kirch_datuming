@@ -352,6 +352,15 @@ endfunction()
 # Set flag to indicate building as part of main project
 set(SE_BUILDING_MAIN_PROJECT TRUE)
 
+option(SE_USE_FFTW "Enable FFTW support for frequency-domain tools" ON)
+if(SE_USE_FFTW)
+    set(ENABLE_FLOAT ON CACHE BOOL "Build FFTW in single precision" FORCE)
+    set(ENABLE_LONG_DOUBLE OFF CACHE BOOL "Disable long double FFTW" FORCE)
+    set(ENABLE_QUAD_PRECISION OFF CACHE BOOL "Disable quad FFTW" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "Disable FFTW tests" FORCE)
+    add_subdirectory(fftw)
+endif()
+
 # Add subdirectories for each module
 add_subdirectory(SEBASIC)
 add_subdirectory(SEFILESYSTEM)
