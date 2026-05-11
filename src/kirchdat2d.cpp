@@ -127,7 +127,7 @@ int main(int argc, char* argv[])
 #pragma omp parallel for private(ih,c,left,right,ic,cc,coef,tau,dist,shift,it,delta)
 #endif
     for (is=0; is < ns; is++) {
-	if (verb) WARN(("Processing common-shot gather %d of %d.",is+1,ns));
+	if (verb) INFO(("Processing common-shot gather %d of %d.",is+1,ns));
 
 	for (ih=0; ih < nh; ih++) {
 
