@@ -314,6 +314,9 @@ int main(int argc, char *argv[])
                 build_kirdat_filter(tau, dt, nsam, filt);
                 memset(filt_time, 0, sizeof(float) * (size_t)nfft);
                 memcpy(filt_time, filt.data(), sizeof(float) * (size_t)nfilt);
+#ifdef _OPENMP
+#pragma omp critical(fftw_filter_exec)
+#endif
                 fftwf_execute(plan_filter);
 
                 float weight = coef / (float)M_PI * dh * rdatum * tau / dist;
@@ -461,6 +464,9 @@ int main(int argc, char *argv[])
                 build_kirdat_filter(tau, dt, nsam, filt);
                 memset(filt_time, 0, sizeof(float) * (size_t)nfft);
                 memcpy(filt_time, filt.data(), sizeof(float) * (size_t)nfilt);
+#ifdef _OPENMP
+#pragma omp critical(fftw_filter_exec)
+#endif
                 fftwf_execute(plan_filter);
 
                 float weight = coef / (float)M_PI * ds * sdatum * tau / dist;
