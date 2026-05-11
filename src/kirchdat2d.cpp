@@ -14,6 +14,23 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+void reverse_trace(int nt, int nh, int ns, float ***tr)
+{
+	INFO(("Reversing traces..."));
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+	for (int is=0; is < ns; is++) {
+		for (int ih=0; ih < nh; ih++) {
+			for (int it=0; it < nt/2; it++) {
+				float tmp = tr[is][ih][it];
+				tr[is][ih][it] = tr[is][ih][nt-1-it];
+				tr[is][ih][nt-1-it] = tmp;
+			}
+		 }
+	 }
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -21,7 +38,9 @@ int main(int argc, char* argv[])
     int verb;
     int it, nt, ih, nh, is, ns, nsg, nrg, left, right, ic, aper, shift, c, cc, hh;
     int ir, nr, jump, sleft, sright, tap;
-    float sdatum, rdatum, length, t0, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau, delta;
+	float sdatum = 0.0f;
+	float rdatum = 0.0f;
+	float length, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau, delta;
     float r, dr, s, h, coef;
     float ***tr_in, ***tr_out, **stable, **rtable;
 	sep_t *in, *out, *sgreen, *rgreen, *interm;
@@ -55,7 +74,6 @@ int main(int argc, char* argv[])
 	nt = in->headers->n[0];
 	nh = in->headers->n[1];
 	ns = in->headers->n[2];
-	t0 = in->headers->o[0];
 	dt = in->headers->d[0];
 	h0 = in->headers->o[1];
 	dh = in->headers->d[1];
@@ -64,6 +82,8 @@ int main(int argc, char* argv[])
 
     tr_in = alloc3float(nt,nh,ns);
 	se_fsio_read_float(in->data->io, tr_in[0][0], nt*nh*ns);
+
+	reverse_trace(nt, nh, ns, tr_in);
 
     /* allocate memory for output */
     tr_out = alloc3float(nt,nh,ns);
@@ -185,7 +205,7 @@ int main(int argc, char* argv[])
 #pragma omp parallel for private(r,sleft,sright,is,c,ih,left,right,ic,cc,hh,coef,tau,dist,shift,it,delta)
 #endif
     for (ir=0; ir < nr; ir++) {
-	if (verb) WARN(("Processing common-receiver gather %d of %d.",ir+1,nr));
+	if (verb) INFO(("Processing common-receiver gather %d of %d.",ir+1,nr));
 
 	r = ir*dr+((ds<=0.)?-1.:0.)*s+((dh<=0.)?-1.:0.)*h;
 	
@@ -252,6 +272,19 @@ int main(int argc, char* argv[])
 	}	
     }
 
+	out->headers->ndim = 3;
+	out->headers->n[0] = nt;
+	out->headers->n[1] = nh;
+	out->headers->n[2] = ns;
+	out->headers->d[0] = dt;
+	out->headers->d[1] = dh;
+	out->headers->d[2] = ds;
+	out->headers->o[0] = 0.;
+	out->headers->o[1] = h0;
+	out->headers->o[2] = s0;
+
+	reverse_trace(nt, nh, ns, tr_in);
+
     /* write output */
 	se_fsio_write_float(out->data->io, tr_in[0][0], nt*nh*ns);
 
@@ -262,6 +295,8 @@ int main(int argc, char* argv[])
 	free3float(tr_out);
 	free2float(stable);
 	free2float(rtable);
+
+	INFO(("Done."));
 
 	return 0;
 }
