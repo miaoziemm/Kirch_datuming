@@ -17,157 +17,276 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static void reverse_trace(int nt, int nh, int ns, float ***tr)
+
+static inline size_t freq_trace_offset(int is, int ih, int nh, int nf)
+{
+    return ((size_t)is * (size_t)nh + (size_t)ih) * (size_t)nf;
+}
+
+
+static inline fftwf_complex* freq_trace(fftwf_complex *f, int is, int ih, int nh, int nf)
+{
+    return f + freq_trace_offset(is, ih, nh, nf);
+}
+
+
+static inline const fftwf_complex* freq_trace_const(const fftwf_complex *f, int is, int ih, int nh, int nf)
+{
+    return f + freq_trace_offset(is, ih, nh, nf);
+}
+
+
+static inline int next_pow2(int n)
+{
+    int m = 1;
+    while (m < n) m <<= 1;
+    return m;
+}
+
+
+void reverse_trace(int nt, int nh, int ns, float ***tr)
 {
     INFO(("Reversing traces..."));
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
     for (int is = 0; is < ns; is++) {
         for (int ih = 0; ih < nh; ih++) {
-            for (int it = 0; it < nt / 2; it++) {
+            for (int it = 0; it < nt/2; it++) {
                 float tmp = tr[is][ih][it];
-                tr[is][ih][it] = tr[is][ih][nt - 1 - it];
-                tr[is][ih][nt - 1 - it] = tmp;
+                tr[is][ih][it] = tr[is][ih][nt-1-it];
+                tr[is][ih][nt-1-it] = tmp;
             }
         }
     }
 }
 
-static int next_pow2(int n)
+
+static void time_to_freq_all(
+    float ***tr,
+    fftwf_complex *ftr,
+    int nt,
+    int nh,
+    int ns,
+    int nfft,
+    int nf
+)
 {
-    int p = 1;
-    while (p < n) {
-        p <<= 1;
+    float *buf_t = (float*)fftwf_malloc(sizeof(float) * (size_t)nfft);
+    fftwf_complex *buf_f = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (size_t)nf);
+
+    if (buf_t == NULL || buf_f == NULL) {
+        ERROR(("FFTW buffer allocation failed in time_to_freq_all."));
     }
-    return p;
+
+    fftwf_plan plan_f = fftwf_plan_dft_r2c_1d(nfft, buf_t, buf_f, FFTW_ESTIMATE);
+    if (plan_f == NULL) {
+        ERROR(("FFTW forward plan creation failed."));
+    }
+
+    for (int is = 0; is < ns; is++) {
+        for (int ih = 0; ih < nh; ih++) {
+
+            memset(buf_t, 0, sizeof(float) * (size_t)nfft);
+
+            for (int it = 0; it < nt; it++) {
+                buf_t[it] = tr[is][ih][it];
+            }
+
+            fftwf_execute(plan_f);
+
+            fftwf_complex *dst = freq_trace(ftr, is, ih, nh, nf);
+            memcpy(dst, buf_f, sizeof(fftwf_complex) * (size_t)nf);
+        }
+    }
+
+    fftwf_destroy_plan(plan_f);
+    fftwf_free(buf_t);
+    fftwf_free(buf_f);
 }
 
-static float max_table_value(float **table, int n)
+
+static void freq_to_time_all(
+    const fftwf_complex *ftr,
+    float ***tr,
+    int nt,
+    int nh,
+    int ns,
+    int nfft,
+    int nf
+)
 {
-    float maxv = 0.0f;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            float v = table[i][j];
-            if (v > maxv) {
-                maxv = v;
+    float *buf_t = (float*)fftwf_malloc(sizeof(float) * (size_t)nfft);
+    fftwf_complex *buf_f = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (size_t)nf);
+
+    if (buf_t == NULL || buf_f == NULL) {
+        ERROR(("FFTW buffer allocation failed in freq_to_time_all."));
+    }
+
+    fftwf_plan plan_b = fftwf_plan_dft_c2r_1d(nfft, buf_f, buf_t, FFTW_ESTIMATE);
+    if (plan_b == NULL) {
+        ERROR(("FFTW backward plan creation failed."));
+    }
+
+    for (int is = 0; is < ns; is++) {
+        for (int ih = 0; ih < nh; ih++) {
+
+            const fftwf_complex *src = freq_trace_const(ftr, is, ih, nh, nf);
+            memcpy(buf_f, src, sizeof(fftwf_complex) * (size_t)nf);
+
+            fftwf_execute(plan_b);
+
+            for (int it = 0; it < nt; it++) {
+                tr[is][ih][it] = buf_t[it] / (float)nfft;
             }
         }
     }
-    return maxv;
+
+    fftwf_destroy_plan(plan_b);
+    fftwf_free(buf_t);
+    fftwf_free(buf_f);
 }
 
-static void build_kirdat_filter(float tau, float dt, int nsam, std::vector<float> &filt)
+
+static inline void add_delayed_trace_freq(
+    fftwf_complex *out,
+    const fftwf_complex *in,
+    const std::vector<double> &omega,
+    int iw_min,
+    int iw_max,
+    double amp,
+    double tau
+)
 {
-    filt.assign(nsam, 0.0f);
-    if (tau <= 0.0f) {
-        return;
-    }
+    if (amp == 0.0) return;
 
-    for (int isam = 1; isam < nsam; isam++) {
-        float ratio = (tau + isam * dt) / tau;
-        filt[isam] = sqrtf(ratio * ratio - 1.0f);
-    }
+    for (int iw = iw_min; iw <= iw_max; iw++) {
 
-    for (int isam = 0; isam < nsam - 1; isam++) {
-        filt[isam] = filt[isam + 1] - filt[isam];
-    }
+        double phase = -omega[iw] * tau;
 
-    for (int isam = nsam - 2; isam > 0; isam--) {
-        filt[isam] = filt[isam] - filt[isam - 1];
-    }
+        double cp = cos(phase);
+        double sp = sin(phase);
 
-    for (int isam = 0; isam < nsam - 1; isam++) {
-        filt[isam] /= dt;
+        double xr = (double)in[iw][0];
+        double xi = (double)in[iw][1];
+
+        out[iw][0] = (float)(out[iw][0] + amp * (cp * xr - sp * xi));
+        out[iw][1] = (float)(out[iw][1] + amp * (sp * xr + cp * xi));
     }
 }
 
-static int compute_it0(float tau, float dt, float *delta)
-{
-    int it0 = (int)ceilf(tau / dt);
-    if (it0 < 0) {
-        it0 = 0;
-    }
-    if (delta) {
-        *delta = ((float)it0 * dt - tau) / dt;
-    }
-    return it0;
-}
 
-static void fill_fft_input(float *dst, float ***src, int nt, int nh, int ns, int nfft)
-{
-    int ntraces = ns * nh;
-    for (int itr = 0; itr < ntraces; itr++) {
-        int is = itr / nh;
-        int ih = itr % nh;
-        float *trace = src[is][ih];
-        float *buf = dst + (size_t)itr * nfft;
-        memcpy(buf, trace, (size_t)nt * sizeof(float));
-        memset(buf + nt, 0, (size_t)(nfft - nt) * sizeof(float));
-    }
-}
-
-static void apply_ifft_output(float ***dst, const float *src, const float *corr,
-                              int nt, int nh, int ns, int nfft, float scale)
-{
-    int ntraces = ns * nh;
-    for (int itr = 0; itr < ntraces; itr++) {
-        int is = itr / nh;
-        int ih = itr % nh;
-        const float *buf = src + (size_t)itr * nfft;
-        const float *corr_trace = corr + (size_t)itr * nt;
-        for (int it = 0; it < nt; it++) {
-            dst[is][ih][it] = buf[it] * scale + corr_trace[it];
-        }
-    }
-}
-
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     se_par_init(argc, argv);
+
     int verb;
-    int nt, ih, nh, is, ns, nsg, nrg, left, right, ic, aper, c, cc, hh;
-    int ir, nr, jump, sleft, sright, tap;
+    int nt, nh, ns;
+    int nsg, nrg;
+    int aper, tap;
+    int nr, jump;
+
     float sdatum = 0.0f;
     float rdatum = 0.0f;
-    float length, dt, h0, dh, s0, ds, sg0, dsg, rg0, drg, dist, tau;
-    float r, dr, s, h, coef;
-    float ***tr_in, ***tr_out, **stable, **rtable;
-    sep_t *in, *out, *sgreen, *rgreen, *interm = NULL;
-    char *in_f = NULL, *out_f = NULL, *sgreen_f = NULL, *rgreen_f = NULL, *interm_f = NULL;
+    float length;
+    float dt, h0, dh, s0, ds;
+    float sg0, dsg, rg0, drg;
 
-    if (!se_have_par("input_file")) ERROR(("Need input_file=")); else in_f = se_get_par_str("input_file");
-    if (!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
-    if (!se_have_par("sgreen_file")) ERROR(("Need sgreen_file=")); else sgreen_f = se_get_par_str("sgreen_file");
-    if (!se_have_par("rgreen_file")) ERROR(("Need rgreen_file=")); else rgreen_f = se_get_par_str("rgreen_file");
+    float ***tr_in = NULL;
+    float ***tr_out = NULL;
+    float **stable = NULL;
+    float **rtable = NULL;
+
+    sep_t *in = NULL;
+    sep_t *out = NULL;
+    sep_t *sgreen = NULL;
+    sep_t *rgreen = NULL;
+    sep_t *interm = NULL;
+
+    char *in_f = NULL;
+    char *out_f = NULL;
+    char *sgreen_f = NULL;
+    char *rgreen_f = NULL;
+    char *interm_f = NULL;
+
+    if (!se_have_par("input_file"))  ERROR(("Need input_file="));
+    else in_f = se_get_par_str("input_file");
+
+    if (!se_have_par("output_file")) ERROR(("Need output_file="));
+    else out_f = se_get_par_str("output_file");
+
+    if (!se_have_par("sgreen_file")) ERROR(("Need sgreen_file="));
+    else sgreen_f = se_get_par_str("sgreen_file");
+
+    if (!se_have_par("rgreen_file")) ERROR(("Need rgreen_file="));
+    else rgreen_f = se_get_par_str("rgreen_file");
 
     in = sep_open(in_f, SEP_READ, 0);
     out = sep_open(out_f, SEP_WRITE, 0);
 
-    if (!se_have_par("verb")) verb = 1; else verb = se_get_par_int("verb");
-    if (!se_have_par("sdatum")) ERROR(("Need sdatum=")); else sdatum = se_get_par_float("sdatum");
-    if (!se_have_par("rdatum")) ERROR(("Need rdatum=")); else rdatum = se_get_par_float("rdatum");
+    if (!se_have_par("verb")) verb = 1;
+    else verb = se_get_par_int("verb");
 
-    if (!se_have_par("aperture")) aper = 50; else aper = se_get_par_int("aperture");
-    if (!se_have_par("taper")) tap = 10; else tap = se_get_par_int("taper");
-    if (!se_have_par("length")) length = 0.025f; else length = se_get_par_float("length");
+    if (!se_have_par("sdatum")) ERROR(("Need sdatum="));
+    else sdatum = se_get_par_float("sdatum");
 
+    if (!se_have_par("rdatum")) ERROR(("Need rdatum="));
+    else rdatum = se_get_par_float("rdatum");
+
+    if (!se_have_par("aperture")) aper = 50;
+    else aper = se_get_par_int("aperture");
+
+    if (!se_have_par("taper")) tap = 10;
+    else tap = se_get_par_int("taper");
+
+    if (!se_have_par("length")) length = 0.025f;
+    else length = se_get_par_float("length");
+
+    /*
+     * Optional frequency band.
+     * If not provided, all positive frequencies are used.
+     */
+    float fmin = 0.0f;
+    float fmax = -1.0f;
+
+    if (se_have_par("fmin")) fmin = se_get_par_float("fmin");
+    if (se_have_par("fmax")) fmax = se_get_par_float("fmax");
+
+    /* read input */
     if (in->headers->ndim < 3) ERROR(("Input must be 3D."));
+
     nt = in->headers->n[0];
     nh = in->headers->n[1];
     ns = in->headers->n[2];
+
     dt = in->headers->d[0];
     h0 = in->headers->o[1];
     dh = in->headers->d[1];
     s0 = in->headers->o[2];
     ds = in->headers->d[2];
 
+    if (fmax <= 0.0f) fmax = 0.5f / dt;
+
+    if (verb) {
+        INFO(("Input dimensions: nt=%d, nh=%d, ns=%d", nt, nh, ns));
+        INFO(("dt=%g, dh=%g, ds=%g", dt, dh, ds));
+        INFO(("Frequency-domain implementation: fmin=%g Hz, fmax=%g Hz", fmin, fmax));
+        INFO(("The original length=%g parameter is kept for compatibility but is not used by this pure phase-delay version.", length));
+    }
+
     tr_in = alloc3float(nt, nh, ns);
     se_fsio_read_float(in->data->io, tr_in[0][0], nt * nh * ns);
 
     reverse_trace(nt, nh, ns, tr_in);
 
-    tr_out = alloc3float(nt, nh, ns);
-
+    /* read Green's function: source table */
     sgreen = sep_open(sgreen_f, SEP_READ, 0);
-    if (sgreen->headers->ndim < 2) ERROR(("Source Green's function must be 2D."));
+
+    if (sgreen->headers->ndim < 2) {
+        ERROR(("Source Green's function must be 2D."));
+    }
+
     nsg = sgreen->headers->n[0];
     sg0 = sgreen->headers->o[0];
     dsg = sgreen->headers->d[0];
@@ -176,8 +295,13 @@ int main(int argc, char *argv[])
     se_fsio_read_float(sgreen->data->io, stable[0], nsg * nsg);
     sep_close(sgreen);
 
+    /* read Green's function: receiver table */
     rgreen = sep_open(rgreen_f, SEP_READ, 0);
-    if (rgreen->headers->ndim < 2) ERROR(("Receiver Green's function must be 2D."));
+
+    if (rgreen->headers->ndim < 2) {
+        ERROR(("Receiver Green's function must be 2D."));
+    }
+
     nrg = rgreen->headers->n[0];
     rg0 = rgreen->headers->o[0];
     drg = rgreen->headers->d[0];
@@ -186,201 +310,174 @@ int main(int argc, char *argv[])
     se_fsio_read_float(rgreen->data->io, rtable[0], nrg * nrg);
     sep_close(rgreen);
 
-    if (!se_have_par("interm")) interm_f = NULL; else interm_f = se_get_par_str("interm");
+    /* intermediate output */
+    if (!se_have_par("interm")) {
+        interm_f = NULL;
+    } else {
+        interm_f = se_get_par_str("interm");
+    }
+
     if (interm_f != NULL) {
         interm = sep_open(interm_f, SEP_WRITE, 0);
+
+        interm->headers->ndim = 3;
+        interm->headers->n[0] = nt;
+        interm->headers->n[1] = nh;
+        interm->headers->n[2] = ns;
+        interm->headers->d[0] = dt;
+        interm->headers->d[1] = dh;
+        interm->headers->d[2] = ds;
+        interm->headers->o[0] = 0.0f;
+        interm->headers->o[1] = h0;
+        interm->headers->o[2] = s0;
     }
 
-    float max_tau = max_table_value(stable, nsg);
-    float max_tau_r = max_table_value(rtable, nrg);
-    if (max_tau_r > max_tau) {
-        max_tau = max_tau_r;
-    }
-
-    int nsam = (int)(length / dt) + 2;
-    int nfilt = nsam - 1;
-    int it0_max = compute_it0(max_tau, dt, NULL);
-    int nfft_min = nt + nfilt - 1 + it0_max;
-    int nfft = next_pow2(nfft_min);
+    /*
+     * FFT setup.
+     * Use zero padding to reduce circular-shift wraparound.
+     */
+    int nfft = next_pow2(2 * nt);
     int nf = nfft / 2 + 1;
-    int ntraces = ns * nh;
 
-    float *fft_time = (float *)fftwf_malloc(sizeof(float) * (size_t)ntraces * nfft);
-    float *fft_time_out = (float *)fftwf_malloc(sizeof(float) * (size_t)ntraces * nfft);
-    fftwf_complex *fft_freq = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (size_t)ntraces * nf);
-    fftwf_complex *fft_freq_accum = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (size_t)ntraces * nf);
-    float *corr = alloc1float((size_t)ntraces * nt);
-
-    int max_threads = 1;
-#ifdef _OPENMP
-    max_threads = omp_get_max_threads();
-#endif
-
-    std::vector<float *> filt_time_thread(max_threads, NULL);
-    std::vector<fftwf_complex *> filt_freq_thread(max_threads, NULL);
-    std::vector<fftwf_plan> plan_filter_thread(max_threads, NULL);
-
-    for (int t = 0; t < max_threads; t++) {
-        filt_time_thread[t] = (float *)fftwf_malloc(sizeof(float) * (size_t)nfft);
-        filt_freq_thread[t] = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * (size_t)nf);
-        if (filt_time_thread[t] && filt_freq_thread[t]) {
-            plan_filter_thread[t] = fftwf_plan_dft_r2c_1d(nfft, filt_time_thread[t], filt_freq_thread[t], FFTW_ESTIMATE);
-        }
+    if (verb) {
+        INFO(("Using nfft=%d, nf=%d", nfft, nf));
     }
 
-    if (!fft_time || !fft_time_out || !fft_freq || !fft_freq_accum || !corr) {
-        ERROR(("FFTW memory allocation failed."));
+    std::vector<double> omega(nf);
+    for (int iw = 0; iw < nf; iw++) {
+        double freq = (double)iw / ((double)nfft * (double)dt);
+        omega[iw] = 2.0 * M_PI * freq;
     }
 
-    for (int t = 0; t < max_threads; t++) {
-        if (!filt_time_thread[t] || !filt_freq_thread[t] || !plan_filter_thread[t]) {
-            ERROR(("FFTW plan creation failed."));
-        }
+    int iw_min = (int)ceil((double)fmin * (double)nfft * (double)dt);
+    int iw_max = (int)floor((double)fmax * (double)nfft * (double)dt);
+
+    if (iw_min < 0) iw_min = 0;
+    if (iw_max > nf - 1) iw_max = nf - 1;
+    if (iw_min > iw_max) {
+        ERROR(("Invalid frequency band: iw_min > iw_max."));
     }
 
-    int n[1] = { nfft };
-    fftwf_plan plan_forward = fftwf_plan_many_dft_r2c(1, n, ntraces,
-                                                      fft_time, NULL, 1, nfft,
-                                                      fft_freq, NULL, 1, nf,
-                                                      FFTW_ESTIMATE);
-    fftwf_plan plan_inverse = fftwf_plan_many_dft_c2r(1, n, ntraces,
-                                                      fft_freq_accum, NULL, 1, nf,
-                                                      fft_time_out, NULL, 1, nfft,
-                                                      FFTW_ESTIMATE);
-    if (!plan_forward || !plan_inverse) {
-        ERROR(("FFTW plan creation failed."));
+    size_t ntrace = (size_t)ns * (size_t)nh;
+    size_t nfreq_total = ntrace * (size_t)nf;
+
+    fftwf_complex *f_in  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * nfreq_total);
+    fftwf_complex *f_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * nfreq_total);
+
+    if (f_in == NULL || f_out == NULL) {
+        ERROR(("FFTW frequency-domain array allocation failed."));
     }
 
-    std::vector<float> cos_wdt(nf);
-    std::vector<float> sin_wdt(nf);
-    for (int k = 0; k < nf; k++) {
-        float wdt = 2.0f * (float)M_PI * (float)k / (float)nfft;
-        cos_wdt[k] = cosf(wdt);
-        sin_wdt[k] = sinf(wdt);
-    }
+    memset(f_in,  0, sizeof(fftwf_complex) * nfreq_total);
+    memset(f_out, 0, sizeof(fftwf_complex) * nfreq_total);
 
-    fill_fft_input(fft_time, tr_in, nt, nh, ns, nfft);
-    fftwf_execute(plan_forward);
+    /*
+     * Convert input traces to frequency domain.
+     */
+    if (verb) INFO(("Transforming input traces to frequency domain..."));
+    time_to_freq_all(tr_in, f_in, nt, nh, ns, nfft, nf);
 
-    memset(fft_freq_accum, 0, sizeof(fftwf_complex) * (size_t)ntraces * nf);
-    memset(corr, 0, sizeof(float) * (size_t)ntraces * nt);
-
-    std::vector<std::vector<float>> filt_thread(max_threads, std::vector<float>(nsam, 0.0f));
+    /*
+     * ------------------------------------------------------------------
+     * 1. Common-shot gather receiver-side datuming in frequency domain.
+     *
+     * Time-domain original:
+     * tr_out[is][ih][it] += W_r * kirdat_pick(..., tr_in[is][ic], ...)
+     *
+     * Frequency-domain version:
+     * F_OUT[is][ih](w) += W_r * exp(-i*w*tau_r) * F_IN[is][ic](w)
+     * ------------------------------------------------------------------
+     */
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
-    for (is = 0; is < ns; is++) {
-#ifdef _OPENMP
-        int tid = omp_get_thread_num();
-#else
-        int tid = 0;
-#endif
-        float *filt_time = filt_time_thread[tid];
-        fftwf_complex *filt_freq = filt_freq_thread[tid];
-        fftwf_plan plan_filter = plan_filter_thread[tid];
-        std::vector<float> &filt = filt_thread[tid];
+    for (int is = 0; is < ns; is++) {
 
         if (verb) INFO(("Processing common-shot gather %d of %d.", is + 1, ns));
-        for (ih = 0; ih < nh; ih++) {
-            int out_idx = is * nh + ih;
-            c = (int)((s0 + is * ds + h0 + ih * dh - rg0) / drg + 0.5f);
-            if (c < 0 || c > nrg - 1) ERROR(("Receiver table too small."));
 
-            left = (ih - aper < 0) ? 0 : ih - aper;
-            right = (ih + aper > nh - 1) ? nh - 1 : ih + aper;
+        for (int ih = 0; ih < nh; ih++) {
 
-            for (ic = left; ic <= right; ic++) {
-                int in_idx = is * nh + ic;
-                cc = (int)((s0 + is * ds + h0 + ic * dh - rg0) / drg + 0.5f);
-                if (cc < 0 || cc > nrg - 1) ERROR(("Receiver table too small."));
+            int c = (int)((s0 + is * ds + h0 + ih * dh - rg0) / drg + 0.5f);
+            if (c < 0 || c > nrg - 1) {
+                ERROR(("Receiver table too small."));
+            }
 
-                coef = 1.0f;
-                coef *= (ic - left >= tap) ? 1.0f : (float)(ic - left) / (float)tap;
-                coef *= (right - ic >= tap) ? 1.0f : (float)(right - ic) / (float)tap;
+            int left  = (ih - aper < 0)      ? 0      : ih - aper;
+            int right = (ih + aper > nh - 1) ? nh - 1 : ih + aper;
 
-                tau = rtable[cc][c];
-                dist = rdatum * rdatum + (ic - ih) * dh * (ic - ih) * dh;
-                if (dist <= 0.0f) {
-                    continue;
+            fftwf_complex *out_trace = freq_trace(f_out, is, ih, nh, nf);
+
+            for (int ic = left; ic <= right; ic++) {
+
+                int cc = (int)((s0 + is * ds + h0 + ic * dh - rg0) / drg + 0.5f);
+                if (cc < 0 || cc > nrg - 1) {
+                    ERROR(("Receiver table too small."));
                 }
 
-                float delta = 0.0f;
-                int it0 = compute_it0(tau, dt, &delta);
-                if (it0 >= nt) {
-                    continue;
+                float coef = 1.0f;
+
+                if (tap > 0) {
+                    coef *= (ic - left  >= tap) ? 1.0f : (float)(ic - left) / (float)tap;
+                    coef *= (right - ic >= tap) ? 1.0f : (float)(right - ic) / (float)tap;
                 }
 
-                build_kirdat_filter(tau, dt, nsam, filt);
-                memset(filt_time, 0, sizeof(float) * (size_t)nfft);
-                memcpy(filt_time, filt.data(), sizeof(float) * (size_t)nfilt);
-#ifdef _OPENMP
-#pragma omp critical(fftw_filter_exec)
-#endif
-                fftwf_execute(plan_filter);
+                float tau = rtable[cc][c];
 
-                float weight = coef / (float)M_PI * dh * rdatum * tau / dist;
+                float dxr = (float)(ic - ih) * dh;
+                float dist = rdatum * rdatum + dxr * dxr;
 
-                fftwf_complex *out_spec = fft_freq_accum + (size_t)out_idx * nf;
-                fftwf_complex *in_spec = fft_freq + (size_t)in_idx * nf;
+                if (dist <= 0.0f) continue;
+                if (tau < 0.0f) continue;
 
-                for (int k = 0; k < nf; k++) {
-                    float interp_r = (1.0f - delta) + delta * cos_wdt[k];
-                    float interp_i = delta * sin_wdt[k];
+                double amp = (double)coef / M_PI
+                           * (double)dh
+                           * (double)rdatum
+                           * (double)tau
+                           / (double)dist;
 
-                    float phase = -2.0f * (float)M_PI * (float)k * (float)it0 / (float)nfft;
-                    float cos_p = cosf(phase);
-                    float sin_p = sinf(phase);
+                const fftwf_complex *in_trace = freq_trace_const(f_in, is, ic, nh, nf);
 
-                    float hr = cos_p * interp_r - sin_p * interp_i;
-                    float hi = cos_p * interp_i + sin_p * interp_r;
-
-                    float fr = filt_freq[k][0];
-                    float fi = filt_freq[k][1];
-
-                    float kr = fr * hr - fi * hi;
-                    float ki = fr * hi + fi * hr;
-
-                    float xr = in_spec[k][0];
-                    float xi = in_spec[k][1];
-
-                    out_spec[k][0] += weight * (kr * xr - ki * xi);
-                    out_spec[k][1] += weight * (kr * xi + ki * xr);
-                }
-
-                if (it0 < nt) {
-                    int nmax = nfilt - 2;
-                    if (nmax > nt - 1 - it0) {
-                        nmax = nt - 1 - it0;
-                    }
-                    if (nmax >= 0) {
-                        float x0 = tr_in[is][ic][0];
-                        float corr_scale = -weight * delta * x0;
-                        float *corr_trace = corr + (size_t)out_idx * nt + it0;
-                        for (int nidx = 0; nidx <= nmax; nidx++) {
-                            corr_trace[nidx] += corr_scale * filt[nidx + 1];
-                        }
-                    }
-                }
+                add_delayed_trace_freq(
+                    out_trace,
+                    in_trace,
+                    omega,
+                    iw_min,
+                    iw_max,
+                    amp,
+                    (double)tau
+                );
             }
         }
     }
 
-    fftwf_execute(plan_inverse);
-    apply_ifft_output(tr_out, fft_time_out, corr, nt, nh, ns, nfft, 1.0f / (float)nfft);
+    /*
+     * If requested, write intermediate receiver-datumed data in time domain.
+     */
+    if (interm_f != NULL) {
+        if (verb) INFO(("Writing intermediate result..."));
 
-    if (NULL != interm_f) {
+        tr_out = alloc3float(nt, nh, ns);
+
+        freq_to_time_all(f_out, tr_out, nt, nh, ns, nfft, nf);
         se_fsio_write_float(interm->data->io, tr_out[0][0], nt * nh * ns);
+
+        free3float(tr_out);
+        tr_out = NULL;
     }
 
-    fill_fft_input(fft_time, tr_out, nt, nh, ns, nfft);
-    fftwf_execute(plan_forward);
+    /*
+     * Reuse f_in as final frequency-domain output.
+     */
+    memset(f_in, 0, sizeof(fftwf_complex) * nfreq_total);
 
-    memset(fft_freq_accum, 0, sizeof(fftwf_complex) * (size_t)ntraces * nf);
-    memset(corr, 0, sizeof(float) * (size_t)ntraces * nt);
+    /*
+     * Acquisition geometry for common-receiver gather.
+     */
+    float s = fabsf((ns - 1) * ds);
+    float h = fabsf((nh - 1) * dh);
 
-    s = fabsf((ns - 1) * ds);
-    h = fabsf((nh - 1) * dh);
+    float dr;
 
     if (fabsf(ds) >= fabsf(dh)) {
         dr = fabsf(dh);
@@ -388,138 +485,124 @@ int main(int argc, char *argv[])
     } else {
         dr = fabsf(ds);
         jump = (int)(dh / ds + 0.5f);
+        if (jump < 1) jump = 1;
     }
 
     nr = (int)((s + h) / dr + 1.5f);
 
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (ir = 0; ir < nr; ir++) {
-    #ifdef _OPENMP
-        int tid = omp_get_thread_num();
-    #else
-        int tid = 0;
-    #endif
-        float *filt_time = filt_time_thread[tid];
-        fftwf_complex *filt_freq = filt_freq_thread[tid];
-        fftwf_plan plan_filter = plan_filter_thread[tid];
-        std::vector<float> &filt = filt_thread[tid];
+    /*
+     * ------------------------------------------------------------------
+     * 2. Common-receiver gather source-side datuming in frequency domain.
+     *
+     * Time-domain original:
+     * tr_in[is][ih][it] += W_s * kirdat_pick(..., tr_out[ic][hh], ...)
+     *
+     * Frequency-domain version:
+     * F_IN[is][ih](w) += W_s * exp(-i*w*tau_s) * F_OUT[ic][hh](w)
+     * ------------------------------------------------------------------
+     */
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int ir = 0; ir < nr; ir++) {
 
         if (verb) INFO(("Processing common-receiver gather %d of %d.", ir + 1, nr));
 
-        r = ir * dr + ((ds <= 0.0f) ? -1.0f : 0.0f) * s + ((dh <= 0.0f) ? -1.0f : 0.0f) * h;
+        float r = ir * dr
+                + ((ds <= 0.0f) ? -1.0f : 0.0f) * s
+                + ((dh <= 0.0f) ? -1.0f : 0.0f) * h;
 
-        sleft = (int)((ir * dr + ((ds <= 0.0f) ? -1.0f : 0.0f) * s + ((ds <= 0.0f) ? 0.0f : -1.0f) * h) / ds + 0.5f);
-        sright = (int)((ir * dr + ((ds <= 0.0f) ? -1.0f : 0.0f) * s + ((ds <= 0.0f) ? -1.0f : 0.0f) * h) / ds + 0.5f);
+        /*
+         * Source-receiver reciprocity.
+         */
+        int sleft = (int)((ir * dr
+                 + ((ds <= 0.0f) ? -1.0f : 0.0f) * s
+                 + ((ds <= 0.0f) ?  0.0f : -1.0f) * h) / ds + 0.5f);
+
+        int sright = (int)((ir * dr
+                  + ((ds <= 0.0f) ? -1.0f : 0.0f) * s
+                  + ((ds <= 0.0f) ? -1.0f : 0.0f) * h) / ds + 0.5f);
 
         if (sleft < 0) sleft = 0;
         if (sright > ns - 1) sright = ns - 1;
 
-        left = (int)((r - sleft * ds) / dh + 0.5f);
-        if (left < 0 || left > nh - 1) sleft++;
+        int left_check = (int)((r - sleft * ds) / dh + 0.5f);
+        if (left_check < 0 || left_check > nh - 1) sleft++;
 
-        right = (int)((r - sright * ds) / dh + 0.5f);
-        if (right < 0 || right > nh - 1) sright--;
+        int right_check = (int)((r - sright * ds) / dh + 0.5f);
+        if (right_check < 0 || right_check > nh - 1) sright--;
 
-        for (is = sleft; is <= sright; is = is + jump) {
-            c = (int)((s0 + is * ds - sg0) / dsg + 0.5f);
-            if (c < 0 || c > nsg - 1) ERROR(("Source table too small."));
+        for (int is = sleft; is <= sright; is += jump) {
 
-            ih = (int)((r - is * ds) / dh + 0.5f);
-            if (ih < 0 || ih > nh - 1) {
-                continue;
+            int c = (int)((s0 + is * ds - sg0) / dsg + 0.5f);
+            if (c < 0 || c > nsg - 1) {
+                ERROR(("Source table too small."));
             }
 
-            int out_idx = is * nh + ih;
+            int ih = (int)((r - is * ds) / dh + 0.5f);
+            if (ih < 0 || ih > nh - 1) continue;
 
-            left = (is - jump * aper < sleft) ? sleft : is - jump * aper;
-            right = (is + jump * aper > sright) ? sright : is + jump * aper;
+            int left  = (is - jump * aper < sleft)  ? sleft  : is - jump * aper;
+            int right = (is + jump * aper > sright) ? sright : is + jump * aper;
 
-            for (ic = left; ic <= right; ic = ic + jump) {
-                cc = (int)((s0 + ic * ds - sg0) / dsg + 0.5f);
-                if (cc < 0 || cc > nsg - 1) ERROR(("Source table too small."));
+            fftwf_complex *out_trace = freq_trace(f_in, is, ih, nh, nf);
 
-                hh = (int)((r - ic * ds) / dh + 0.5f);
-                if (hh < 0 || hh > nh - 1) {
-                    continue;
+            for (int ic = left; ic <= right; ic += jump) {
+
+                int cc = (int)((s0 + ic * ds - sg0) / dsg + 0.5f);
+                if (cc < 0 || cc > nsg - 1) {
+                    ERROR(("Source table too small."));
                 }
 
-                coef = 1.0f;
-                coef *= (ic - left >= tap) ? 1.0f : (float)(ic - left) / (float)jump / (float)tap;
-                coef *= (right - ic >= tap) ? 1.0f : (float)(right - ic) / (float)jump / (float)tap;
+                int hh = (int)((r - ic * ds) / dh + 0.5f);
+                if (hh < 0 || hh > nh - 1) continue;
 
-                tau = stable[cc][c];
-                dist = sdatum * sdatum + (ic - is) * ds * (ic - is) * ds;
-                if (dist <= 0.0f) {
-                    continue;
+                float coef = 1.0f;
+
+                if (tap > 0) {
+                    coef *= (ic - left  >= tap) ? 1.0f : (float)(ic - left) / (float)jump / (float)tap;
+                    coef *= (right - ic >= tap) ? 1.0f : (float)(right - ic) / (float)jump / (float)tap;
                 }
 
-                float delta = 0.0f;
-                int it0 = compute_it0(tau, dt, &delta);
-                if (it0 >= nt) {
-                    continue;
-                }
+                float tau = stable[cc][c];
 
-                build_kirdat_filter(tau, dt, nsam, filt);
-                memset(filt_time, 0, sizeof(float) * (size_t)nfft);
-                memcpy(filt_time, filt.data(), sizeof(float) * (size_t)nfilt);
-#ifdef _OPENMP
-#pragma omp critical(fftw_filter_exec)
-#endif
-                fftwf_execute(plan_filter);
+                float dxs = (float)(ic - is) * ds;
+                float dist = sdatum * sdatum + dxs * dxs;
 
-                float weight = coef / (float)M_PI * ds * sdatum * tau / dist;
+                if (dist <= 0.0f) continue;
+                if (tau < 0.0f) continue;
 
-                int in_idx = ic * nh + hh;
-                fftwf_complex *out_spec = fft_freq_accum + (size_t)out_idx * nf;
-                fftwf_complex *in_spec = fft_freq + (size_t)in_idx * nf;
+                double amp = (double)coef / M_PI
+                           * (double)ds
+                           * (double)sdatum
+                           * (double)tau
+                           / (double)dist;
 
-                for (int k = 0; k < nf; k++) {
-                    float interp_r = (1.0f - delta) + delta * cos_wdt[k];
-                    float interp_i = delta * sin_wdt[k];
+                const fftwf_complex *in_trace = freq_trace_const(f_out, ic, hh, nh, nf);
 
-                    float phase = -2.0f * (float)M_PI * (float)k * (float)it0 / (float)nfft;
-                    float cos_p = cosf(phase);
-                    float sin_p = sinf(phase);
-
-                    float hr = cos_p * interp_r - sin_p * interp_i;
-                    float hi = cos_p * interp_i + sin_p * interp_r;
-
-                    float fr = filt_freq[k][0];
-                    float fi = filt_freq[k][1];
-
-                    float kr = fr * hr - fi * hi;
-                    float ki = fr * hi + fi * hr;
-
-                    float xr = in_spec[k][0];
-                    float xi = in_spec[k][1];
-
-                    out_spec[k][0] += weight * (kr * xr - ki * xi);
-                    out_spec[k][1] += weight * (kr * xi + ki * xr);
-                }
-
-                if (it0 < nt) {
-                    int nmax = nfilt - 2;
-                    if (nmax > nt - 1 - it0) {
-                        nmax = nt - 1 - it0;
-                    }
-                    if (nmax >= 0) {
-                        float x0 = tr_out[ic][hh][0];
-                        float corr_scale = -weight * delta * x0;
-                        float *corr_trace = corr + (size_t)out_idx * nt + it0;
-                        for (int nidx = 0; nidx <= nmax; nidx++) {
-                            corr_trace[nidx] += corr_scale * filt[nidx + 1];
-                        }
-                    }
-                }
+                add_delayed_trace_freq(
+                    out_trace,
+                    in_trace,
+                    omega,
+                    iw_min,
+                    iw_max,
+                    amp,
+                    (double)tau
+                );
             }
         }
     }
 
-    fftwf_execute(plan_inverse);
-    apply_ifft_output(tr_in, fft_time_out, corr, nt, nh, ns, nfft, 1.0f / (float)nfft);
+    /*
+     * Convert final frequency-domain result back to time domain.
+     */
+    if (verb) INFO(("Transforming final result back to time domain..."));
+    freq_to_time_all(f_in, tr_in, nt, nh, ns, nfft, nf);
 
+    /*
+     * Output header.
+     */
     out->headers->ndim = 3;
     out->headers->n[0] = nt;
     out->headers->n[1] = nh;
@@ -533,43 +616,29 @@ int main(int argc, char *argv[])
 
     reverse_trace(nt, nh, ns, tr_in);
 
+    /*
+     * Write output.
+     */
     se_fsio_write_float(out->data->io, tr_in[0][0], nt * nh * ns);
 
+    /*
+     * Clean up.
+     */
     sep_close(in);
     sep_close(out);
-    if (interm_f != NULL) {
+
+    if (interm != NULL) {
         sep_close(interm);
     }
 
-    fftwf_destroy_plan(plan_forward);
-    fftwf_destroy_plan(plan_inverse);
-
-    for (int t = 0; t < max_threads; t++) {
-        if (plan_filter_thread[t]) {
-            fftwf_destroy_plan(plan_filter_thread[t]);
-        }
-    }
-
-    fftwf_free(fft_time);
-    fftwf_free(fft_time_out);
-    fftwf_free(fft_freq);
-    fftwf_free(fft_freq_accum);
-
-    for (int t = 0; t < max_threads; t++) {
-        if (filt_time_thread[t]) {
-            fftwf_free(filt_time_thread[t]);
-        }
-        if (filt_freq_thread[t]) {
-            fftwf_free(filt_freq_thread[t]);
-        }
-    }
-
-    free1float(corr);
     free3float(tr_in);
-    free3float(tr_out);
     free2float(stable);
     free2float(rtable);
 
+    fftwf_free(f_in);
+    fftwf_free(f_out);
+
     INFO(("Done."));
+
     return 0;
 }
