@@ -2,6 +2,7 @@
 nlayers=5
 overlap=10
 model_file=marmsmooth.rsf
+data_file=data.rsf
 
 nx=768
 nz=261
@@ -20,12 +21,12 @@ cp time1s.rsf time1r.rsf
 cp tds1s.rsf tds1r.rsf
 cp tdl1s.rsf tdl1r.rsf
 
-../build/bin/kirchmig2d seismic_data=data.rsf migration=mig_1.rsf stable=time1s.rsf sderiv=tds1s.rsf rtable=time1r.rsf rderiv=tds1r.rsf
+../build/bin/kirchmig2d seismic_data=${data_file} migration=mig_1.rsf stable=time1s.rsf sderiv=tds1s.rsf rtable=time1r.rsf rderiv=tds1r.rsf
 
 ../build/bin/greensol_auto ttabel_file=time1s.rsf tgreen_file=time1s_green.rsf model_file=marmlayer_1.rsf
 ../build/bin/greensol_auto ttabel_file=time1r.rsf tgreen_file=time1r_green.rsf model_file=marmlayer_1.rsf
 
-../build/bin/kirchdat2d_auto input_file=data.rsf output_file=rdata_1.rsf aperture=300 taper=0 length=0.05 sgreen_file=time1s_green.rsf rgreen_file=time1s_green.rsf model_file=marmlayer_1.rsf
+../build/bin/kirchdat2d_auto input_file=${data_file} output_file=rdata_1.rsf aperture=300 taper=0 length=0.05 sgreen_file=time1s_green.rsf rgreen_file=time1s_green.rsf model_file=marmlayer_1.rsf
 
 
 # 从第二层开始循环
