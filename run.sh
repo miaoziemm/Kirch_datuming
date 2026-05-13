@@ -51,3 +51,17 @@ do
     ../build/bin/kirchdat2d_auto input_file=rdata_$(($i-1)).rsf output_file=rdata_${i}.rsf aperture=300 taper=0 length=0.05 sgreen_file=time${i}s_green.rsf rgreen_file=time${i}r_green.rsf model_file=marmlayer_${i}.rsf
 done
 
+# 最后一层走时计算加成像
+../build/bin/shotgen shotfile=sht_${nlayers}.rsf nshot=${nx} oy=0 dy=${dx} 
+../build/bin/shotgen shotfile=rcv_${nlayers}.rsf nshot=${nx} oy=0 dy=${dx} 
+
+../build/bin/eikods2d in=marmlayer_${nlayers}.rsf out=time${nlayers}s.rsf shotfile=sht_${nlayers}.rsf tdl1=tdl${nlayers}s.rsf tds1=tds${nlayers}s.rsf b1=2 b2=2
+    # ../build/bin/eikods2d in=marmlayer_${nlayers}.rsf out=time${nlayers}r.rsf shotfile=rcv_${nlayers}.rsf tdl1=tdl${nlayers}r.rsf tds1=tds${nlayers}r.rsf b1=2 b2=2
+cp time${nlayers}s.rsf time${nlayers}r.rsf
+cp tds${nlayers}s.rsf tds${nlayers}r.rsf
+cp tdl${nlayers}s.rsf tdl${nlayers}r.rsf
+
+../build/bin/kirchmig2d seismic_data=rdata_$(($nlayers-1)).rsf migration=mig_${nlayers}.rsf stable=time${nlayers}s.rsf sderiv=tds${nlayers}s.rsf rtable=time${nlayers}r.rsf rderiv=tds${nlayers}r.rsf
+
+
+../build/bin/layercom full_model=marmsmooth.rsf layer_model_base=marmlayer.rsf layer_image_base=mig.rsf nlayers=${nlayers} output_file=mig_full.rsf

@@ -55,6 +55,7 @@ add_executable(kirchdat2d_freq kirchdat2d_frequency.cpp)
 add_executable(shotgen shotgen.cpp)
 add_executable(greensol greensol.cpp)
 add_executable(greensol_auto greensol_auto.cpp)
+add_executable(layercom layercom.cpp)
 add_executable(window window.cpp)
 add_executable(layervel layervel.cpp)
 
@@ -72,6 +73,7 @@ target_link_libraries(kirchdat2d_freq ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SEREC
 target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layercom ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(window ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(layervel ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
@@ -88,6 +90,7 @@ install(TARGETS
     shotgen
     greensol
     greensol_auto
+    layercom
     window
     layervel
 )
@@ -102,5 +105,6 @@ add_dependencies(kirchdat2d_freq sebasic sefs reckirch fftw3f)
 add_dependencies(shotgen sebasic sefs reckirch)
 add_dependencies(greensol sebasic sefs reckirch)
 add_dependencies(greensol_auto sebasic sefs reckirch)
+add_dependencies(layercom sebasic sefs reckirch)
 add_dependencies(window sebasic sefs reckirch)
 add_dependencies(layervel sebasic sefs reckirch)
