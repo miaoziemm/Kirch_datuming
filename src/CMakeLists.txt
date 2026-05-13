@@ -50,9 +50,11 @@ endif()
 add_executable(kirchmig2d kirchmig2d.cpp)
 add_executable(eikods2d eikods2d.cpp)
 add_executable(kirchdat2d kirchdat2d.cpp)
+add_executable(kirchdat2d_auto kirchdat2d_auto.cpp)
 add_executable(kirchdat2d_freq kirchdat2d_frequency.cpp)
 add_executable(shotgen shotgen.cpp)
 add_executable(greensol greensol.cpp)
+add_executable(greensol_auto greensol_auto.cpp)
 add_executable(window window.cpp)
 add_executable(layervel layervel.cpp)
 
@@ -65,9 +67,11 @@ find_package(Threads REQUIRED)
 target_link_libraries(kirchmig2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(eikods2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(kirchdat2d_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchdat2d_freq ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(greensol_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(window ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(layervel ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
@@ -79,9 +83,11 @@ install(TARGETS
     kirchmig2d
     eikods2d
     kirchdat2d
+    kirchdat2d_auto
     kirchdat2d_freq
     shotgen
     greensol
+    greensol_auto
     window
     layervel
 )
@@ -91,8 +97,10 @@ install(TARGETS
 add_dependencies(kirchmig2d sebasic sefs reckirch)
 add_dependencies(eikods2d sebasic sefs reckirch)
 add_dependencies(kirchdat2d sebasic sefs reckirch)
+add_dependencies(kirchdat2d_auto sebasic sefs reckirch)
 add_dependencies(kirchdat2d_freq sebasic sefs reckirch fftw3f)
 add_dependencies(shotgen sebasic sefs reckirch)
 add_dependencies(greensol sebasic sefs reckirch)
+add_dependencies(greensol_auto sebasic sefs reckirch)
 add_dependencies(window sebasic sefs reckirch)
 add_dependencies(layervel sebasic sefs reckirch)
