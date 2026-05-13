@@ -54,6 +54,7 @@ add_executable(kirchdat2d_freq kirchdat2d_frequency.cpp)
 add_executable(shotgen shotgen.cpp)
 add_executable(greensol greensol.cpp)
 add_executable(window window.cpp)
+add_executable(layervel layervel.cpp)
 
 # 查找系统库（SQLite3 依赖）
 find_library(DL_LIBRARY dl)
@@ -68,6 +69,7 @@ target_link_libraries(kirchdat2d_freq ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SEREC
 target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(window ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layervel ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
 target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 
@@ -81,6 +83,7 @@ install(TARGETS
     shotgen
     greensol
     window
+    layervel
 )
 
 # 确保依赖的库先编译完成
@@ -92,3 +95,4 @@ add_dependencies(kirchdat2d_freq sebasic sefs reckirch fftw3f)
 add_dependencies(shotgen sebasic sefs reckirch)
 add_dependencies(greensol sebasic sefs reckirch)
 add_dependencies(window sebasic sefs reckirch)
+add_dependencies(layervel sebasic sefs reckirch)
