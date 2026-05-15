@@ -24,6 +24,13 @@ int main(int argc, char* argv[])
     out->headers->n[0] = 3;
     out->headers->n[1] = nshot;
     
+    out->headers->d[0] = dy;
+
+    
+//    // 打印参数信息ox, dx, oy, dy, zs
+//    printf("ox: %f, dx: %f, oy: %f, dy: %f, zs: %f\n", ox, dx, oy, dy, zs);
+
+    
 
     for(int is=0; is<nshot; is++)
     {
