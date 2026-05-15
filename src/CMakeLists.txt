@@ -58,6 +58,7 @@ add_executable(greensol_auto greensol_auto.cpp)
 add_executable(layercom layercom.cpp)
 add_executable(window window.cpp)
 add_executable(layervel layervel.cpp)
+add_executable(kirchdat2d_auto_cs kirchdat2d_auto_cs.cpp)
 
 # 查找系统库（SQLite3 依赖）
 find_library(DL_LIBRARY dl)
@@ -76,6 +77,7 @@ target_link_libraries(greensol_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKI
 target_link_libraries(layercom ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(window ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(layervel ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(kirchdat2d_auto_cs ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 
 target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 
@@ -93,6 +95,7 @@ install(TARGETS
     layercom
     window
     layervel
+    kirchdat2d_auto_cs
 )
 
 # 确保依赖的库先编译完成
@@ -108,3 +111,4 @@ add_dependencies(greensol_auto sebasic sefs reckirch)
 add_dependencies(layercom sebasic sefs reckirch)
 add_dependencies(window sebasic sefs reckirch)
 add_dependencies(layervel sebasic sefs reckirch)
+add_dependencies(kirchdat2d_auto_cs sebasic sefs reckirch)

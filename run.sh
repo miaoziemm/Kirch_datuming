@@ -9,6 +9,7 @@ nz=261
 dx=0.01
 dz=0.01
 
+
 ../build/bin/layervel input_file=${model_file} nlayers=${nlayers} overlap=${overlap} output_file_base=marmlayer.rsf
 
 # 对第一层进行走时计算和成像
