@@ -92,8 +92,8 @@ int main(int argc, char* argv[])
         sep_copy_headers(out, in);
         out->headers->ndim = in->headers->ndim;
         sep_set_axis(out, 0, m1, in->headers->o[0], in->headers->d[0], label1);
-        int should_datum = m1 - overlap - 1;
-        int should_datum_abs = end - overlap;
+        int should_datum = m1 - overlap - 1 + 1;
+        int should_datum_abs = end - overlap+1;
         sep_set_header_int(out, "should_datum", should_datum);
         sep_set_header_int(out, "should_datum_abs", should_datum_abs);
         sep_write_headers(out);

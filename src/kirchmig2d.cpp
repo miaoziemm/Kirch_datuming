@@ -194,6 +194,11 @@ int main(int argc, char *argv[])
         tau = 0.0;
     else
         tau = se_get_par_float("tau"); /* static time-shift (in second) */
+
+
+    // 打印tau
+    INFO(("tau = %f\n", tau));
+    
     if (!se_have_par("aperture"))
         aper = 90.0;
     else
