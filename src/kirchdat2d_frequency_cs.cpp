@@ -7,6 +7,10 @@
 
 #include <fftw3.h>
 
+#ifdef SE_USE_OMP
+#include <omp.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -26,6 +30,9 @@ typedef struct {
 static void reverse_trace(int nt, int nh, int ns, float ***tr)
 {
     INFO(("Reversing traces..."));
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
     for (int is = 0; is < ns; is++) {
         for (int ih = 0; ih < nh; ih++) {
             for (int it = 0; it < nt / 2; it++) {
@@ -363,6 +370,9 @@ int main(int argc, char **argv)
 
     fft_traces_to_freq(tr_in, &ctx, p_f, rpad, spec, Uin);
 
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
     for (int iw = 0; iw < ctx.nw; iw++) {
         apply_receiver_operator_freq_iw(&ctx, Uin, Utmp, iw);
     }
@@ -372,6 +382,9 @@ int main(int argc, char **argv)
         se_fsio_write_float(interm->data->io, tr_out[0][0], ctx.nt * ctx.nh * ctx.ns);
     }
 
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
     for (int iw = 0; iw < ctx.nw; iw++) {
         apply_source_operator_freq_iw(&ctx, Utmp, Uout, iw);
     }
