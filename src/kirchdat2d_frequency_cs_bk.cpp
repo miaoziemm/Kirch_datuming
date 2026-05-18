@@ -24,23 +24,23 @@ typedef struct {
     int nfft, nw, nsam;
     float dt, h0, dh, s0, ds, sg0, dsg, rg0, drg;
     float sdatum, rdatum;
-    float antialias;
     float **stable, **rtable;
 } FreqContext;
 
-static void reverse_trace_1d(int nt, float *tr)
+static void reverse_trace(int nt, int nh, int ns, float ***tr)
 {
-    for (int it = 0; it < nt / 2; it++) {
-        float t = tr[it];
-        tr[it] = tr[nt - 1 - it];
-        tr[nt - 1 - it] = t;
-    }
-}
-
-static void reverse_traces_2d(int nt, int nh, float **tr)
-{
-    for (int ih = 0; ih < nh; ih++) {
-        reverse_trace_1d(nt, tr[ih]);
+    INFO(("Reversing traces..."));
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int is = 0; is < ns; is++) {
+        for (int ih = 0; ih < nh; ih++) {
+            for (int it = 0; it < nt / 2; it++) {
+                float t = tr[is][ih][it];
+                tr[is][ih][it] = tr[is][ih][nt - 1 - it];
+                tr[is][ih][nt - 1 - it] = t;
+            }
+        }
     }
 }
 
@@ -142,39 +142,6 @@ static void accumulate_pair_at_freq(float ar, float ai, float br, float bi, floa
     *oi += w * (ar * bi + ai * br);
 }
 
-
-static inline float table_slope_first_index(float **table, int n, int row, int col, float dcoord)
-{
-    if (n <= 1 || dcoord == 0.0f) return 0.0f;
-    if (row <= 0) return (table[1][col] - table[0][col]) / dcoord;
-    if (row >= n - 1) return (table[n - 1][col] - table[n - 2][col]) / dcoord;
-    return 0.5f * (table[row + 1][col] - table[row - 1][col]) / dcoord;
-}
-
-static inline float antialias_weight_iw(const FreqContext *ctx, int iw, float dtau)
-{
-    if (ctx->antialias <= 0.0f) return 1.0f;
-    if (iw <= 0) return 1.0f;
-
-    dtau = fabsf(dtau) * ctx->antialias;
-    if (dtau <= 1e-12f || !isfinite(dtau)) return 1.0f;
-
-    float freq = (float)iw / ((float)ctx->nfft * ctx->dt);
-    float fnyq = 0.5f / ctx->dt;
-    float fmax = 0.5f / dtau;
-
-    if (fmax >= fnyq) return 1.0f;
-    if (fmax <= 0.0f) return 0.0f;
-
-    /* Smooth transition avoids ringing caused by a hard frequency cut. */
-    float fpass = 0.8f * fmax;
-    if (freq <= fpass) return 1.0f;
-    if (freq >= fmax) return 0.0f;
-
-    float x = (freq - fpass) / (fmax - fpass);
-    return 0.5f * (1.0f + cosf((float)M_PI * x));
-}
-
 static inline float taper_weight(int left, int center, int right, int tap, int stride)
 {
     if (tap <= 0) return 1.0f;
@@ -189,39 +156,25 @@ static inline float taper_weight(int left, int center, int right, int tap, int s
     return wl * wr;
 }
 
-static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **shot,
-                                fftwf_plan p_f, float *pad, fftwf_complex *spec, fftwf_complex *U)
+static void fft_traces_to_freq(float ***tr, const FreqContext *ctx, fftwf_plan p_f, float *pad, fftwf_complex *spec, fftwf_complex *U)
 {
-    size_t shot_size = (size_t)ctx->nt * ctx->nh;
-
-    /* Read and FFT one shot at a time to avoid buffering the full time cube. */
-    se_fsio_seek(io, 0);
     for (int is = 0; is < ctx->ns; is++) {
-        se_fsio_read_float(io, shot[0], shot_size);
-        reverse_traces_2d(ctx->nt, ctx->nh, shot);
         for (int ih = 0; ih < ctx->nh; ih++) {
             memset(pad, 0, (size_t)ctx->nfft * sizeof(float));
-            memcpy(pad, shot[ih], (size_t)ctx->nt * sizeof(float));
+            memcpy(pad, tr[is][ih], (size_t)ctx->nt * sizeof(float));
             fftwf_execute(p_f);
             memcpy(&U[IDX3(is, ih, 0, ctx->nh, ctx->nw)], spec, (size_t)ctx->nw * sizeof(fftwf_complex));
         }
     }
 }
 
-static void write_traces_from_freq(fftwf_complex *U, const FreqContext *ctx, fftwf_plan p_b,
-                                   fftwf_complex *spec, float *pad, se_fsio *io, int reverse)
+static void ifft_traces_from_freq(fftwf_complex *U, const FreqContext *ctx, fftwf_plan p_b, fftwf_complex *spec, float *pad, float ***tr)
 {
     for (int is = 0; is < ctx->ns; is++) {
         for (int ih = 0; ih < ctx->nh; ih++) {
             memcpy(spec, &U[IDX3(is, ih, 0, ctx->nh, ctx->nw)], (size_t)ctx->nw * sizeof(fftwf_complex));
             fftwf_execute(p_b);
-            for (int it = 0; it < ctx->nt; it++) {
-                pad[it] /= ctx->nfft;
-            }
-            if (reverse) {
-                reverse_trace_1d(ctx->nt, pad);
-            }
-            se_fsio_write_float(io, pad, (size_t)ctx->nt);
+            for (int it = 0; it < ctx->nt; it++) tr[is][ih][it] = pad[it] / ctx->nfft;
         }
     }
 }
@@ -245,14 +198,6 @@ static void apply_receiver_operator_freq_iw(const FreqContext *ctx, fftwf_comple
                 float tau = ctx->rtable[cc][c];
                 float dist = ctx->rdatum * ctx->rdatum + (ic - ih) * (ic - ih) * ctx->dh * ctx->dh;
                 float w = coef / M_PI * ctx->dh * ctx->rdatum * tau / dist;
-
-                /* Frequency-domain operator anti-aliasing on receiver summation.
-                 * The local phase increment is approximated by dT/dr * dh.
-                 */
-                float slope = table_slope_first_index(ctx->rtable, ctx->nrg, cc, c, ctx->drg);
-                float aa = antialias_weight_iw(ctx, iw, slope * fabsf(ctx->dh));
-                w *= aa;
-
                 if (fabsf(w) < 1e-20f) continue;
                 size_t key = (size_t)cc * ctx->nrg + c;
                 if (!cached[key]) {
@@ -311,15 +256,6 @@ static void apply_source_operator_freq_iw(const FreqContext *ctx, fftwf_complex 
                     float tau = ctx->stable[cc][c];
                     float dist = ctx->sdatum * ctx->sdatum + (ic - is) * (ic - is) * ctx->ds * ctx->ds;
                     float w = coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
-
-                    /* Frequency-domain operator anti-aliasing on source summation.
-                     * In cmp mode the source loop may skip by jump, so the sampled
-                     * source interval is jump * ds.
-                     */
-                    float slope = table_slope_first_index(ctx->stable, ctx->nsg, cc, c, ctx->dsg);
-                    float aa = antialias_weight_iw(ctx, iw, slope * fabsf((float)jump * ctx->ds));
-                    w *= aa;
-
                     if (fabsf(w) < 1e-20f) continue;
                     size_t key = (size_t)cc * ctx->nsg + c;
                     if (!cached[key]) {
@@ -350,12 +286,6 @@ static void apply_source_operator_freq_iw(const FreqContext *ctx, fftwf_complex 
                 float tau = ctx->stable[cc][c];
                 float dist = ctx->sdatum * ctx->sdatum + (ic - is) * (ic - is) * ctx->ds * ctx->ds;
                 float w = coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
-
-                /* Frequency-domain operator anti-aliasing on source summation. */
-                float slope = table_slope_first_index(ctx->stable, ctx->nsg, cc, c, ctx->dsg);
-                float aa = antialias_weight_iw(ctx, iw, slope * fabsf(ctx->ds));
-                w *= aa;
-
                 if (fabsf(w) < 1e-20f) continue;
                 size_t key = (size_t)cc * ctx->nsg + c;
                 if (!cached[key]) {
@@ -408,7 +338,7 @@ int main(int argc, char **argv)
     int should_datum = 0;
     char *in_f = NULL, *out_f = NULL, *sgreen_f = NULL, *rgreen_f = NULL, *model_f = NULL, *interm_f = NULL;
     sep_t *in, *out, *sgreen, *rgreen, *model, *interm = NULL;
-    float **shot = NULL, **stable, **rtable;
+    float ***tr_in, ***tr_out, **stable, **rtable;
 
     if (!se_have_par("input_file")) ERROR(("Need input_file=")); else in_f = se_get_par_str("input_file");
     if (!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
@@ -430,8 +360,6 @@ int main(int argc, char **argv)
 
     ctx.aper = se_have_par("aperture") ? se_get_par_int("aperture") : 50;
     ctx.tap = se_have_par("taper") ? se_get_par_int("taper") : 10;
-    ctx.antialias = se_have_par("antialias") ? se_get_par_float("antialias") : 1.0f;
-    if (ctx.antialias < 0.0f) ERROR(("antialias must be >= 0."));
     float length = se_have_par("length") ? se_get_par_float("length") : 0.025f;
 
     if (in->headers->ndim < 3) ERROR(("Input must be 3D."));
@@ -446,6 +374,11 @@ int main(int argc, char **argv)
 
     ctx.sdatum = (float)(model->headers->o[0] + should_datum * model->headers->d[0]);
     ctx.rdatum = ctx.sdatum;
+
+    tr_in = alloc3float(ctx.nt, ctx.nh, ctx.ns);
+    tr_out = alloc3float(ctx.nt, ctx.nh, ctx.ns);
+    se_fsio_read_float(in->data->io, tr_in[0][0], ctx.nt * ctx.nh * ctx.ns);
+    reverse_trace(ctx.nt, ctx.nh, ctx.ns, tr_in);
 
     sgreen = sep_open(sgreen_f, SEP_READ, 0);
     if (sgreen->headers->ndim < 2) ERROR(("Source Green's function must be 2D."));
@@ -477,10 +410,6 @@ int main(int argc, char **argv)
     ctx.nfft = choose_nfft(ctx.nt, ctx.nsam, ctx.dt, ctx.nrg, ctx.nsg, rtable, stable);
     ctx.nw = ctx.nfft / 2 + 1;
 
-    if (ctx.verb) {
-        INFO(("antialias = %g; set antialias=0 to disable frequency-domain operator anti-aliasing.", ctx.antialias));
-    }
-
     float *rpad = (float *)fftwf_malloc((size_t)ctx.nfft * sizeof(float));
     fftwf_complex *spec = (fftwf_complex *)fftwf_malloc((size_t)ctx.nw * sizeof(fftwf_complex));
     fftwf_plan p_f = fftwf_plan_dft_r2c_1d(ctx.nfft, rpad, spec, FFTW_ESTIMATE);
@@ -488,13 +417,12 @@ int main(int argc, char **argv)
 
     fftwf_complex *Uin = (fftwf_complex *)fftwf_malloc((size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
     fftwf_complex *Utmp = (fftwf_complex *)fftwf_malloc((size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
+    fftwf_complex *Uout = (fftwf_complex *)fftwf_malloc((size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
 
     memset(Utmp, 0, (size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
+    memset(Uout, 0, (size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
 
-    shot = alloc2float(ctx.nt, ctx.nh);
-    read_traces_to_freq(in->data->io, &ctx, shot, p_f, rpad, spec, Uin);
-    free2float(shot);
-    shot = NULL;
+    fft_traces_to_freq(tr_in, &ctx, p_f, rpad, spec, Uin);
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -505,14 +433,9 @@ int main(int argc, char **argv)
     }
 
     if (interm) {
-        write_traces_from_freq(Utmp, &ctx, p_b, spec, rpad, interm->data->io, 0);
+        ifft_traces_from_freq(Utmp, &ctx, p_b, spec, rpad, tr_out);
+        se_fsio_write_float(interm->data->io, tr_out[0][0], ctx.nt * ctx.nh * ctx.ns);
     }
-
-    fftwf_free(Uin);
-    Uin = NULL;
-
-    fftwf_complex *Uout = (fftwf_complex *)fftwf_malloc((size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
-    memset(Uout, 0, (size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -522,8 +445,7 @@ int main(int argc, char **argv)
         apply_source_operator_freq_iw(&ctx, Utmp, Uout, iw);
     }
 
-    fftwf_free(Utmp);
-    Utmp = NULL;
+    ifft_traces_from_freq(Uout, &ctx, p_b, spec, rpad, tr_in);
 
     out->headers->ndim = 3;
     out->headers->n[0] = ctx.nt;
@@ -536,12 +458,15 @@ int main(int argc, char **argv)
     out->headers->o[1] = ctx.h0;
     out->headers->o[2] = ctx.s0;
 
-    write_traces_from_freq(Uout, &ctx, p_b, spec, rpad, out->data->io, 1);
+    reverse_trace(ctx.nt, ctx.nh, ctx.ns, tr_in);
+    se_fsio_write_float(out->data->io, tr_in[0][0], ctx.nt * ctx.nh * ctx.ns);
 
     fftwf_destroy_plan(p_f);
     fftwf_destroy_plan(p_b);
     fftwf_free(rpad);
     fftwf_free(spec);
+    fftwf_free(Uin);
+    fftwf_free(Utmp);
     fftwf_free(Uout);
 
     sep_close(in);
@@ -549,7 +474,8 @@ int main(int argc, char **argv)
     sep_close(model);
     if (interm) sep_close(interm);
 
-    if (shot) free2float(shot);
+    free3float(tr_in);
+    free3float(tr_out);
     free2float(stable);
     free2float(rtable);
 
