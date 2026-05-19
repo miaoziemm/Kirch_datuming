@@ -37,7 +37,6 @@ int main(int argc, char* argv[])
 	char* layer_model_base = NULL;
 	char* layer_image_base = NULL;
 	char* out_f = NULL;
-	float scale = 1.0f;
 
 	if (!se_have_par("full_model")) ERROR(("Need full_model=")); else full_model_f = se_get_par_str("full_model");
 	if (!se_have_par("layer_model_base")) ERROR(("Need layer_model_base=")); else layer_model_base = se_get_par_str("layer_model_base");
@@ -45,14 +44,9 @@ int main(int argc, char* argv[])
 	if (!se_have_par("nlayers")) ERROR(("Need nlayers=")); else nlayers = se_get_par_int("nlayers");
 	if (!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
 
-	/* scale is used to amplify the layer image from the second layer onward. */
-	if (se_have_par("scale")) scale = se_get_par_float("scale");
-
 	if (nlayers <= 0) {
 		ERROR(("Invalid nlayers=%d", nlayers));
 	}
-
-	INFO(("Layer image scale factor for lower layers: scale=%g", scale));
 
 	sep_t* full_model = sep_open(full_model_f, SEP_READ, 0);
 	int full_ndim = (int)sep_get_min_ndim(full_model);
@@ -143,16 +137,6 @@ int main(int argc, char* argv[])
 					int gz = start + i1;
 					float val = layer_data[i3][i2][i1];
 
-					/*
-					 * Minimal modification:
-					 * before stitching the current lower layer with the previous layer,
-					 * amplify the current layer image by scale.
-					 * The first layer is kept unchanged.
-					 */
-					if (ilayer > 0) {
-						val *= scale;
-					}
-
 					if (overlap > 0 && gz <= prev_end) {
 						int k = gz - start;
 						float w = 0.5f;
@@ -200,3 +184,4 @@ int main(int argc, char* argv[])
 
 	return 0;
 }
+

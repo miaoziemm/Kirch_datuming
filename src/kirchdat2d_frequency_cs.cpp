@@ -175,19 +175,23 @@ static inline float antialias_weight_iw(const FreqContext *ctx, int iw, float dt
     return 0.5f * (1.0f + cosf((float)M_PI * x));
 }
 
-static inline float taper_weight(int left, int center, int right, int tap, int stride)
-{
-    if (tap <= 0) return 1.0f;
-    /*
-     * Match kirchdat2d_auto_cs.cpp exactly:
-     *   cmp=0/receiver pass: (ic-left)/tap and (right-ic)/tap (integer division)
-     *   cmp=1/source pass:   (ic-left)/jump/tap and (right-ic)/jump/tap (integer division)
-     * We intentionally keep integer-division semantics here for numerical equivalence.
-     */
-    float wl = (center - left >= tap) ? 1.0f : (float)(((center - left) / stride) / tap);
-    float wr = (right - center >= tap) ? 1.0f : (float)(((right - center) / stride) / tap);
-    return wl * wr;
-}
+ static inline float taper_weight(int left, int center, int right, int tap, int stride)
+ {
+     if (tap <= 0) return 1.0f;
+     /*
+      * Match kirchdat2d_auto_cs.cpp exactly:
+      *   cmp=0/receiver pass: (ic-left)/tap and (right-ic)/tap (integer division)
+      *   cmp=1/source pass:   (ic-left)/jump/tap and (right-ic)/jump/tap (integer division)
+      * We intentionally keep integer-division semantics here for numerical equivalence.
+      */
+     float wl = (center - left >= tap) ? 1.0f : (float)(((center - left) / stride) / tap);
+     float wr = (right - center >= tap) ? 1.0f : (float)(((right - center) / stride) / tap);
+     return wl * wr;
+ }
+
+
+
+
 
 static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **shot,
                                 fftwf_plan p_f, float *pad, fftwf_complex *spec, fftwf_complex *U)

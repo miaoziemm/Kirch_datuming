@@ -17,6 +17,22 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+void diff2(float *trace,int n, float d)
+{
+    int i;
+    float *tmp = alloc1float(n);
+    for (i=0; i < n; i++) {
+    tmp[i] = trace[i];
+    }
+    for (i=1; i < n-1; i++) {
+    trace[i] = (tmp[i+1]-tmp[i-1])/(2.*d);
+    }
+    trace[0] = (tmp[1]-tmp[0])/d;
+    trace[n-1] = (tmp[n-1]-tmp[n-2])/d;
+    free1float(tmp);
+}
+
+
 int main(int argc, char *argv[])
 {
     se_par_init(argc, argv);
@@ -30,6 +46,15 @@ int main(int argc, char *argv[])
     float aal = 0.0f, tx = 0.0f, aper = 0.0f;
     sep_t *dat = NULL, *mig = NULL, *stim = NULL, *sder = NULL, *rtim = NULL, *rder = NULL;
     char *dat_f = NULL, *mig_f = NULL, *stim_f = NULL, *sder_f = NULL, *rtim_f = NULL, *rder_f = NULL;
+
+    int aperture_trace = -1; //用于限定成像道数，如果为-1则不限定
+
+    if(!se_have_par("aperture_trace"))
+        aperture_trace = -1;
+    else
+        aperture_trace = se_get_par_int("aperture_trace");
+
+    INFO(("aperture_trace = %d\n", aperture_trace));
 
     if (!se_have_par("adj"))
         adj = 1;
@@ -362,9 +387,32 @@ int main(int argc, char *argv[])
         for (ih = 0; ih < nh; ih++)
         { /* offset */
             h = h0 + ih * dh;
-
             /* cubic Hermite spline interpolation */
             iht = cmp ? (s + h - ry0) / rdy : (h - ry0) / rdy;
+
+
+             if (adj)
+            {
+                /* read trace */
+                se_fsio_read_float(dat->data->io, trace, nt);
+                // 根据aperture_trace参数限定成像道数
+                if (aperture_trace != -1 && fabs(iht-ist) >= aperture_trace) continue;
+                doubint(nt, trace);
+
+                diff2(trace, nt, dt);
+
+            }
+            else
+            {
+                for (ithr = 0; ithr < nthr; ithr++)
+                {
+                    for (i = 0; i < nt; i++)
+                    {
+                        traces[ithr][i] = 0.;
+                    }
+                }
+            }
+
             if (iht <= 0)
             {
                 for (i = 0; i < nzx; i++)
@@ -402,23 +450,7 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (adj)
-            {
-                /* read trace */
-                se_fsio_read_float(dat->data->io, trace, nt);
-                
-                doubint(nt, trace);
-            }
-            else
-            {
-                for (ithr = 0; ithr < nthr; ithr++)
-                {
-                    for (i = 0; i < nt; i++)
-                    {
-                        traces[ithr][i] = 0.;
-                    }
-                }
-            }
+           
 
 #ifdef _OPENMP
 #pragma omp parallel for private(iz, ix, t1, t2, ti, tx, ithr)
@@ -473,7 +505,8 @@ int main(int argc, char *argv[])
                 t2 = rtable[i];
                 ti = t1 + t2 + tau;
 
-                tx = MAX(fabsf(stablex[i] * ds), fabsf(rtablex[i] * dh));
+                 tx = MAX(fabsf(stablex[i] * ds), fabsf(rtablex[i] * dh));
+
                 kirmig_pick(adj, ti, tx * aal, out[cig ? ih : 0] + i, adj ? trace : traces[ithr]);
             }
 
