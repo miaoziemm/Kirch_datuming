@@ -213,33 +213,33 @@ static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **sho
 }
 
 
-static void highpassfilt(fftwf_complex *spec, int nw, float df, float fmin)
-{
-    if (!spec || nw <= 0 || df <= 0.0f) return;
-    if (fmin <= 0.0f) return;
+// static void highpassfilt(fftwf_complex *spec, int nw, float df, float fmin)
+// {
+//     if (!spec || nw <= 0 || df <= 0.0f) return;
+//     if (fmin <= 0.0f) return;
 
-    float trans = fmaxf(4.0f * df, 0.1f * fmin);
-    if (trans >= fmin) trans = fmin;
-    float f1 = fmin + trans;
+//     float trans = fmaxf(4.0f * df, 0.1f * fmin);
+//     if (trans >= fmin) trans = fmin;
+//     float f1 = fmin + trans;
 
-    for (int iw = 0; iw < nw; iw++) {
-        float freq = iw * df;
-        float w = 1.0f;
-        if (freq <= fmin) {
-            w = 0.0f;
-        } else if (freq < f1) {
-            float x = (freq - fmin) / (f1 - fmin);
-            w = 0.5f * (1.0f - cosf((float)M_PI * x));
-        }
-        if (w <= 0.0f) {
-            spec[iw][0] = 0.0f;
-            spec[iw][1] = 0.0f;
-        } else if (w < 1.0f) {
-            spec[iw][0] *= w;
-            spec[iw][1] *= w;
-        }
-    }
-}
+//     for (int iw = 0; iw < nw; iw++) {
+//         float freq = iw * df;
+//         float w = 1.0f;
+//         if (freq <= fmin) {
+//             w = 0.0f;
+//         } else if (freq < f1) {
+//             float x = (freq - fmin) / (f1 - fmin);
+//             w = 0.5f * (1.0f - cosf((float)M_PI * x));
+//         }
+//         if (w <= 0.0f) {
+//             spec[iw][0] = 0.0f;
+//             spec[iw][1] = 0.0f;
+//         } else if (w < 1.0f) {
+//             spec[iw][0] *= w;
+//             spec[iw][1] *= w;
+//         }
+//     }
+// }
 
 static void lowpassfilt(fftwf_complex *spec, int nw, float df, float fmax)
 {
