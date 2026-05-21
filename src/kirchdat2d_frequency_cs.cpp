@@ -410,6 +410,7 @@ int main(int argc, char **argv)
     se_par_init(argc, argv);
 
     int should_datum = 0;
+    int auto_datum = 1;
     char *in_f = NULL, *out_f = NULL, *sgreen_f = NULL, *rgreen_f = NULL, *model_f = NULL, *interm_f = NULL;
     sep_t *in, *out, *sgreen, *rgreen, *model, *interm = NULL;
     float **shot = NULL, **stable, **rtable;
@@ -429,8 +430,20 @@ int main(int argc, char **argv)
     ctx.cmp = se_have_par("cmp") ? se_get_par_int("cmp") : 1;
     if (ctx.cmp != 0 && ctx.cmp != 1) ERROR(("cmp must be 0 or 1."));
 
-    if (sep_have_hdr_int(model, "should_datum")) should_datum = sep_get_hdr_int(model, "should_datum", 0);
-    else ERROR(("Need should_datum in model_file header"));
+    auto_datum = se_have_par("auto_datum") ? se_get_par_int("auto_datum") : 1;
+    if (auto_datum != 0 && auto_datum != 1) ERROR(("auto_datum must be 0 or 1."));
+    if (auto_datum) {
+        if (sep_have_hdr_int(model, "should_datum")) should_datum = sep_get_hdr_int(model, "should_datum", 0);
+        else ERROR(("Need should_datum in model_file header when auto_datum=1"));
+
+        ctx.sdatum = (float)(model->headers->o[0] + should_datum * model->headers->d[0]);
+        ctx.rdatum = ctx.sdatum;
+    } else {
+        if (!se_have_par("sdatum")) ERROR(("Need sdatum= when auto_datum=0"));
+        if (!se_have_par("rdatum")) ERROR(("Need rdatum= when auto_datum=0"));
+        ctx.sdatum = se_get_par_float("sdatum");
+        ctx.rdatum = se_get_par_float("rdatum");
+    }
 
     ctx.aper = se_have_par("aperture") ? se_get_par_int("aperture") : 50;
     ctx.tap = se_have_par("taper") ? se_get_par_int("taper") : 10;
@@ -448,8 +461,7 @@ int main(int argc, char **argv)
     ctx.s0 = in->headers->o[2];
     ctx.ds = in->headers->d[2];
 
-    ctx.sdatum = (float)(model->headers->o[0] + should_datum * model->headers->d[0]);
-    ctx.rdatum = ctx.sdatum;
+   
 
     sgreen = sep_open(sgreen_f, SEP_READ, 0);
     if (sgreen->headers->ndim < 2) ERROR(("Source Green's function must be 2D."));
