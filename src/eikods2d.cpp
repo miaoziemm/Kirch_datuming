@@ -184,7 +184,7 @@ int main(int argc, char *argv[])
 
         oshot = s[0][1];
         dshot = -s[0][1] + (o2 + 0.5 * (n2 - 1) * d2);
-        WARN(("Shooting from zshot=%g yshot=%g xshot=%g",
+        INFO(("Shooting from zshot=%g yshot=%g xshot=%g",
               s[0][0], s[0][1], s[0][2]));
     }
 
@@ -259,9 +259,11 @@ int main(int argc, char *argv[])
     /* loop over shots */
     for (is = 0; is < nshot; is++)
     {
-        WARN(("shot %d of %d;", is + 1, nshot));
-        WARN(("Shooting from zshot=%g yshot=%g xshot=%g",
+        if (is % 100 == 0) {
+        INFO(("shot %d of %d;", is + 1, nshot));
+        INFO(("Shooting from zshot=%g yshot=%g xshot=%g",
               s[is][0], s[is][1], s[is][2]));
+        }
         if (sweep)
         {
             continue;
@@ -286,7 +288,7 @@ int main(int argc, char *argv[])
         if (tds2 != NULL)
             se_fsio_write_float(tds2->data->io, ds2, n123);
     }
-    WARN(("."));
+    INFO(("FINISH."));
 
     time->headers->n[0] = n1;
     time->headers->d[0] = d1;
