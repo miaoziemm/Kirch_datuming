@@ -10,5 +10,7 @@
 #include "tpow.h"
 #include "kirmig.h"
 #include "kirdat.h"
+#include "efmm.h"
+#include "bf1d.h"
 
 #endif

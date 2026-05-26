@@ -6,7 +6,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
-#include <math.h>
 
 typedef struct {
 	int start;
@@ -28,18 +27,6 @@ static int is_end_token(const char* s)
 	       (strcmp(s, "END") == 0 ||
 	        strcmp(s, "End") == 0 ||
 	        strcmp(s, "end") == 0);
-}
-
-static int imin2(int a, int b)
-{
-	return a < b ? a : b;
-}
-
-static float clamp_float(float v, float vmin, float vmax)
-{
-	if (v < vmin) return vmin;
-	if (v > vmax) return vmax;
-	return v;
 }
 
 static char* build_output_name(const char* base, int layer_index)
@@ -236,76 +223,6 @@ static layer_range_t* read_layer_txt(const char* fname, int n1, int* nlayers_out
 	return layers;
 }
 
-static float compute_overlap_energy_scale(float*** out_data,
-                                          float*** layer_data,
-                                          int n2, int n3,
-                                          int start,
-                                          int overlap,
-                                          int blend_start,
-                                          int blend_z,
-                                          int auto_scale_nz,
-                                          const float* scalex_layer,
-                                          float eps,
-                                          float scale_min,
-                                          float scale_max)
-/*<
- * Estimate the scale for the current lower layer by matching the energy of
- * the already-stitched upper image and the current lower image in the valid
- * overlap zone.
- *
- * If stitch_blend=20 and overlap=50, blend_start=30.  The default
- * auto_scale_nz=1 uses k=30, i.e., the first effective row of the lower
- * layer.  Set auto_scale_nz=0 to use the whole effective blending zone.
- *>*/
-{
-	if (overlap <= 0) return 1.0f;
-
-	int k0 = 0;
-	int nz_avail = 0;
-
-	if (blend_z > 0) {
-		k0 = blend_start;
-		nz_avail = blend_z;
-	} else {
-		/* No lower-layer sample is used inside the overlap.  Use the last
-		 * overlapping row as the closest common-depth reference.
-		 */
-		k0 = overlap - 1;
-		nz_avail = 1;
-	}
-
-	if (k0 < 0 || k0 >= overlap || nz_avail <= 0) return 1.0f;
-
-	int nz_use = (auto_scale_nz <= 0) ? nz_avail : imin2(auto_scale_nz, nz_avail);
-	if (k0 + nz_use > overlap) nz_use = overlap - k0;
-	if (nz_use <= 0) return 1.0f;
-
-	double upper_energy = 0.0;
-	double lower_energy = 0.0;
-
-	for (int i3 = 0; i3 < n3; ++i3) {
-		for (int i2 = 0; i2 < n2; ++i2) {
-			float scale_x = scalex_layer ? scalex_layer[i2] : 1.0f;
-			for (int iz = 0; iz < nz_use; ++iz) {
-				int k = k0 + iz;
-				int gz = start + k;
-				float u = out_data[i3][i2][gz];
-				float l = layer_data[i3][i2][k] * scale_x;
-				upper_energy += (double)u * (double)u;
-				lower_energy += (double)l * (double)l;
-			}
-		}
-	}
-
-	if (upper_energy <= (double)eps || lower_energy <= (double)eps) {
-		return 1.0f;
-	}
-
-	float scale = (float)sqrt(upper_energy / lower_energy);
-	if (!isfinite(scale)) scale = 1.0f;
-	return clamp_float(scale, scale_min, scale_max);
-}
-
 int main(int argc, char* argv[])
 {
 	se_par_init(argc, argv);
@@ -321,66 +238,22 @@ int main(int argc, char* argv[])
 	float scalex_max = 1.0f;
 	int scalex_aper = 200;
 
-	/* Tail-only stitching parameter.
-	 * If overlap=50 and stitch_blend=20:
-	 *   k=0..29  : keep the upper-layer image only;
-	 *   k=30..49 : weighted blending from upper to lower;
-	 *   below overlap: use the lower-layer image.
-	 * Set stitch_blend=-1 to blend the whole overlap zone.
-	 * Set stitch_blend=0 to keep the upper layer within the whole overlap zone.
-	 */
-	int stitch_blend = -1;
-
-	/* Automatic layer-amplitude scaling parameters. */
-	int auto_scale = 1;
-	int auto_scale_nz = 1;
-	float auto_scale_min = 0.70f;
-	float auto_scale_max = 1.30f;
-	float auto_scale_eps = 1e-20f;
-
 	if (!se_have_par("full_model")) ERROR(("Need full_model=")); else full_model_f = se_get_par_str("full_model");
 	if (!se_have_par("layer_model_base")) ERROR(("Need layer_model_base=")); else layer_model_base = se_get_par_str("layer_model_base");
 	if (!se_have_par("layer_image_base")) ERROR(("Need layer_image_base=")); else layer_image_base = se_get_par_str("layer_image_base");
 	if (!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
 
-	/* Keep layer_txt as the main control of the stitching layers.
-	 * nlayers is optional and is used only for consistency checking when layer_txt is given.
-	 */
 	if (se_have_par("nlayers")) nlayers = se_get_par_int("nlayers");
 	if (se_have_par("layer_txt")) layer_txt = se_get_par_str("layer_txt");
 
 	if (!layer_txt && nlayers <= 0) {
-		ERROR(("Need layer_txt= or nlayers="));
+		ERROR(("Need nlayers= when layer_txt is not provided"));
 	}
 
-	/* scale is used only as a fallback when auto_scale=0. */
+	/* scale is used to amplify the layer image from the second layer onward. */
 	if (se_have_par("scale")) scalez = se_get_par_float("scale");
 	if (se_have_par("scalex_scale")) scalex_max = se_get_par_float("scalex_scale");
 	if (se_have_par("scalex_aper")) scalex_aper = se_get_par_int("scalex_aper");
-
-	if (se_have_par("stitch_blend")) stitch_blend = se_get_par_int("stitch_blend");
-
-	if (se_have_par("auto_scale")) auto_scale = se_get_par_int("auto_scale");
-	if (se_have_par("auto_scale_nz")) auto_scale_nz = se_get_par_int("auto_scale_nz");
-	if (se_have_par("auto_scale_min")) auto_scale_min = se_get_par_float("auto_scale_min");
-	if (se_have_par("auto_scale_max")) auto_scale_max = se_get_par_float("auto_scale_max");
-	if (se_have_par("auto_scale_eps")) auto_scale_eps = se_get_par_float("auto_scale_eps");
-
-	if (stitch_blend < -1) {
-		ERROR(("Invalid stitch_blend=%d", stitch_blend));
-	}
-	if (auto_scale != 0 && auto_scale != 1) {
-		ERROR(("Invalid auto_scale=%d, should be 0 or 1", auto_scale));
-	}
-	if (auto_scale_nz < 0) {
-		ERROR(("Invalid auto_scale_nz=%d", auto_scale_nz));
-	}
-	if (auto_scale_min <= 0.0f || auto_scale_max <= 0.0f || auto_scale_min > auto_scale_max) {
-		ERROR(("Invalid auto_scale_min=%g or auto_scale_max=%g", auto_scale_min, auto_scale_max));
-	}
-	if (auto_scale_eps <= 0.0f) {
-		ERROR(("Invalid auto_scale_eps=%g", auto_scale_eps));
-	}
 
 	sep_t* full_model = sep_open(full_model_f, SEP_READ, 0);
 	int full_ndim = (int)sep_get_min_ndim(full_model);
@@ -405,7 +278,6 @@ int main(int argc, char* argv[])
 			       nlayers, layer_txt, nlayers_from_txt));
 		}
 		nlayers = nlayers_from_txt;
-		INFO(("Using layer_txt=%s. Number of layers = %d", layer_txt, nlayers));
 	}
 
 	if (nlayers <= 0) {
@@ -419,15 +291,13 @@ int main(int argc, char* argv[])
 		} else {
 			scale_layer[i] = 1.0f + (scalez - 1.0f) * (float)i / (float)(nlayers - 1);
 		}
-		INFO(("Layer %d fallback scale factor: %g", i + 1, scale_layer[i]));
+		INFO(("Layer %d scale factor: %g", i + 1, scale_layer[i]));
 	}
 
-	INFO(("Tail blending: stitch_blend=%d (-1 means full-overlap blending)", stitch_blend));
-	INFO(("Auto scale: enable=%d nz=%d min=%g max=%g eps=%g",
-	      auto_scale, auto_scale_nz, auto_scale_min, auto_scale_max, auto_scale_eps));
-
-	/* 横向 scale：两侧各按 scalex_aper 个采样点从 scalex_max 线性过渡到 1，
-	 * 中间保持 1。
+	/*
+	 * 横向 scale：两侧各按 scalex_aper 个采样点从 scalex_max 线性过渡到 1，
+	 * 中间保持 1。比如 n2_full=200, scalex_aper=80 时，0-79 由 2 过渡到 1，
+	 * 80-120 保持 1，121-199 由 1 过渡到 2。
 	 */
 	float* scalex_layer = alloc1float(n2_full);
 	for (int i2 = 0; i2 < n2_full; ++i2) {
@@ -531,45 +401,16 @@ int main(int argc, char* argv[])
 			}
 		}
 
-		int blend_z = overlap;
-		int blend_start = 0;
-		if (overlap > 0) {
-			if (stitch_blend < 0) {
-				blend_z = overlap;
-			} else {
-				blend_z = stitch_blend;
-				if (blend_z > overlap) {
-					ERROR(("Layer %d: stitch_blend=%d is larger than actual overlap=%d",
-					       ilayer + 1, blend_z, overlap));
-				}
-			}
-			blend_start = overlap - blend_z;
-		}
-
-		INFO(("Combining layer %d: start=%d end=%d overlap=%d keep_upper=%d blend_tail=%d",
-		      ilayer + 1, start, end, overlap, blend_start, blend_z));
+		INFO(("Combining layer %d: start=%d end=%d overlap=%d",
+		      ilayer + 1, start, end, overlap));
 
 		float*** layer_data = alloc3float(m1, n2_full, n3_full);
-		se_fsio_read_float(image->data->io, layer_data[0][0],
-		                   (size_t)m1 * (size_t)n2_full * (size_t)n3_full);
-
-		float scale_z = (ilayer > 0) ? scale_layer[ilayer] : 1.0f;
-		if (ilayer > 0 && auto_scale && overlap > 0) {
-			scale_z = compute_overlap_energy_scale(out_data, layer_data,
-			                                      n2_full, n3_full,
-			                                      start, overlap,
-			                                      blend_start, blend_z,
-			                                      auto_scale_nz,
-			                                      scalex_layer,
-			                                      auto_scale_eps,
-			                                      auto_scale_min,
-			                                      auto_scale_max);
-			INFO(("Layer %d auto scale factor: %g", ilayer + 1, scale_z));
-		}
+		se_fsio_read_float(image->data->io, layer_data[0][0], (size_t)m1 * n2_full * n3_full);
 
 		for (int i3 = 0; i3 < n3_full; ++i3) {
 			for (int i2 = 0; i2 < n2_full; ++i2) {
 				float scale_x = (ilayer > 0) ? scalex_layer[i2] : 1.0f;
+				float scale_z = (ilayer > 0) ? scale_layer[ilayer] : 1.0f;
 				float scale = scale_x * scale_z;
 
 				for (int i1 = 0; i1 < m1; ++i1) {
@@ -577,20 +418,12 @@ int main(int argc, char* argv[])
 					float val = layer_data[i3][i2][i1] * scale;
 
 					if (overlap > 0 && gz <= prev_end) {
-						int k = gz - start;  /* 0 <= k <= overlap-1 */
-
-						if (k < blend_start || blend_z == 0) {
-							/* Keep the upper-layer result in the early part of the overlap zone. */
-							continue;
-						} else {
-							int kb = k - blend_start;
-							float w = 1.0f;
-							if (blend_z > 1) {
-								w = (float)kb / (float)(blend_z - 1);
-							}
-							out_data[i3][i2][gz] =
-							    out_data[i3][i2][gz] * (1.0f - w) + val * w;
+						int k = gz - start;
+						float w = 0.5f;
+						if (overlap > 1) {
+							w = (float)k / (float)(overlap - 1);
 						}
+						out_data[i3][i2][gz] = out_data[i3][i2][gz] * (1.0f - w) + val * w;
 					} else {
 						out_data[i3][i2][gz] = val;
 					}

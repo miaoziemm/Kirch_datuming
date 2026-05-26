@@ -16,10 +16,11 @@ int main(int argc, char *argv[])
     }
 
     int b1 = 1, b2 = 1, b3 = 1, n1 = 0, n2 = 0, n3 = 1, i, nshot = 1, ndim = 3, is, order = 2, n123, *p, l = 1;
-    float br1 = 0.0f, br2 = 0.0f, br3 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f, slow;
+    float br1 = 0.0f, br2 = 0.0f, br3 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     float **s, *t, *v, *dl1, *ds1, *dl2 = NULL, *ds2 = NULL;
     const char *sfile = NULL, *in_f = NULL, *out_f = NULL, *tdl1_f = NULL, *tds1_f = NULL, *tdl2_f = NULL, *tds2_f = NULL;
-    bool isvel = true, sweep = false, plane[3] = {false, false, false};
+    bool isvel = true, plane[3] = {false, false, false};
+    int efmm = 0;
     sep_t *vel = NULL, *time = NULL, *shots = NULL, *tdl1 = NULL, *tds1 = NULL, *tdl2 = NULL, *tds2 = NULL;
 
     se_par_init(argc, argv);
@@ -77,11 +78,11 @@ int main(int argc, char *argv[])
         order = se_get_par_int("order");
     /* [1,2] Accuracy order */
 
-    if (!se_have_par("sweep"))
-        sweep = false;
+    if (!se_have_par("efmm"))
+        efmm = 0;
     else
-        sweep = se_get_par_int("sweep");
-    /* if y, use fast sweeping instead of fast marching */
+        efmm = se_get_par_int("efmm");
+    /* if y, use fast efmming instead of fast marching */
 
     if (!se_have_par("br1"))
         br1 = d1;
@@ -192,7 +193,9 @@ int main(int argc, char *argv[])
 
     n123 = n1 * n2 * n3;
 
-    t = alloc1float(n123);
+    size_t shot_stride = (size_t)n123;
+
+    t = alloc1float(n123 * nshot);
     v = alloc1float(n123);
     p = alloc1int(n123);
 
@@ -200,10 +203,13 @@ int main(int argc, char *argv[])
     if (isvel)
     {
         /* transform velocity to slowness squared */
+#ifdef SE_USE_OMP
+#pragma omp parallel for
+#endif
         for (i = 0; i < n123; i++)
         {
-            slow = v[i];
-            v[i] = 1. / (slow * slow);
+            float slow_i = v[i];
+            v[i] = 1. / (slow_i * slow_i);
         }
     }
 
@@ -222,8 +228,8 @@ int main(int argc, char *argv[])
     tds1->headers->ndim = 3;
     // sep_copy_headers(tdl1, time);
     // sep_copy_headers(tds1, time);
-    dl1 = alloc1float(n123);
-    ds1 = alloc1float(n123);
+    dl1 = alloc1float(n123 * nshot);
+    ds1 = alloc1float(n123 * nshot);
 
     /* second-order derivative */
     if (se_have_par("tdl2"))
@@ -243,8 +249,8 @@ int main(int argc, char *argv[])
 
     if (tdl2 != NULL || tds2 != NULL)
     {
-        dl2 = alloc1float(n123);
-        ds2 = alloc1float(n123);
+        dl2 = alloc1float(n123 * nshot);
+        ds2 = alloc1float(n123 * nshot);
     }
 
     if (!se_have_par("l"))
@@ -253,40 +259,102 @@ int main(int argc, char *argv[])
         l = se_get_par_int("l");
     /* source perturbation direction */
 
-    if (!sweep)
+    if (!efmm)
         eikods_init(n3, n2, n1);
+    else
+        efmm_eikods_init(n3, n2, n1);
 
-    /* loop over shots */
-    for (is = 0; is < nshot; is++)
+#ifdef SE_USE_OMP
+    if (efmm)
     {
-        if (is % 100 == 0) {
-        INFO(("shot %d of %d;", is + 1, nshot));
-        INFO(("Shooting from zshot=%g yshot=%g xshot=%g",
-              s[is][0], s[is][1], s[is][2]));
-        }
-        if (sweep)
-        {
-            continue;
-        }
-        else
-        {
-            eikods(t, v, p, plane,
-                   n3, n2, n1,
-                   o3, o2, o1,
-                   d3, d2, d1,
-                   s[is][2], s[is][1], s[is][0],
-                   b3, b2, b1,
-                   order, l,
-                   dl1, ds1, dl2, ds2);
-        }
+        int shot_done = 0;
 
-        se_fsio_write_float(time->data->io, t, n123);
-        se_fsio_write_float(tdl1->data->io, dl1, n123);
-        se_fsio_write_float(tds1->data->io, ds1, n123);
-        if (tdl2 != NULL)
-            se_fsio_write_float(tdl2->data->io, dl2, n123);
-        if (tds2 != NULL)
-            se_fsio_write_float(tds2->data->io, ds2, n123);
+        INFO(("efmm parallel run: %d shots, %d threads", nshot, omp_get_max_threads()));
+#pragma omp parallel for schedule(dynamic)
+        for (is = 0; is < nshot; is++)
+        {
+            size_t shot_off = (size_t)is * shot_stride;
+            int tid = omp_get_thread_num();
+
+            efmm_eikods(t + shot_off, v, p, plane,
+                        n3, n2, n1,
+                        o3, o2, o1,
+                        d3, d2, d1,
+                        s[is][2], s[is][1], s[is][0],
+                        b3, b2, b1,
+                        order, l,
+                        dl1 + shot_off, ds1 + shot_off,
+                        dl2 != NULL ? dl2 + shot_off : NULL,
+                        ds2 != NULL ? ds2 + shot_off : NULL);
+
+#pragma omp critical
+            {
+                shot_done++;
+                if (shot_done == 1 || shot_done == nshot || shot_done % 50 == 0)
+                {
+                    INFO(("efmm shot %d/%d done by thread %d", shot_done, nshot, tid));
+                }
+            }
+        }
+    }
+    else
+#endif
+    {
+        INFO(("serial run: %d shots", nshot));
+        for (is = 0; is < nshot; is++)
+        {
+            size_t shot_off = (size_t)is * shot_stride;
+
+            if (is % 100 == 0)
+            {
+                INFO(("shot %d of %d;", is + 1, nshot));
+                INFO(("Shooting from zshot=%g yshot=%g xshot=%g",
+                      s[is][0], s[is][1], s[is][2]));
+            }
+
+            if (efmm)
+            {
+                if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                {
+                    INFO(("efmm shot %d/%d start", is + 1, nshot));
+                }
+                efmm_eikods(t + shot_off, v, p, plane,
+                       n3, n2, n1,
+                       o3, o2, o1,
+                       d3, d2, d1,
+                       s[is][2], s[is][1], s[is][0],
+                       b3, b2, b1,
+                       order, l,
+                       dl1 + shot_off, ds1 + shot_off,
+                       dl2 != NULL ? dl2 + shot_off : NULL,
+                       ds2 != NULL ? ds2 + shot_off : NULL);
+                if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                {
+                    INFO(("efmm shot %d/%d done", is + 1, nshot));
+                }
+            }
+            else
+            {
+                if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                {
+                    INFO(("eikods shot %d/%d start", is + 1, nshot));
+                }
+                eikods(t + shot_off, v, p, plane,
+                       n3, n2, n1,
+                       o3, o2, o1,
+                       d3, d2, d1,
+                       s[is][2], s[is][1], s[is][0],
+                       b3, b2, b1,
+                       order, l,
+                       dl1 + shot_off, ds1 + shot_off,
+                       dl2 != NULL ? dl2 + shot_off : NULL,
+                       ds2 != NULL ? ds2 + shot_off : NULL);
+                if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                {
+                    INFO(("eikods shot %d/%d done", is + 1, nshot));
+                }
+            }
+        }
     }
     INFO(("FINISH."));
 
@@ -324,6 +392,18 @@ int main(int argc, char *argv[])
     tds1->headers->d[2] = dshot;
     tds1->headers->o[2] = oshot;
 
+
+    for (is = 0; is < nshot; is++)
+    {
+        size_t shot_off = (size_t)is * shot_stride;
+        se_fsio_write_float(time->data->io, t + shot_off, n123);
+        se_fsio_write_float(tdl1->data->io, dl1 + shot_off, n123);
+        se_fsio_write_float(tds1->data->io, ds1 + shot_off, n123);
+        if (tdl2 != NULL)
+            se_fsio_write_float(tdl2->data->io, dl2 + shot_off, n123);
+        if (tds2 != NULL)
+            se_fsio_write_float(tds2->data->io, ds2 + shot_off, n123);
+    }
 
     sep_close(vel);
     sep_close(time);

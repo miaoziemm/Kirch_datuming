@@ -25,6 +25,8 @@ set(RECKIRCH_HEADERS
     include/tpow.h
     include/kirmig.h
     include/kirdat.h
+    include/efmm.h
+    include/bf1d.h
 )
 
 # =============================================================================
@@ -40,6 +42,8 @@ set(RECKIRCH_SOURCES
     src/tpow.cpp
     src/kirmig.cpp
     src/kirdat.cpp
+    src/efmm.cpp
+    src/bf1d.cpp
 )
 
 # =============================================================================
@@ -49,6 +53,8 @@ add_library(reckirch STATIC
     ${RECKIRCH_SOURCES}
     ${RECKIRCH_HEADERS}
 )
+
+target_link_libraries(reckirch PUBLIC fftw3f)
 
 # =============================================================================
 # C++ standard

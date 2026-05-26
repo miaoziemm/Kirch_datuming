@@ -399,7 +399,7 @@ int main(int argc, char *argv[])
                 if (aperture_trace != -1 && fabs(iht-ist) >= aperture_trace) continue;
                 doubint(nt, trace);
 
-                diff2(trace, nt, dt);
+                // diff2(trace, nt, dt);
 
             }
             else

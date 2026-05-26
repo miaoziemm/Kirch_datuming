@@ -309,7 +309,10 @@ if (BUILD_SHARED_LIBS)
 endif ()
 
 add_library (${fftw3_lib} ${SOURCEFILES})
-target_include_directories (${fftw3_lib} INTERFACE $<INSTALL_INTERFACE:include>)
+target_include_directories (${fftw3_lib}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api>
+    $<INSTALL_INTERFACE:include>)
 if (MSVC)
   if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-bigobj)
@@ -353,7 +356,10 @@ if (Threads_FOUND)
     target_link_libraries (${fftw3_lib} ${CMAKE_THREAD_LIBS_INIT})
   else ()
     add_library (${fftw3_lib}_threads ${fftw_threads_SOURCE})
-    target_include_directories (${fftw3_lib}_threads INTERFACE $<INSTALL_INTERFACE:include>)
+    target_include_directories (${fftw3_lib}_threads
+      PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api>
+        $<INSTALL_INTERFACE:include>)
     target_link_libraries (${fftw3_lib}_threads ${fftw3_lib})
     target_link_libraries (${fftw3_lib}_threads ${CMAKE_THREAD_LIBS_INIT})
     list (APPEND subtargets ${fftw3_lib}_threads)
@@ -362,7 +368,10 @@ endif ()
 
 if (OPENMP_FOUND)
   add_library (${fftw3_lib}_omp ${fftw_omp_SOURCE})
-  target_include_directories (${fftw3_lib}_omp INTERFACE $<INSTALL_INTERFACE:include>)
+  target_include_directories (${fftw3_lib}_omp
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/api>
+      $<INSTALL_INTERFACE:include>)
   target_link_libraries (${fftw3_lib}_omp ${fftw3_lib})
   target_link_libraries (${fftw3_lib}_omp ${CMAKE_THREAD_LIBS_INIT})
   list (APPEND subtargets ${fftw3_lib}_omp)

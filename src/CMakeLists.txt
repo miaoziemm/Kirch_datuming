@@ -9,39 +9,45 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR})
 
 # 查找 sebasic 库
-find_library(SEBASIC_LIB
-    NAMES sebasic
-    PATHS ${CMAKE_BINARY_DIR}/lib
-    NO_DEFAULT_PATH
-)
-
-# 如果没有找到库，添加依赖到 sebasic 目标
-if(NOT SEBASIC_LIB)
+if(TARGET sebasic)
     set(SEBASIC_LIB sebasic)
+else()
+    find_library(SEBASIC_LIB
+        NAMES sebasic
+        PATHS ${CMAKE_BINARY_DIR}/lib
+        NO_DEFAULT_PATH
+    )
+    if(NOT SEBASIC_LIB)
+        set(SEBASIC_LIB sebasic)
+    endif()
 endif()
 
 # 查找 SEFILESYSTEM 库
-find_library(SEFILESYSTEM_LIB
-    NAMES sefs
-    PATHS ${CMAKE_BINARY_DIR}/lib
-    NO_DEFAULT_PATH
-)
-
-# 如果没有找到 SEFILESYSTEM 的静态库文件，回退为目标名 `sefs`
-if(NOT SEFILESYSTEM_LIB)
+if(TARGET sefs)
     set(SEFILESYSTEM_LIB sefs)
+else()
+    find_library(SEFILESYSTEM_LIB
+        NAMES sefs
+        PATHS ${CMAKE_BINARY_DIR}/lib
+        NO_DEFAULT_PATH
+    )
+    if(NOT SEFILESYSTEM_LIB)
+        set(SEFILESYSTEM_LIB sefs)
+    endif()
 endif()
 
 # 查找 SERECKIRCH 库
-find_library(SERECKIRCH_LIB
-    NAMES reckirch
-    PATHS ${CMAKE_BINARY_DIR}/lib
-    NO_DEFAULT_PATH
-)
-
-# 如果没有找到 SERECKIRCH 的静态库文件，回退为目标名 `reckirch`
-if(NOT SERECKIRCH_LIB)
+if(TARGET reckirch)
     set(SERECKIRCH_LIB reckirch)
+else()
+    find_library(SERECKIRCH_LIB
+        NAMES reckirch
+        PATHS ${CMAKE_BINARY_DIR}/lib
+        NO_DEFAULT_PATH
+    )
+    if(NOT SERECKIRCH_LIB)
+        set(SERECKIRCH_LIB reckirch)
+    endif()
 endif()
 
 

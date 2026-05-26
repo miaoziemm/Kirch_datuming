@@ -37,6 +37,10 @@ int main(int argc, char* argv[])
 	char* layer_model_base = NULL;
 	char* layer_image_base = NULL;
 	char* out_f = NULL;
+	float scalez = 1.0f;
+	float scalex_max = 1.0f;
+	int scalex_aper=200;
+	
 
 	if (!se_have_par("full_model")) ERROR(("Need full_model=")); else full_model_f = se_get_par_str("full_model");
 	if (!se_have_par("layer_model_base")) ERROR(("Need layer_model_base=")); else layer_model_base = se_get_par_str("layer_model_base");
@@ -44,9 +48,28 @@ int main(int argc, char* argv[])
 	if (!se_have_par("nlayers")) ERROR(("Need nlayers=")); else nlayers = se_get_par_int("nlayers");
 	if (!se_have_par("output_file")) ERROR(("Need output_file=")); else out_f = se_get_par_str("output_file");
 
+	float scale_layer[nlayers];
+
+	/* scale is used to amplify the layer image from the second layer onward. */
+	if (se_have_par("scale")) scalez = se_get_par_float("scale");
+	if (se_have_par("scalex_scale")) scalex_max = se_get_par_float("scalex_scale");
+	if (se_have_par("scalex_aper")) scalex_aper = se_get_par_int("scalex_aper");
+
+	// 构建每一层的scale，第一层永远时1，最后一层为给定的scale，其他层线性插值
+	// TODO 这里可以换成其他的构建方式，比如指数或者分段线性等
+	for (int i = 0; i < nlayers; ++i) {
+		if (nlayers == 1) {
+			scale_layer[i] = 1.0f;
+		} else {
+			scale_layer[i] = 1.0f + (scalez - 1.0f) * (float)i / (float)(nlayers - 1);
+		}
+		INFO(("Layer %d scale factor: %g", i + 1, scale_layer[i]));
+	}
+
 	if (nlayers <= 0) {
 		ERROR(("Invalid nlayers=%d", nlayers));
 	}
+
 
 	sep_t* full_model = sep_open(full_model_f, SEP_READ, 0);
 	int full_ndim = (int)sep_get_min_ndim(full_model);
@@ -58,6 +81,34 @@ int main(int argc, char* argv[])
 	int n1_full = full_model->headers->n[0];
 	int n2_full = (full_ndim >= 2) ? full_model->headers->n[1] : 1;
 	int n3_full = (full_ndim >= 3) ? full_model->headers->n[2] : 1;
+
+	// 横向 scale：两侧各按 scalex_aper 个采样点从 scalex_max 线性过渡到 1，
+	// 中间保持 1。比如 n2_full=200, scalex_aper=80 时，0-79 由 2 过渡到 1，
+	// 80-120 保持 1，121-199 由 1 过渡到 2。
+	float scalex_layer[n2_full];
+	for (int i2 = 0; i2 < n2_full; ++i2) {
+		if (scalex_aper > 0) {
+			int dist_left = i2;
+			int dist_right = n2_full - 1 - i2;
+			int dist_edge = dist_left < dist_right ? dist_left : dist_right;
+			if (dist_edge < scalex_aper) {
+				if (scalex_aper == 1) {
+					scalex_layer[i2] = (dist_edge == 0) ? scalex_max : 1.0f;
+				} else {
+					float t = 1.0f - (float)dist_edge / (float)(scalex_aper - 1);
+					scalex_layer[i2] = 1.0f + (scalex_max - 1.0f) * t;
+				}
+			} else {
+				scalex_layer[i2] = 1.0f;
+			}
+		} else {
+			scalex_layer[i2] = 1.0f;
+		}
+	}
+
+
+	
+
 
 	if (n1_full <= 0 || n2_full <= 0 || n3_full <= 0) {
 		ERROR(("Invalid full model size n1=%d n2=%d n3=%d", n1_full, n2_full, n3_full));
@@ -133,9 +184,33 @@ int main(int argc, char* argv[])
 
 		for (int i3 = 0; i3 < n3_full; ++i3) {
 			for (int i2 = 0; i2 < n2_full; ++i2) {
+	
+				if (ilayer > 0) {
+						//在这里应用横向的 scalex_layer，放在最内层循环以避免重复计算
+				float scale = scalex_layer[i2];
+				if (scale != 1.0f) {
+					for (int i1 = 0; i1 < m1; ++i1) {
+						layer_data[i3][i2][i1] *= scale;
+					}
+				}
+					}
+
+				
+
+
 				for (int i1 = 0; i1 < m1; ++i1) {
 					int gz = start + i1;
 					float val = layer_data[i3][i2][i1];
+
+					/*
+					 * Minimal modification:
+					 * before stitching the current lower layer with the previous layer,
+					 * amplify the current layer image by scale.
+					 * The first layer is kept unchanged.
+					 */
+					if (ilayer > 0) {
+						val *= scale_layer[ilayer];
+					}
 
 					if (overlap > 0 && gz <= prev_end) {
 						int k = gz - start;
@@ -184,4 +259,3 @@ int main(int argc, char* argv[])
 
 	return 0;
 }
-
