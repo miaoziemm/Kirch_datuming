@@ -897,7 +897,47 @@ static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
         //     }
         // }
 
-        butterfly_apply_1d_phase_amp(ctx->ns, tau_mat, Amp_mat, Uin_is, Uout_is, omega, ctx->p, ctx->n_leaf);
+//         // 这里输出一个txt文件，保持一组tau_mat，Amp_mat，Uin_is用于我后续测试，保持的频率是5Hz，15Hz，30Hz，50Hz，70Hz，90Hz，保存完之后就直接exit
+//         int iw5  = (int)lroundf(5.0f  / ctx->df);
+// int iw15 = (int)lroundf(15.0f / ctx->df);
+// int iw30 = (int)lroundf(30.0f / ctx->df);
+// int iw50 = (int)lroundf(50.0f / ctx->df);
+// int iw70 = (int)lroundf(70.0f / ctx->df);
+// int iw90 = (int)lroundf(90.0f / ctx->df);
+
+// if (iw == iw5 || iw == iw15 || iw == iw30 || iw == iw50 || iw == iw70 || iw == iw90){
+//             char filename[256];
+//             sprintf(filename, "output_iw_%d.txt", iw);
+//             FILE *fp = fopen(filename, "w");
+//             if (fp == NULL) {
+//                 ERROR(("Failed to open file for writing."));
+//             }
+//             fprintf(fp, "frequency_hz: %f omega: %f\n", (float)iw * ctx->df, omega);
+//             fprintf(fp, "tau_mat:\n");
+//             for (int ih = 0; ih < ctx->nh; ih++) {
+//                 for (int ic = 0; ic < ctx->nh; ic++) {
+//                     fprintf(fp, "%f ", tau_mat[ih][ic]);
+//                 }
+//                 fprintf(fp, "\n");
+//             }
+//             fprintf(fp, "Amp_mat:\n");
+//             for (int ih = 0; ih < ctx->nh; ih++) {
+//                 for (int ic = 0; ic < ctx->nh; ic++) {
+//                     size_t imat = (size_t)ih * (size_t)ctx->nh + (size_t)ic;
+//                     fprintf(fp, "%f + %fi ", Amp_mat[imat][0], Amp_mat[imat][1]);
+//                 }
+//                 fprintf(fp, "\n");
+//             }
+//             fprintf(fp, "Uin_is:\n");
+//             for (int ic = 0; ic < ctx->nh; ic++) {
+//                 fprintf(fp, "%f + %fi\n", Uin_is[ic][0], Uin_is[ic][1]);
+//             }
+//             fclose(fp);
+//         }
+        
+
+
+        butterfly_apply_1d_phase_amp(ctx->nh, tau_mat, Amp_mat, Uin_is, Uout_is, omega, ctx->p, ctx->n_leaf);
 
         /*
          * Butterfly replacement interface:
@@ -1673,8 +1713,8 @@ int main(int argc, char **argv)
     }
 
     use_bf = se_have_par("use_bf") ? se_get_par_int("use_bf") : 1;
-    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 12;
-    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 16;
+    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 6;
+    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 8;
 
     INFO(("Use butterfly: %s.", use_bf ? "yes" : "no"));
     INFO(("Butterfly parameters: p = %d, n_leaf = %d.", ctx.p, ctx.n_leaf));
@@ -1780,6 +1820,7 @@ int main(int argc, char **argv)
     for (int iw = 0; iw < ctx.nw; iw++)
     {
         print_frequency_progress("source-side", iw, ctx.nw, ctx.verb);
+        // apply_source_operator_freq_iw(&ctx, Utmp, Uout, iw);
         if (!use_bf)
             apply_source_operator_freq_iw(&ctx, Utmp, Uout, iw);
         else

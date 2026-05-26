@@ -30,22 +30,127 @@
  *                                p,
  *                                leaf_n);
  *
- * The function internally pads the problem size to:
- *
- *     n_pad = leaf_n * 2^ceil(log2(ceil(ns/leaf_n))).
- *
- * Therefore,
- *
- *     L = log2(n_pad / leaf_n)
- *
- * is always an integer.
+ * The public function is safe for arbitrary ns: it computes the largest
+ * legal leading block by butterfly and computes all tail interactions by
+ * exact direct summation.  The internal butterfly core is used only when
+ * ns = leaf_n * 2^L.
  */
 
 #include "../include/bf1d.h"
 
+/*
+ * butterfly_apply_1d.c
+ *
+ * 1D butterfly matrix-vector multiplication for kernels of the form
+ *
+ *     K(r,s) = Amp(r,s) * exp(i * alpha * tau(r,s)),
+ *
+ * where, for the phase-amplitude-separated extrapolation used here,
+ *
+ *     alpha = -omega,
+ *     K(r,s) = Amp(r,s) * exp(-i * omega * tau(r,s)).
+ *
+ * Input convention:
+ *   tau_mat[row][col]  : row = output/target index r, col = input/source index s
+ *   Amp_mat[row*n+col] : complex amplitude matrix, same convention
+ *   Uin_is[col]        : input vector
+ *   Uout_is[row]       : output vector
+ *
+ * Main entry:
+ *
+ *   butterfly_apply_1d_phase_amp(ns,
+ *                                tau_mat,
+ *                                Amp_mat,
+ *                                Uin_is,
+ *                                Uout_is,
+ *                                omega,
+ *                                p,
+ *                                leaf_n);
+ *
+ * The public function is safe for arbitrary ns: it computes the largest
+ * legal leading block by butterfly and computes all tail interactions by
+ * exact direct summation.  The internal butterfly core is used only when
+ * ns = leaf_n * 2^L.
+ */
+
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/*
+ * High-frequency safeguard.
+ *
+ * For frequencies higher than BF_DIRECT_FREQ_CUTOFF_HZ, this file
+ * bypasses the butterfly approximation and uses exact direct summation.
+ *
+ * Only this macro is used. Its unit is Hz.
+ *
+ * Examples:
+ *
+ *     #define BF_DIRECT_FREQ_CUTOFF_HZ 60.0f
+ *
+ * or compile with:
+ *
+ *     -DBF_DIRECT_FREQ_CUTOFF_HZ=60.0f
+ *
+ * Set BF_DIRECT_FREQ_CUTOFF_HZ <= 0.0f to disable the high-frequency
+ * direct-summation fallback.
+ */
+#ifndef BF_DIRECT_FREQ_CUTOFF_HZ
+#define BF_DIRECT_FREQ_CUTOFF_HZ 60.0f
+#endif
+
+int bf1d_use_direct_for_omega(float omega)
+{
+    if ((float)BF_DIRECT_FREQ_CUTOFF_HZ <= 0.0f) {
+        return 0;
+    }
+
+    float omega_cutoff =
+        2.0f * (float)M_PI * (float)BF_DIRECT_FREQ_CUTOFF_HZ;
+
+    return fabsf(omega) >= omega_cutoff;
+}
+
+/* Forward declarations because the butterfly routines can fall back to
+ * direct summation before the direct routines are defined below.
+ */
+static void direct_add_1d_phase_amp_range(int n,
+                                          int row0,
+                                          int row1,
+                                          int col0,
+                                          int col1,
+                                          float **tau_mat,
+                                          const fftwf_complex *Amp_mat,
+                                          const fftwf_complex *Uin_is,
+                                          fftwf_complex *Uout_is,
+                                          float omega);
+
+void direct_apply_1d_phase_amp(int n,
+                               float **tau_mat,
+                               const fftwf_complex *Amp_mat,
+                               const fftwf_complex *Uin_is,
+                               fftwf_complex *Uout_is,
+                               float omega);
+
+void butterfly_apply_1d_phase_amp_main_tail(int n,
+                                            float **tau_mat,
+                                            const fftwf_complex *Amp_mat,
+                                            const fftwf_complex *Uin_is,
+                                            fftwf_complex *Uout_is,
+                                            float omega,
+                                            int p,
+                                            int leaf_n);
+
+static void butterfly_apply_1d_phase_amp_core(int n_org,
+                                              float **tau_mat,
+                                              const fftwf_complex *Amp_mat,
+                                              const fftwf_complex *Uin_is,
+                                              fftwf_complex *Uout_is,
+                                              float omega,
+                                              int p,
+                                              int leaf_n);
 
 typedef struct {
     int i1;       /* inclusive, 0-based */
@@ -479,14 +584,14 @@ static void copy_and_pad_input(int n_org,
  *   p        : Chebyshev rank, e.g., 60
  *   leaf_n   : leaf size, e.g., 64
  */
-void butterfly_apply_1d_phase_amp(int n_org,
-                                  float **tau_mat,
-                                  const fftwf_complex *Amp_mat,
-                                  const fftwf_complex *Uin_is,
-                                  fftwf_complex *Uout_is,
-                                  float omega,
-                                  int p,
-                                  int leaf_n)
+static void butterfly_apply_1d_phase_amp_core(int n_org,
+                                              float **tau_mat,
+                                              const fftwf_complex *Amp_mat,
+                                              const fftwf_complex *Uin_is,
+                                              fftwf_complex *Uout_is,
+                                              float omega,
+                                              int p,
+                                              int leaf_n)
 {
     if (n_org <= 0) {
         bf_die("n_org must be positive.");
@@ -495,7 +600,37 @@ void butterfly_apply_1d_phase_amp(int n_org,
         bf_die("p and leaf_n must be positive.");
     }
 
+    /*
+     * High-frequency safeguard:
+     * for high frequencies, use exact direct summation instead of the
+     * butterfly approximation to avoid loss of accuracy.
+     */
+    if (bf1d_use_direct_for_omega(omega)) {
+        direct_apply_1d_phase_amp(n_org,
+                                  tau_mat,
+                                  Amp_mat,
+                                  Uin_is,
+                                  Uout_is,
+                                  omega);
+        return;
+    }
+
     int n_pad = next_padded_size(n_org, leaf_n);
+
+    /*
+     * This core routine is intentionally restricted to legal butterfly
+     * sizes.  The previous version padded arbitrary n_org to n_pad and
+     * filled the padded tau/Amp/U entries with zeros.  Those artificial
+     * boundary values can be interpolated at Chebyshev nodes and may
+     * contaminate the unpadded output near the tail.  Arbitrary sizes
+     * should therefore be handled by butterfly_apply_1d_phase_amp_main_tail(),
+     * which computes the legal main block by butterfly and the tail blocks
+     * exactly by direct summation.
+     */
+    if (n_pad != n_org) {
+        bf_die("internal core called with a non-legal butterfly size.");
+    }
+
     int L = int_log2_exact(n_pad / leaf_n);
 
     /*
@@ -1091,4 +1226,324 @@ void butterfly_apply_1d_phase_amp(int n_org,
     fftwf_free(Uin_pad);
     fftwf_free(Amp_pad);
     free(tau_pad);
+}
+
+/*
+ * Public entry.
+ *
+ * This wrapper is safe for arbitrary n.  It avoids the loss of accuracy
+ * caused by padding tau/Amp/U with zeros: a legal leading block is evaluated
+ * by the butterfly core, while all tail interactions are evaluated exactly by
+ * direct summation.
+ */
+void butterfly_apply_1d_phase_amp(int n_org,
+                                  float **tau_mat,
+                                  const fftwf_complex *Amp_mat,
+                                  const fftwf_complex *Uin_is,
+                                  fftwf_complex *Uout_is,
+                                  float omega,
+                                  int p,
+                                  int leaf_n)
+{
+    butterfly_apply_1d_phase_amp_main_tail(n_org,
+                                           tau_mat,
+                                           Amp_mat,
+                                           Uin_is,
+                                           Uout_is,
+                                           omega,
+                                           p,
+                                           leaf_n);
+}
+
+/*
+ * Direct summation for rows [row0,row1) and cols [col0,col1).
+ * The result is ADDED into Uout_is[row].
+ *
+ * This uses the same kernel as the phase-amplitude-separated extrapolation:
+ *
+ *     K(row,col) = Amp_mat[row,col] * exp(-i * omega * tau_mat[row][col]).
+ */
+static void direct_add_1d_phase_amp_range(int n,
+                                          int row0,
+                                          int row1,
+                                          int col0,
+                                          int col1,
+                                          float **tau_mat,
+                                          const fftwf_complex *Amp_mat,
+                                          const fftwf_complex *Uin_is,
+                                          fftwf_complex *Uout_is,
+                                          float omega)
+{
+    if (row0 < 0) row0 = 0;
+    if (col0 < 0) col0 = 0;
+    if (row1 > n) row1 = n;
+    if (col1 > n) col1 = n;
+
+    for (int row = row0; row < row1; row++) {
+        for (int col = col0; col < col1; col++) {
+
+            size_t imat = (size_t)row * (size_t)n + (size_t)col;
+
+            float amp_r = Amp_mat[imat][0];
+            float amp_i = Amp_mat[imat][1];
+
+            if (fabsf(amp_r) < 1e-20f &&
+                fabsf(amp_i) < 1e-20f) {
+                continue;
+            }
+
+            float tau = tau_mat[row][col];
+
+            float phase = omega * tau;
+            float cosp = cosf(phase);
+            float sinp = sinf(phase);
+
+            /*
+             * K = Amp * exp(-i*phase).
+             * If Amp = amp_r + i amp_i, then
+             *
+             *     K_r = amp_r*cos + amp_i*sin
+             *     K_i = amp_i*cos - amp_r*sin.
+             */
+            float kr = amp_r * cosp + amp_i * sinp;
+            float ki = amp_i * cosp - amp_r * sinp;
+
+            float ar = Uin_is[col][0];
+            float ai = Uin_is[col][1];
+
+            Uout_is[row][0] += kr * ar - ki * ai;
+            Uout_is[row][1] += kr * ai + ki * ar;
+        }
+    }
+}
+
+/*
+ * Full direct summation. This is mainly for verification.
+ */
+void direct_apply_1d_phase_amp(int n,
+                               float **tau_mat,
+                               const fftwf_complex *Amp_mat,
+                               const fftwf_complex *Uin_is,
+                               fftwf_complex *Uout_is,
+                               float omega)
+{
+    for (int i = 0; i < n; i++) {
+        Uout_is[i][0] = 0.0f;
+        Uout_is[i][1] = 0.0f;
+    }
+
+    direct_add_1d_phase_amp_range(n,
+                                  0,
+                                  n,
+                                  0,
+                                  n,
+                                  tau_mat,
+                                  Amp_mat,
+                                  Uin_is,
+                                  Uout_is,
+                                  omega);
+}
+
+static int largest_legal_main_size(int n, int leaf_n)
+{
+    if (n <= 0 || leaf_n <= 0) {
+        bf_die("n and leaf_n must be positive.");
+    }
+
+    if (n < leaf_n) {
+        return 0;
+    }
+
+    int n0 = leaf_n;
+
+    while (n0 <= n / 2) {
+        n0 *= 2;
+    }
+
+    return n0;
+}
+
+/*
+ * Arbitrary-size version using:
+ *
+ *     main block butterfly + tail direct summation.
+ *
+ * Let n0 be the largest valid butterfly size:
+ *
+ *     n0 = leaf_n * 2^L <= n.
+ *
+ * Then the matrix-vector product is decomposed as:
+ *
+ *     [U0]   [K00 K01] [V0]
+ *     [U1] = [K10 K11] [V1]
+ *
+ * where:
+ *
+ *     K00 is n0 x n0 and is computed by butterfly;
+ *     K01, K10, and K11 are computed by direct summation.
+ *
+ * No padding is used. Therefore, no artificial boundary values are introduced.
+ *
+ * Input convention:
+ *
+ *     tau_mat[row][col]
+ *     Amp_mat[row*n+col]
+ *     Uin_is[col]
+ *     Uout_is[row]
+ */
+void butterfly_apply_1d_phase_amp_main_tail(int n,
+                                            float **tau_mat,
+                                            const fftwf_complex *Amp_mat,
+                                            const fftwf_complex *Uin_is,
+                                            fftwf_complex *Uout_is,
+                                            float omega,
+                                            int p,
+                                            int leaf_n)
+{
+    if (n <= 0) {
+        bf_die("n must be positive.");
+    }
+    if (p <= 0 || leaf_n <= 0) {
+        bf_die("p and leaf_n must be positive.");
+    }
+
+    /*
+     * High-frequency safeguard:
+     * at high frequency, compute the full matrix-vector product exactly.
+     * This bypasses both the main-block butterfly and the tail decomposition.
+     */
+    if (bf1d_use_direct_for_omega(omega)) {
+        direct_apply_1d_phase_amp(n,
+                                  tau_mat,
+                                  Amp_mat,
+                                  Uin_is,
+                                  Uout_is,
+                                  omega);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        Uout_is[i][0] = 0.0f;
+        Uout_is[i][1] = 0.0f;
+    }
+
+    int n0 = largest_legal_main_size(n, leaf_n);
+
+    /*
+     * If the vector is shorter than leaf_n, using butterfly is not meaningful.
+     * The exact direct summation is used for the whole vector.
+     */
+    if (n0 <= 0) {
+        direct_add_1d_phase_amp_range(n,
+                                      0,
+                                      n,
+                                      0,
+                                      n,
+                                      tau_mat,
+                                      Amp_mat,
+                                      Uin_is,
+                                      Uout_is,
+                                      omega);
+        return;
+    }
+
+    /*
+     * 1. Main block K00: butterfly on rows 0:n0-1 and cols 0:n0-1.
+     *
+     * tau_mat can be passed by row pointers because only tau_mat[row][col]
+     * with row,col < n0 is accessed. Amp_mat must be copied because the
+     * original row stride is n, whereas butterfly_apply_1d_phase_amp expects
+     * a row stride of n0.
+     */
+    float **tau00 = (float **)malloc((size_t)n0 * sizeof(float *));
+    fftwf_complex *Amp00 =
+        (fftwf_complex *)fftwf_malloc((size_t)n0
+                                      * (size_t)n0
+                                      * sizeof(fftwf_complex));
+    fftwf_complex *Uin0 =
+        (fftwf_complex *)fftwf_malloc((size_t)n0 * sizeof(fftwf_complex));
+    fftwf_complex *Uout0 =
+        (fftwf_complex *)fftwf_malloc((size_t)n0 * sizeof(fftwf_complex));
+
+    if (tau00 == NULL || Amp00 == NULL || Uin0 == NULL || Uout0 == NULL) {
+        bf_die("out of memory in main-tail butterfly wrapper.");
+    }
+
+    for (int row = 0; row < n0; row++) {
+        tau00[row] = tau_mat[row];
+
+        for (int col = 0; col < n0; col++) {
+            size_t id0 = (size_t)row * (size_t)n0 + (size_t)col;
+            size_t id  = (size_t)row * (size_t)n  + (size_t)col;
+
+            Amp00[id0][0] = Amp_mat[id][0];
+            Amp00[id0][1] = Amp_mat[id][1];
+        }
+    }
+
+    for (int col = 0; col < n0; col++) {
+        Uin0[col][0] = Uin_is[col][0];
+        Uin0[col][1] = Uin_is[col][1];
+
+        Uout0[col][0] = 0.0f;
+        Uout0[col][1] = 0.0f;
+    }
+
+    butterfly_apply_1d_phase_amp_core(n0,
+                                      tau00,
+                                 Amp00,
+                                 Uin0,
+                                 Uout0,
+                                 omega,
+                                 p,
+                                 leaf_n);
+
+    for (int row = 0; row < n0; row++) {
+        Uout_is[row][0] = Uout0[row][0];
+        Uout_is[row][1] = Uout0[row][1];
+    }
+
+    fftwf_free(Uout0);
+    fftwf_free(Uin0);
+    fftwf_free(Amp00);
+    free(tau00);
+
+    /*
+     * If n is already legal, K00 covers the whole matrix.
+     */
+    if (n0 == n) {
+        return;
+    }
+
+    /*
+     * 2. Top-right block K01: rows 0:n0-1, cols n0:n-1.
+     *
+     * This contribution is added to the butterfly result in Uout_is[0:n0-1].
+     */
+    direct_add_1d_phase_amp_range(n,
+                                  0,
+                                  n0,
+                                  n0,
+                                  n,
+                                  tau_mat,
+                                  Amp_mat,
+                                  Uin_is,
+                                  Uout_is,
+                                  omega);
+
+    /*
+     * 3. Bottom blocks K10 and K11: rows n0:n-1, cols 0:n-1.
+     *
+     * These rows are computed exactly by direct summation.
+     */
+    direct_add_1d_phase_amp_range(n,
+                                  n0,
+                                  n,
+                                  0,
+                                  n,
+                                  tau_mat,
+                                  Amp_mat,
+                                  Uin_is,
+                                  Uout_is,
+                                  omega);
 }

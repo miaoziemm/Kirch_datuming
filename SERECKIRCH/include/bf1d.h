@@ -15,6 +15,13 @@ void butterfly_apply_1d_phase_amp(int n_org,
                                   float omega,
                                   int p,
                                   int leaf_n);
-
+void butterfly_apply_1d_phase_amp_main_tail(int n,
+                                            float **tau_mat,
+                                            const fftwf_complex *Amp_mat,
+                                            const fftwf_complex *Uin_is,
+                                            fftwf_complex *Uout_is,
+                                            float omega,
+                                            int p,
+                                            int leaf_n);
 
 #endif
