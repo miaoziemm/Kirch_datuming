@@ -1131,7 +1131,7 @@ static void print_frequency_progress(const char *stage, int iw, int nw, int verb
 
 int main(int argc, char **argv)
 {
-    auto t_start = std::chrono::steady_clock::now();
+    
 
     se_par_init(argc, argv);
 
@@ -1285,6 +1285,7 @@ int main(int argc, char **argv)
     free2float(shot);
     shot = NULL;
 
+    auto t_start = std::chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static, omp_freq_chunk)
 #endif
@@ -1321,6 +1322,10 @@ int main(int argc, char **argv)
             apply_source_operator_freq_iw_bf(&ctx, Utmp, Uout, iw);
     }
 
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
+
     fftwf_free(Utmp);
     Utmp = NULL;
 
@@ -1354,8 +1359,6 @@ int main(int argc, char **argv)
     free2float(stable);
     free2float(rtable);
 
-    auto t_end = std::chrono::steady_clock::now();
-    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
-    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
+    
     return 0;
 }

@@ -136,7 +136,7 @@ int main(int argc, char* argv[])
         interm = sep_open(interm_f, SEP_WRITE, 0);
     }
 
-
+auto t_start = std::chrono::steady_clock::now();
     /* initialize */
     filt_init(dt,length);
 
@@ -374,7 +374,9 @@ int main(int argc, char* argv[])
     out->headers->o[2] = s0;
 
     reverse_trace(nt, nh, ns, tr_in);
-
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
     /* write output */
     se_fsio_write_float(out->data->io, tr_in[0][0], nt*nh*ns);
 

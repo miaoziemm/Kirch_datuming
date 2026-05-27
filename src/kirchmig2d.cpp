@@ -326,6 +326,8 @@ int main(int argc, char *argv[])
         sep_read_fromsep(mig, nzx * ng, 0, &out[0], NULL);
     }
 
+auto t_start = std::chrono::steady_clock::now();
+
     /* determine number of threads without a data race */
 #ifdef _OPENMP
     nthr = omp_get_max_threads();
@@ -529,6 +531,9 @@ int main(int argc, char *argv[])
         } /* ih */
     }
     INFO(("FINISH."));
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
 
     if (adj)
         se_fsio_write_float(mig->data->io, out[0], nzx * ng);

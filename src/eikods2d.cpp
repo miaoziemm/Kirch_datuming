@@ -259,6 +259,8 @@ int main(int argc, char *argv[])
         l = se_get_par_int("l");
     /* source perturbation direction */
 
+auto t_start = std::chrono::steady_clock::now();
+
     if (!efmm)
         eikods_init(n3, n2, n1);
     else
@@ -357,7 +359,10 @@ int main(int argc, char *argv[])
         }
     }
     INFO(("FINISH."));
-
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
+    
     time->headers->n[0] = n1;
     time->headers->d[0] = d1;
     time->headers->o[0] = o1;
