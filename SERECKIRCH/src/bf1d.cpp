@@ -37,6 +37,7 @@
  */
 
 #include "../include/bf1d.h"
+#include <string.h>
 
 /*
  * butterfly_apply_1d.c
@@ -1228,6 +1229,567 @@ static void butterfly_apply_1d_phase_amp_core(int n_org,
     free(tau_pad);
 }
 
+
+
+/*
+ * Fast block adaptive-cross-approximation (ACA) version.
+ *
+ * This version keeps the previous high-accuracy blockwise low-rank idea, but
+ * removes the main speed bottlenecks of the first ACA implementation:
+ *
+ *   1. no malloc/free inside each matrix block;
+ *   2. no preliminary nonzero-block scan;
+ *   3. residual, pivot column, and pivot row are stored in compact real/imag
+ *      work arrays;
+ *   4. zero blocks are skipped automatically when the initial residual norm is
+ *      zero.
+ *
+ * The algorithm is still a true low-rank butterfly-style compression; it does
+ * not use accuracy-test fallback to direct summation.  Each leaf_n-by-leaf_n
+ * block is approximated by a rank-p cross expansion,
+ *
+ *     K_block ~= sum_k col_k * row_k,
+ *
+ * and then applied to Uin in factored form.
+ */
+#ifndef BF_ACA_PIVOT_REL_TOL
+#define BF_ACA_PIVOT_REL_TOL 1.0e-7f
+#endif
+
+static inline float bf_cabs2(float ar, float ai)
+{
+    return ar * ar + ai * ai;
+}
+
+static inline void bf_cmul(float ar, float ai,
+                           float br, float bi,
+                           float *cr, float *ci)
+{
+    *cr = ar * br - ai * bi;
+    *ci = ar * bi + ai * br;
+}
+
+static inline void bf_cdiv(float ar, float ai,
+                           float br, float bi,
+                           float *cr, float *ci)
+{
+    float den = br * br + bi * bi;
+    if (den <= 0.0f) {
+        *cr = 0.0f;
+        *ci = 0.0f;
+        return;
+    }
+    *cr = (ar * br + ai * bi) / den;
+    *ci = (ai * br - ar * bi) / den;
+}
+
+typedef struct {
+    int leaf_cap;
+    float *Rr;
+    float *Ri;
+    float *colr;
+    float *coli;
+    float *rowr;
+    float *rowi;
+} BFAcaWork;
+
+static void bf_aca_work_init(BFAcaWork *W, int leaf_n)
+{
+    memset(W, 0, sizeof(*W));
+    W->leaf_cap = leaf_n;
+    size_t m2 = (size_t)leaf_n * (size_t)leaf_n;
+    W->Rr = (float *)malloc(m2 * sizeof(float));
+    W->Ri = (float *)malloc(m2 * sizeof(float));
+    W->colr = (float *)malloc((size_t)leaf_n * sizeof(float));
+    W->coli = (float *)malloc((size_t)leaf_n * sizeof(float));
+    W->rowr = (float *)malloc((size_t)leaf_n * sizeof(float));
+    W->rowi = (float *)malloc((size_t)leaf_n * sizeof(float));
+    if (W->Rr == NULL || W->Ri == NULL || W->colr == NULL || W->coli == NULL ||
+        W->rowr == NULL || W->rowi == NULL) {
+        bf_die("out of memory for fast ACA workspace.");
+    }
+}
+
+static void bf_aca_work_free(BFAcaWork *W)
+{
+    if (W == NULL) return;
+    free(W->Rr);
+    free(W->Ri);
+    free(W->colr);
+    free(W->coli);
+    free(W->rowr);
+    free(W->rowi);
+    memset(W, 0, sizeof(*W));
+}
+
+static inline void build_kernel_entry_phase_amp_fast(int n,
+                                                     int row,
+                                                     int col,
+                                                     float **tau_mat,
+                                                     const fftwf_complex *Amp_mat,
+                                                     float omega,
+                                                     float *kr,
+                                                     float *ki)
+{
+    size_t imat = (size_t)row * (size_t)n + (size_t)col;
+    float amp_r = Amp_mat[imat][0];
+    float amp_i = Amp_mat[imat][1];
+
+    if (fabsf(amp_r) < 1e-20f && fabsf(amp_i) < 1e-20f) {
+        *kr = 0.0f;
+        *ki = 0.0f;
+        return;
+    }
+
+    float phase = omega * tau_mat[row][col];
+    float cosp = cosf(phase);
+    float sinp = sinf(phase);
+
+    /* Amp * exp(-i*phase). */
+    *kr = amp_r * cosp + amp_i * sinp;
+    *ki = amp_i * cosp - amp_r * sinp;
+}
+
+static void aca_add_block_phase_amp_fast(int n,
+                                         int row0,
+                                         int row1,
+                                         int col0,
+                                         int col1,
+                                         float **tau_mat,
+                                         const fftwf_complex *Amp_mat,
+                                         const fftwf_complex *Uin_is,
+                                         fftwf_complex *Uout_is,
+                                         float omega,
+                                         int rank,
+                                         BFAcaWork *W)
+{
+    int nr = row1 - row0;
+    int nc = col1 - col0;
+
+    if (nr <= 0 || nc <= 0 || rank <= 0) return;
+    if (nr > W->leaf_cap || nc > W->leaf_cap) {
+        bf_die("ACA block is larger than workspace capacity.");
+    }
+    if (rank > nr) rank = nr;
+    if (rank > nc) rank = nc;
+
+    float *Rr = W->Rr;
+    float *Ri = W->Ri;
+    float *colr = W->colr;
+    float *coli = W->coli;
+    float *rowr = W->rowr;
+    float *rowi = W->rowi;
+
+    float max0 = 0.0f;
+    for (int ir = 0; ir < nr; ir++) {
+        int row = row0 + ir;
+        for (int jc = 0; jc < nc; jc++) {
+            float kr, ki;
+            build_kernel_entry_phase_amp_fast(n,
+                                              row,
+                                              col0 + jc,
+                                              tau_mat,
+                                              Amp_mat,
+                                              omega,
+                                              &kr,
+                                              &ki);
+            size_t id = (size_t)ir * (size_t)nc + (size_t)jc;
+            Rr[id] = kr;
+            Ri[id] = ki;
+            float a2 = bf_cabs2(kr, ki);
+            if (a2 > max0) max0 = a2;
+        }
+    }
+
+    if (max0 <= 0.0f) return;
+
+    float pivot_stop2 = (float)BF_ACA_PIVOT_REL_TOL *
+                        (float)BF_ACA_PIVOT_REL_TOL * max0;
+
+    for (int k = 0; k < rank; k++) {
+        int piv_i = -1;
+        int piv_j = -1;
+        float piv_abs2 = 0.0f;
+
+        for (int ir = 0; ir < nr; ir++) {
+            size_t base = (size_t)ir * (size_t)nc;
+            for (int jc = 0; jc < nc; jc++) {
+                float a2 = bf_cabs2(Rr[base + jc], Ri[base + jc]);
+                if (a2 > piv_abs2) {
+                    piv_abs2 = a2;
+                    piv_i = ir;
+                    piv_j = jc;
+                }
+            }
+        }
+
+        if (piv_i < 0 || piv_j < 0 || piv_abs2 <= pivot_stop2) {
+            break;
+        }
+
+        size_t piv_id = (size_t)piv_i * (size_t)nc + (size_t)piv_j;
+        float piv_r = Rr[piv_id];
+        float piv_iq = Ri[piv_id];
+
+        for (int ir = 0; ir < nr; ir++) {
+            size_t id = (size_t)ir * (size_t)nc + (size_t)piv_j;
+            colr[ir] = Rr[id];
+            coli[ir] = Ri[id];
+        }
+
+        size_t piv_row_base = (size_t)piv_i * (size_t)nc;
+        for (int jc = 0; jc < nc; jc++) {
+            bf_cdiv(Rr[piv_row_base + jc],
+                    Ri[piv_row_base + jc],
+                    piv_r,
+                    piv_iq,
+                    &rowr[jc],
+                    &rowi[jc]);
+        }
+
+        float coeff_r = 0.0f;
+        float coeff_i = 0.0f;
+        for (int jc = 0; jc < nc; jc++) {
+            int col = col0 + jc;
+            float tr, ti;
+            bf_cmul(rowr[jc], rowi[jc],
+                    Uin_is[col][0], Uin_is[col][1],
+                    &tr, &ti);
+            coeff_r += tr;
+            coeff_i += ti;
+        }
+
+        for (int ir = 0; ir < nr; ir++) {
+            int row = row0 + ir;
+            float tr, ti;
+            bf_cmul(colr[ir], coli[ir], coeff_r, coeff_i, &tr, &ti);
+            Uout_is[row][0] += tr;
+            Uout_is[row][1] += ti;
+        }
+
+        /* R <- R - col * row. */
+        for (int ir = 0; ir < nr; ir++) {
+            float cr = colr[ir];
+            float ci = coli[ir];
+            size_t base = (size_t)ir * (size_t)nc;
+            for (int jc = 0; jc < nc; jc++) {
+                float pr = cr * rowr[jc] - ci * rowi[jc];
+                float pi = cr * rowi[jc] + ci * rowr[jc];
+                Rr[base + jc] -= pr;
+                Ri[base + jc] -= pi;
+            }
+        }
+    }
+}
+
+void butterfly_apply_1d_phase_amp_aca(int n,
+                                      float **tau_mat,
+                                      const fftwf_complex *Amp_mat,
+                                      const fftwf_complex *Uin_is,
+                                      fftwf_complex *Uout_is,
+                                      float omega,
+                                      int p,
+                                      int leaf_n)
+{
+    if (n <= 0) {
+        bf_die("n must be positive.");
+    }
+    if (p <= 0 || leaf_n <= 1) {
+        bf_die("p must be positive and leaf_n must be larger than one.");
+    }
+    if (p >= leaf_n) {
+        bf_die("for meaningful interpolation/compression, require p < leaf_n.");
+    }
+
+    for (int i = 0; i < n; i++) {
+        Uout_is[i][0] = 0.0f;
+        Uout_is[i][1] = 0.0f;
+    }
+
+    BFAcaWork W;
+    bf_aca_work_init(&W, leaf_n);
+
+    for (int row0 = 0; row0 < n; row0 += leaf_n) {
+        int row1 = row0 + leaf_n;
+        if (row1 > n) row1 = n;
+
+        for (int col0 = 0; col0 < n; col0 += leaf_n) {
+            int col1 = col0 + leaf_n;
+            if (col1 > n) col1 = n;
+
+            aca_add_block_phase_amp_fast(n,
+                                         row0,
+                                         row1,
+                                         col0,
+                                         col1,
+                                         tau_mat,
+                                         Amp_mat,
+                                         Uin_is,
+                                         Uout_is,
+                                         omega,
+                                         p,
+                                         &W);
+        }
+    }
+
+    bf_aca_work_free(&W);
+}
+
+
+
+typedef struct {
+    int row0, row1;
+    int col0, col1;
+    int nr, nc;
+    int rank;
+    float *colr; /* rank x nr */
+    float *coli;
+    float *rowr; /* rank x nc */
+    float *rowi;
+} BFAcaBlockFactor;
+
+typedef struct BFAcaFactor {
+    int n;
+    int p;
+    int leaf_n;
+    int nblocks;
+    BFAcaBlockFactor *blocks;
+} BFAcaFactor;
+
+static void bf_aca_block_factor_free(BFAcaBlockFactor *B)
+{
+    if (B == NULL) return;
+    free(B->colr);
+    free(B->coli);
+    free(B->rowr);
+    free(B->rowi);
+    memset(B, 0, sizeof(*B));
+}
+
+void bf1d_aca_factor_destroy(BFAcaFactor *F)
+{
+    if (F == NULL) return;
+    for (int i = 0; i < F->nblocks; i++) {
+        bf_aca_block_factor_free(&F->blocks[i]);
+    }
+    free(F->blocks);
+    free(F);
+}
+
+static int bf_aca_factorize_one_block(int n,
+                                      int row0,
+                                      int row1,
+                                      int col0,
+                                      int col1,
+                                      float **tau_mat,
+                                      const fftwf_complex *Amp_mat,
+                                      float omega,
+                                      int rank_max,
+                                      BFAcaWork *W,
+                                      BFAcaBlockFactor *BF)
+{
+    int nr = row1 - row0;
+    int nc = col1 - col0;
+    if (nr <= 0 || nc <= 0 || rank_max <= 0) return 0;
+    if (rank_max > nr) rank_max = nr;
+    if (rank_max > nc) rank_max = nc;
+
+    float *Rr = W->Rr;
+    float *Ri = W->Ri;
+    float *colr = W->colr;
+    float *coli = W->coli;
+    float *rowr = W->rowr;
+    float *rowi = W->rowi;
+
+    float max0 = 0.0f;
+    for (int ir = 0; ir < nr; ir++) {
+        int row = row0 + ir;
+        for (int jc = 0; jc < nc; jc++) {
+            float kr, ki;
+            build_kernel_entry_phase_amp_fast(n, row, col0 + jc,
+                                              tau_mat, Amp_mat, omega, &kr, &ki);
+            size_t id = (size_t)ir * (size_t)nc + (size_t)jc;
+            Rr[id] = kr;
+            Ri[id] = ki;
+            float a2 = bf_cabs2(kr, ki);
+            if (a2 > max0) max0 = a2;
+        }
+    }
+    if (max0 <= 0.0f) return 0;
+
+    BF->row0 = row0;
+    BF->row1 = row1;
+    BF->col0 = col0;
+    BF->col1 = col1;
+    BF->nr = nr;
+    BF->nc = nc;
+    BF->rank = 0;
+    BF->colr = (float *)malloc((size_t)rank_max * (size_t)nr * sizeof(float));
+    BF->coli = (float *)malloc((size_t)rank_max * (size_t)nr * sizeof(float));
+    BF->rowr = (float *)malloc((size_t)rank_max * (size_t)nc * sizeof(float));
+    BF->rowi = (float *)malloc((size_t)rank_max * (size_t)nc * sizeof(float));
+    if (BF->colr == NULL || BF->coli == NULL || BF->rowr == NULL || BF->rowi == NULL) {
+        bf_die("out of memory for ACA block factors.");
+    }
+
+    float pivot_stop2 = (float)BF_ACA_PIVOT_REL_TOL *
+                        (float)BF_ACA_PIVOT_REL_TOL * max0;
+
+    for (int k = 0; k < rank_max; k++) {
+        int piv_i = -1;
+        int piv_j = -1;
+        float piv_abs2 = 0.0f;
+
+        for (int ir = 0; ir < nr; ir++) {
+            size_t base = (size_t)ir * (size_t)nc;
+            for (int jc = 0; jc < nc; jc++) {
+                float a2 = bf_cabs2(Rr[base + jc], Ri[base + jc]);
+                if (a2 > piv_abs2) {
+                    piv_abs2 = a2;
+                    piv_i = ir;
+                    piv_j = jc;
+                }
+            }
+        }
+
+        if (piv_i < 0 || piv_j < 0 || piv_abs2 <= pivot_stop2) break;
+
+        size_t piv_id = (size_t)piv_i * (size_t)nc + (size_t)piv_j;
+        float piv_r = Rr[piv_id];
+        float piv_iq = Ri[piv_id];
+
+        for (int ir = 0; ir < nr; ir++) {
+            size_t id = (size_t)ir * (size_t)nc + (size_t)piv_j;
+            colr[ir] = Rr[id];
+            coli[ir] = Ri[id];
+        }
+
+        size_t piv_row_base = (size_t)piv_i * (size_t)nc;
+        for (int jc = 0; jc < nc; jc++) {
+            bf_cdiv(Rr[piv_row_base + jc], Ri[piv_row_base + jc],
+                    piv_r, piv_iq, &rowr[jc], &rowi[jc]);
+        }
+
+        size_t koff_col = (size_t)k * (size_t)nr;
+        for (int ir = 0; ir < nr; ir++) {
+            BF->colr[koff_col + ir] = colr[ir];
+            BF->coli[koff_col + ir] = coli[ir];
+        }
+        size_t koff_row = (size_t)k * (size_t)nc;
+        for (int jc = 0; jc < nc; jc++) {
+            BF->rowr[koff_row + jc] = rowr[jc];
+            BF->rowi[koff_row + jc] = rowi[jc];
+        }
+        BF->rank++;
+
+        for (int ir = 0; ir < nr; ir++) {
+            float cr = colr[ir];
+            float ci = coli[ir];
+            size_t base = (size_t)ir * (size_t)nc;
+            for (int jc = 0; jc < nc; jc++) {
+                float pr = cr * rowr[jc] - ci * rowi[jc];
+                float pi = cr * rowi[jc] + ci * rowr[jc];
+                Rr[base + jc] -= pr;
+                Ri[base + jc] -= pi;
+            }
+        }
+    }
+
+    if (BF->rank <= 0) {
+        bf_aca_block_factor_free(BF);
+        return 0;
+    }
+    return 1;
+}
+
+BFAcaFactor *bf1d_aca_factor_create_phase_amp(int n,
+                                              float **tau_mat,
+                                              const fftwf_complex *Amp_mat,
+                                              float omega,
+                                              int p,
+                                              int leaf_n)
+{
+    if (n <= 0) bf_die("n must be positive.");
+    if (p <= 0 || leaf_n <= 1) bf_die("p must be positive and leaf_n must be larger than one.");
+    if (p >= leaf_n) bf_die("for meaningful interpolation/compression, require p < leaf_n.");
+
+    int max_blocks_per_dim = (n + leaf_n - 1) / leaf_n;
+    int max_blocks = max_blocks_per_dim * max_blocks_per_dim;
+
+    BFAcaFactor *F = (BFAcaFactor *)calloc(1, sizeof(BFAcaFactor));
+    if (F == NULL) bf_die("out of memory for ACA factor.");
+    F->n = n;
+    F->p = p;
+    F->leaf_n = leaf_n;
+    F->blocks = (BFAcaBlockFactor *)calloc((size_t)max_blocks, sizeof(BFAcaBlockFactor));
+    if (F->blocks == NULL) bf_die("out of memory for ACA block list.");
+
+    BFAcaWork W;
+    bf_aca_work_init(&W, leaf_n);
+
+    for (int row0 = 0; row0 < n; row0 += leaf_n) {
+        int row1 = row0 + leaf_n;
+        if (row1 > n) row1 = n;
+        for (int col0 = 0; col0 < n; col0 += leaf_n) {
+            int col1 = col0 + leaf_n;
+            if (col1 > n) col1 = n;
+            BFAcaBlockFactor B;
+            memset(&B, 0, sizeof(B));
+            if (bf_aca_factorize_one_block(n, row0, row1, col0, col1,
+                                           tau_mat, Amp_mat, omega, p, &W, &B)) {
+                F->blocks[F->nblocks++] = B;
+            }
+        }
+    }
+
+    bf_aca_work_free(&W);
+    return F;
+}
+
+void bf1d_aca_factor_apply(const BFAcaFactor *F,
+                           const fftwf_complex *Uin_is,
+                           fftwf_complex *Uout_is)
+{
+    if (F == NULL) bf_die("null ACA factor.");
+    int n = F->n;
+    for (int i = 0; i < n; i++) {
+        Uout_is[i][0] = 0.0f;
+        Uout_is[i][1] = 0.0f;
+    }
+
+    for (int ib = 0; ib < F->nblocks; ib++) {
+        const BFAcaBlockFactor *B = &F->blocks[ib];
+        int nr = B->nr;
+        int nc = B->nc;
+        int row0 = B->row0;
+        int col0 = B->col0;
+
+        for (int k = 0; k < B->rank; k++) {
+            size_t roff = (size_t)k * (size_t)nc;
+            float coeff_r = 0.0f;
+            float coeff_i = 0.0f;
+            for (int jc = 0; jc < nc; jc++) {
+                int col = col0 + jc;
+                float rr = B->rowr[roff + jc];
+                float ri = B->rowi[roff + jc];
+                float ur = Uin_is[col][0];
+                float ui = Uin_is[col][1];
+                coeff_r += rr * ur - ri * ui;
+                coeff_i += rr * ui + ri * ur;
+            }
+
+            size_t coff = (size_t)k * (size_t)nr;
+            for (int ir = 0; ir < nr; ir++) {
+                int row = row0 + ir;
+                float cr = B->colr[coff + ir];
+                float ci = B->coli[coff + ir];
+                Uout_is[row][0] += cr * coeff_r - ci * coeff_i;
+                Uout_is[row][1] += cr * coeff_i + ci * coeff_r;
+            }
+        }
+    }
+}
+
 /*
  * Public entry.
  *
@@ -1245,14 +1807,14 @@ void butterfly_apply_1d_phase_amp(int n_org,
                                   int p,
                                   int leaf_n)
 {
-    butterfly_apply_1d_phase_amp_main_tail(n_org,
-                                           tau_mat,
-                                           Amp_mat,
-                                           Uin_is,
-                                           Uout_is,
-                                           omega,
-                                           p,
-                                           leaf_n);
+    butterfly_apply_1d_phase_amp_aca(n_org,
+                                     tau_mat,
+                                     Amp_mat,
+                                     Uin_is,
+                                     Uout_is,
+                                     omega,
+                                     p,
+                                     leaf_n);
 }
 
 /*

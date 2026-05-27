@@ -20,6 +20,28 @@
 
 #define IDX3(is, ih, iw, nh, nw) ((((size_t)(is) * (nh) + (ih)) * (nw)) + (iw))
 
+
+/* Cached low-rank butterfly/ACA interface.
+ * The factor is built once for a fixed matrix K(row,col) and then reused for
+ * multiple input vectors.  This is the key to making the butterfly replacement
+ * faster than direct summation when the operator matrix is unchanged.
+ */
+typedef struct BFAcaFactor BFAcaFactor;
+
+BFAcaFactor *bf1d_aca_factor_create_phase_amp(int n,
+                                              float **tau_mat,
+                                              const fftwf_complex *Amp_mat,
+                                              float omega,
+                                              int p,
+                                              int leaf_n);
+
+void bf1d_aca_factor_apply(const BFAcaFactor *F,
+                           const fftwf_complex *Uin_is,
+                           fftwf_complex *Uout_is);
+
+void bf1d_aca_factor_destroy(BFAcaFactor *F);
+
+
 typedef struct
 {
     int nt, nh, ns;
@@ -594,385 +616,268 @@ static void apply_source_operator_freq_iw(const FreqContext *ctx, fftwf_complex 
     free(F);
 }
 
+
+static void zero_phase_amp_matrix(int n, float **tau_mat, fftwf_complex *Amp_mat)
+{
+    memset(tau_mat[0], 0, (size_t)n * (size_t)n * sizeof(float));
+    memset(Amp_mat, 0, (size_t)n * (size_t)n * sizeof(fftwf_complex));
+}
+
+static void build_receiver_phase_amp_matrix(const FreqContext *ctx,
+                                            int iw,
+                                            float omega,
+                                            float s_abs,
+                                            float *F,
+                                            float *hr_cache,
+                                            float *hi_cache,
+                                            unsigned char *cached,
+                                            float **tau_mat,
+                                            fftwf_complex *Amp_mat)
+{
+    zero_phase_amp_matrix(ctx->nh, tau_mat, Amp_mat);
+
+    for (int ih = 0; ih < ctx->nh; ih++)
+    {
+        int c = (int)(((s_abs + ctx->h0 + ih * ctx->dh - ctx->rg0) / ctx->drg) + 0.5f);
+
+        int left = (ih - ctx->aper < 0) ? 0 : ih - ctx->aper;
+        int right = (ih + ctx->aper > ctx->nh - 1) ? ctx->nh - 1 : ih + ctx->aper;
+
+        for (int ic = left; ic <= right; ic++)
+        {
+            int cc = (int)(((s_abs + ctx->h0 + ic * ctx->dh - ctx->rg0) / ctx->drg) + 0.5f);
+
+            if (c < 0 || c >= ctx->nrg || cc < 0 || cc >= ctx->nrg)
+                ERROR(("Receiver table too small."));
+
+            float coef = taper_weight(left, ic, right, ctx->tap, 1);
+            float tau = ctx->rtable[cc][c];
+
+            float dist = ctx->rdatum * ctx->rdatum +
+                         (ic - ih) * (ic - ih) * ctx->dh * ctx->dh;
+
+            float w = coef / M_PI * ctx->dh * ctx->rdatum * tau / dist;
+
+            float slope = table_slope_first_index(ctx->rtable,
+                                                  ctx->nrg,
+                                                  cc,
+                                                  c,
+                                                  ctx->drg);
+            w *= antialias_weight_iw(ctx, iw, slope * fabsf(ctx->dh));
+
+            if (fabsf(w) < 1e-20f)
+                continue;
+
+            size_t key = (size_t)cc * (size_t)ctx->nrg + (size_t)c;
+            if (!cached[key])
+            {
+                build_H_iw(tau, ctx, iw, F, &hr_cache[key], &hi_cache[key]);
+                cached[key] = 1;
+            }
+
+            float hr = hr_cache[key];
+            float hi = hi_cache[key];
+
+            float phase = omega * tau;
+            float cosp = cosf(phase);
+            float sinp = sinf(phase);
+
+            size_t imat = (size_t)ih * (size_t)ctx->nh + (size_t)ic;
+            tau_mat[ih][ic] = tau;
+            Amp_mat[imat][0] = w * (hr * cosp - hi * sinp);
+            Amp_mat[imat][1] = w * (hr * sinp + hi * cosp);
+        }
+    }
+}
+
+static void build_source_phase_amp_matrix_noncmp(const FreqContext *ctx,
+                                                 int iw,
+                                                 float omega,
+                                                 float *F,
+                                                 float *hr_cache,
+                                                 float *hi_cache,
+                                                 unsigned char *cached,
+                                                 float **tau_mat,
+                                                 fftwf_complex *Amp_mat)
+{
+    zero_phase_amp_matrix(ctx->ns, tau_mat, Amp_mat);
+
+    for (int is = 0; is < ctx->ns; is++)
+    {
+        int c = (int)((ctx->s0 + is * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
+        if (c < 0 || c >= ctx->nsg)
+            ERROR(("Source table too small."));
+
+        int left = (is - ctx->aper < 0) ? 0 : is - ctx->aper;
+        int right = (is + ctx->aper > ctx->ns - 1) ? ctx->ns - 1 : is + ctx->aper;
+
+        for (int ic = left; ic <= right; ic++)
+        {
+            int cc = (int)((ctx->s0 + ic * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
+            if (cc < 0 || cc >= ctx->nsg)
+                ERROR(("Source table too small."));
+
+            float coef = taper_weight(left, ic, right, ctx->tap, 1);
+            float tau = ctx->stable[cc][c];
+
+            float dist = ctx->sdatum * ctx->sdatum +
+                         (ic - is) * (ic - is) * ctx->ds * ctx->ds;
+
+            float w = coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
+
+            float slope = table_slope_first_index(ctx->stable,
+                                                  ctx->nsg,
+                                                  cc,
+                                                  c,
+                                                  ctx->dsg);
+            w *= antialias_weight_iw(ctx, iw, slope * fabsf(ctx->ds));
+
+            if (fabsf(w) < 1e-20f)
+                continue;
+
+            size_t key = (size_t)cc * (size_t)ctx->nsg + (size_t)c;
+            if (!cached[key])
+            {
+                build_H_iw(tau, ctx, iw, F, &hr_cache[key], &hi_cache[key]);
+                cached[key] = 1;
+            }
+
+            float hr = hr_cache[key];
+            float hi = hi_cache[key];
+
+            float phase = omega * tau;
+            float cosp = cosf(phase);
+            float sinp = sinf(phase);
+
+            size_t imat = (size_t)is * (size_t)ctx->ns + (size_t)ic;
+            tau_mat[is][ic] = tau;
+            Amp_mat[imat][0] = w * (hr * cosp - hi * sinp);
+            Amp_mat[imat][1] = w * (hr * sinp + hi * cosp);
+        }
+    }
+}
+
 static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
                                                fftwf_complex *Uin,
                                                fftwf_complex *Utmp,
                                                int iw)
 {
     float *F = (float *)malloc((size_t)(ctx->nsam - 1) * sizeof(float));
+    float *hr_cache = (float *)malloc((size_t)ctx->nrg * ctx->nrg * sizeof(float));
+    float *hi_cache = (float *)malloc((size_t)ctx->nrg * ctx->nrg * sizeof(float));
+    unsigned char *cached = (unsigned char *)calloc((size_t)ctx->nrg * ctx->nrg, sizeof(unsigned char));
 
-    float *hr_cache =
-        (float *)malloc((size_t)ctx->nrg * ctx->nrg * sizeof(float));
-
-    float *hi_cache =
-        (float *)malloc((size_t)ctx->nrg * ctx->nrg * sizeof(float));
-
-    unsigned char *cached =
-        (unsigned char *)calloc((size_t)ctx->nrg * ctx->nrg,
-                                sizeof(unsigned char));
-
-    /*
-     * Traveltime matrix:
-     *
-     *     tau_mat[ih][ic] = tau from input receiver ic to output receiver ih
-     *
-     * This is the phase matrix used by the butterfly algorithm.
-     */
     float **tau_mat = alloc2float(ctx->nh, ctx->nh);
-
-    /*
-     * Amplitude matrix after phase removal:
-     *
-     *     Amp_mat[ih,ic]
-     *       = w(ih,ic) * H(tau,iw) * exp(+i * omega * tau)
-     *
-     * Therefore, the full kernel is reconstructed by:
-     *
-     *     K[ih,ic]
-     *       = Amp_mat[ih,ic] * exp(-i * omega * tau_mat[ih][ic]).
-     *
-     * Amp_mat is stored as a 1D complex array:
-     *
-     *     imat = ih * nh + ic.
-     */
     fftwf_complex *Amp_mat =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->nh * (size_t)ctx->nh * sizeof(fftwf_complex));
-
-    /*
-     * Input and output vectors for one fixed source is
-     * and one fixed frequency iw:
-     *
-     *     Uin_is[ic]  = Uin[is, ic, iw]
-     *     Uout_is[ih] = receiver-side extrapolated result
-     */
     fftwf_complex *Uin_is =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->nh * sizeof(fftwf_complex));
-
     fftwf_complex *Uout_is =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->nh * sizeof(fftwf_complex));
 
-    if (F == NULL || hr_cache == NULL || hi_cache == NULL ||
-        cached == NULL || tau_mat == NULL || Amp_mat == NULL ||
-        Uin_is == NULL || Uout_is == NULL)
+    if (F == NULL || hr_cache == NULL || hi_cache == NULL || cached == NULL ||
+        tau_mat == NULL || Amp_mat == NULL || Uin_is == NULL || Uout_is == NULL)
     {
         ERROR(("Out of memory."));
     }
 
-    /*
-     * Physical angular frequency.
-     *
-     * build_H_iw internally uses the digital angular frequency
-     *
-     *     omega_d = 2*pi*iw/nfft.
-     *
-     * Since tau is measured in seconds, the corresponding physical
-     * angular frequency is:
-     *
-     *     omega = omega_d / dt = 2*pi*iw/(nfft*dt).
-     */
-    float omega =
-        2.0f * (float)M_PI * (float)iw / ((float)ctx->nfft * ctx->dt);
+    float omega = 2.0f * (float)M_PI * (float)iw / ((float)ctx->nfft * ctx->dt);
 
-    for (int is = 0; is < ctx->ns; is++)
+    if (ctx->cmp == 0)
     {
-
         /*
-         * Initialize tau_mat, Amp_mat, and Uout_is for the current source.
-         *
-         * Values outside the aperture remain zero.
+         * For cmp=0, the receiver-side operator does not depend on is.
+         * Build and compress the matrix only once for this frequency, then
+         * reuse the low-rank factor for all source gathers.
          */
-        for (int ih = 0; ih < ctx->nh; ih++)
-        {
+        build_receiver_phase_amp_matrix(ctx,
+                                        iw,
+                                        omega,
+                                        0.0f,
+                                        F,
+                                        hr_cache,
+                                        hi_cache,
+                                        cached,
+                                        tau_mat,
+                                        Amp_mat);
 
-            Uout_is[ih][0] = 0.0f;
-            Uout_is[ih][1] = 0.0f;
+        BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->nh,
+                                                               tau_mat,
+                                                               Amp_mat,
+                                                               omega,
+                                                               ctx->p,
+                                                               ctx->n_leaf);
+
+        for (int is = 0; is < ctx->ns; is++)
+        {
+            for (int ic = 0; ic < ctx->nh; ic++)
+            {
+                size_t ia = IDX3(is, ic, 0, ctx->nh, ctx->nw);
+                Uin_is[ic][0] = Uin[ia + iw][0];
+                Uin_is[ic][1] = Uin[ia + iw][1];
+            }
+
+            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+
+            for (int ih = 0; ih < ctx->nh; ih++)
+            {
+                size_t ib = IDX3(is, ih, 0, ctx->nh, ctx->nw);
+                Utmp[ib + iw][0] += Uout_is[ih][0];
+                Utmp[ib + iw][1] += Uout_is[ih][1];
+            }
+        }
+
+        bf1d_aca_factor_destroy(factor);
+    }
+    else
+    {
+        /*
+         * For cmp=1, the receiver-side matrix shifts with the source position.
+         * It is not safe to reuse one factor across different is values.
+         */
+        for (int is = 0; is < ctx->ns; is++)
+        {
+            float s_abs = ctx->s0 + is * ctx->ds;
+
+            build_receiver_phase_amp_matrix(ctx,
+                                            iw,
+                                            omega,
+                                            s_abs,
+                                            F,
+                                            hr_cache,
+                                            hi_cache,
+                                            cached,
+                                            tau_mat,
+                                            Amp_mat);
 
             for (int ic = 0; ic < ctx->nh; ic++)
             {
-
-                size_t imat =
-                    (size_t)ih * (size_t)ctx->nh + (size_t)ic;
-
-                tau_mat[ih][ic] = 0.0f;
-
-                Amp_mat[imat][0] = 0.0f;
-                Amp_mat[imat][1] = 0.0f;
+                size_t ia = IDX3(is, ic, 0, ctx->nh, ctx->nw);
+                Uin_is[ic][0] = Uin[ia + iw][0];
+                Uin_is[ic][1] = Uin[ia + iw][1];
             }
-        }
 
-        /*
-         * Extract input vector at the current source and frequency:
-         *
-         *     Uin_is[ic] = Uin[is, ic, iw].
-         */
-        for (int ic = 0; ic < ctx->nh; ic++)
-        {
+            BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->nh,
+                                                                   tau_mat,
+                                                                   Amp_mat,
+                                                                   omega,
+                                                                   ctx->p,
+                                                                   ctx->n_leaf);
+            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+            bf1d_aca_factor_destroy(factor);
 
-            size_t ia = IDX3(is, ic, 0, ctx->nh, ctx->nw);
-
-            Uin_is[ic][0] = Uin[ia + iw][0];
-            Uin_is[ic][1] = Uin[ia + iw][1];
-        }
-
-        /*
-         * Build tau_mat and Amp_mat.
-         *
-         * For each output receiver ih, only input receivers inside
-         * [left, right] are used. Outside this aperture, Amp_mat remains zero.
-         */
-        for (int ih = 0; ih < ctx->nh; ih++)
-        {
-
-            float s_abs =
-                ctx->cmp ? (ctx->s0 + is * ctx->ds) : 0.0f;
-
-            int c = (int)(((s_abs + ctx->h0 + ih * ctx->dh - ctx->rg0) / ctx->drg) + 0.5f);
-
-            int left = (ih - ctx->aper < 0)
-                           ? 0
-                           : ih - ctx->aper;
-
-            int right = (ih + ctx->aper > ctx->nh - 1)
-                            ? ctx->nh - 1
-                            : ih + ctx->aper;
-
-            for (int ic = left; ic <= right; ic++)
+            for (int ih = 0; ih < ctx->nh; ih++)
             {
-
-                int cc = (int)(((s_abs + ctx->h0 + ic * ctx->dh - ctx->rg0) / ctx->drg) + 0.5f);
-
-                if (c < 0 || c >= ctx->nrg ||
-                    cc < 0 || cc >= ctx->nrg)
-                {
-                    ERROR(("Receiver table too small."));
-                }
-
-                float coef = taper_weight(left, ic, right, ctx->tap, 1);
-
-                float tau = ctx->rtable[cc][c];
-
-                float dist =
-                    ctx->rdatum * ctx->rdatum + (ic - ih) * (ic - ih) * ctx->dh * ctx->dh;
-
-                float w =
-                    coef / M_PI * ctx->dh * ctx->rdatum * tau / dist;
-
-                /*
-                 * Frequency-domain operator anti-aliasing on receiver summation.
-                 * The local phase increment is approximated by dT/dr * dh.
-                 */
-                float slope =
-                    table_slope_first_index(ctx->rtable,
-                                            ctx->nrg,
-                                            cc,
-                                            c,
-                                            ctx->drg);
-
-                float aa =
-                    antialias_weight_iw(ctx,
-                                        iw,
-                                        slope * fabsf(ctx->dh));
-
-                w *= aa;
-
-                if (fabsf(w) < 1e-20f)
-                    continue;
-
-                /*
-                 * Build H(tau, iw) using the same cache strategy as
-                 * the original direct-summation code.
-                 */
-                size_t key =
-                    (size_t)cc * (size_t)ctx->nrg + (size_t)c;
-
-                if (!cached[key])
-                {
-                    build_H_iw(tau,
-                               ctx,
-                               iw,
-                               F,
-                               &hr_cache[key],
-                               &hi_cache[key]);
-
-                    cached[key] = 1;
-                }
-
-                float hr = hr_cache[key];
-                float hi = hi_cache[key];
-
-                /*
-                 * Phase-amplitude separation:
-                 *
-                 *     H(tau,iw) = B(tau,iw) * exp(-i * omega * tau)
-                 *
-                 * Therefore:
-                 *
-                 *     B(tau,iw) = H(tau,iw) * exp(+i * omega * tau)
-                 *
-                 * and
-                 *
-                 *     Amp_mat = w * B
-                 *             = w * H(tau,iw) * exp(+i * omega * tau).
-                 */
-                float phase = omega * tau;
-                float cosp = cosf(phase);
-                float sinp = sinf(phase);
-
-                /*
-                 * H * exp(+i*phase):
-                 *
-                 *     (hr + i hi) * (cos + i sin)
-                 *   = (hr*cos - hi*sin) + i(hr*sin + hi*cos)
-                 */
-                float amp_r = w * (hr * cosp - hi * sinp);
-                float amp_i = w * (hr * sinp + hi * cosp);
-
-                size_t imat =
-                    (size_t)ih * (size_t)ctx->nh + (size_t)ic;
-
-                tau_mat[ih][ic] = tau;
-
-                Amp_mat[imat][0] = amp_r;
-                Amp_mat[imat][1] = amp_i;
+                size_t ib = IDX3(is, ih, 0, ctx->nh, ctx->nw);
+                Utmp[ib + iw][0] += Uout_is[ih][0];
+                Utmp[ib + iw][1] += Uout_is[ih][1];
             }
-        }
-
-        // /*
-        //  * Receiver-side extrapolation in phase-amplitude-separated form:
-        //  *
-        //  *     Uout_is[ih]
-        //  *       = sum_ic Amp_mat[ih,ic]
-        //  *                * exp(-i * omega * tau_mat[ih][ic])
-        //  *                * Uin_is[ic].
-        //  *
-        //  * This direct summation is only for verification.
-        //  * Later it can be replaced by a butterfly algorithm using
-        //  * tau_mat as the phase matrix and Amp_mat as the amplitude matrix.
-        //  */
-        // for (int ih = 0; ih < ctx->nh; ih++) {
-        //     for (int ic = 0; ic < ctx->nh; ic++) {
-
-        //         size_t imat =
-        //             (size_t)ih * (size_t)ctx->nh + (size_t)ic;
-
-        //         float amp_r = Amp_mat[imat][0];
-        //         float amp_i = Amp_mat[imat][1];
-
-        //         if (fabsf(amp_r) < 1e-20f &&
-        //             fabsf(amp_i) < 1e-20f) {
-        //             continue;
-        //         }
-
-        //         float tau = tau_mat[ih][ic];
-
-        //         /*
-        //          * exp(-i * omega * tau)
-        //          *   = cos(omega*tau) - i sin(omega*tau).
-        //          */
-        //         float phase = omega * tau;
-        //         float cosp = cosf(phase);
-        //         float sinp = sinf(phase);
-
-        //         /*
-        //          * Reconstruct the full kernel:
-        //          *
-        //          *     K = Amp * exp(-i*phase)
-        //          *
-        //          * If Amp = amp_r + i amp_i, then
-        //          *
-        //          *     K_r = amp_r*cos + amp_i*sin
-        //          *     K_i = amp_i*cos - amp_r*sin
-        //          */
-        //         float kr = amp_r * cosp + amp_i * sinp;
-        //         float ki = amp_i * cosp - amp_r * sinp;
-
-        //         float ar = Uin_is[ic][0];
-        //         float ai = Uin_is[ic][1];
-
-        //         /*
-        //          * Uout_is[ih] += K * Uin_is[ic].
-        //          */
-        //         Uout_is[ih][0] += kr * ar - ki * ai;
-        //         Uout_is[ih][1] += kr * ai + ki * ar;
-        //     }
-        // }
-
-//         // 这里输出一个txt文件，保持一组tau_mat，Amp_mat，Uin_is用于我后续测试，保持的频率是5Hz，15Hz，30Hz，50Hz，70Hz，90Hz，保存完之后就直接exit
-//         int iw5  = (int)lroundf(5.0f  / ctx->df);
-// int iw15 = (int)lroundf(15.0f / ctx->df);
-// int iw30 = (int)lroundf(30.0f / ctx->df);
-// int iw50 = (int)lroundf(50.0f / ctx->df);
-// int iw70 = (int)lroundf(70.0f / ctx->df);
-// int iw90 = (int)lroundf(90.0f / ctx->df);
-
-// if (iw == iw5 || iw == iw15 || iw == iw30 || iw == iw50 || iw == iw70 || iw == iw90){
-//             char filename[256];
-//             sprintf(filename, "output_iw_%d.txt", iw);
-//             FILE *fp = fopen(filename, "w");
-//             if (fp == NULL) {
-//                 ERROR(("Failed to open file for writing."));
-//             }
-//             fprintf(fp, "frequency_hz: %f omega: %f\n", (float)iw * ctx->df, omega);
-//             fprintf(fp, "tau_mat:\n");
-//             for (int ih = 0; ih < ctx->nh; ih++) {
-//                 for (int ic = 0; ic < ctx->nh; ic++) {
-//                     fprintf(fp, "%f ", tau_mat[ih][ic]);
-//                 }
-//                 fprintf(fp, "\n");
-//             }
-//             fprintf(fp, "Amp_mat:\n");
-//             for (int ih = 0; ih < ctx->nh; ih++) {
-//                 for (int ic = 0; ic < ctx->nh; ic++) {
-//                     size_t imat = (size_t)ih * (size_t)ctx->nh + (size_t)ic;
-//                     fprintf(fp, "%f + %fi ", Amp_mat[imat][0], Amp_mat[imat][1]);
-//                 }
-//                 fprintf(fp, "\n");
-//             }
-//             fprintf(fp, "Uin_is:\n");
-//             for (int ic = 0; ic < ctx->nh; ic++) {
-//                 fprintf(fp, "%f + %fi\n", Uin_is[ic][0], Uin_is[ic][1]);
-//             }
-//             fclose(fp);
-//         }
-        
-
-
-        butterfly_apply_1d_phase_amp(ctx->nh, tau_mat, Amp_mat, Uin_is, Uout_is, omega, ctx->p, ctx->n_leaf);
-
-        /*
-         * Butterfly replacement interface:
-         *
-         *     butterfly_receiver_apply(ctx,
-         *                              iw,
-         *                              tau_mat,
-         *                              Amp_mat,
-         *                              Uin_is,
-         *                              Uout_is);
-         *
-         * Inside the butterfly algorithm, the kernel should be evaluated as:
-         *
-         *     K(ih,ic)
-         *       = Amp_mat[ih,ic]
-         *         * exp(-i * omega * tau_mat[ih][ic]).
-         */
-
-        /*
-         * Write current-source output vector back to Utmp.
-         */
-        for (int ih = 0; ih < ctx->nh; ih++)
-        {
-
-            size_t ib = IDX3(is, ih, 0, ctx->nh, ctx->nw);
-
-            Utmp[ib + iw][0] += Uout_is[ih][0];
-            Utmp[ib + iw][1] += Uout_is[ih][1];
         }
     }
 
     fftwf_free(Amp_mat);
     fftwf_free(Uin_is);
     fftwf_free(Uout_is);
-
     free2float(tau_mat);
 
     free(hr_cache);
@@ -987,390 +892,137 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
                                              int iw)
 {
     float *F = (float *)malloc((size_t)(ctx->nsam - 1) * sizeof(float));
+    float *hr_cache = (float *)malloc((size_t)ctx->nsg * ctx->nsg * sizeof(float));
+    float *hi_cache = (float *)malloc((size_t)ctx->nsg * ctx->nsg * sizeof(float));
+    unsigned char *cached = (unsigned char *)calloc((size_t)ctx->nsg * ctx->nsg, sizeof(unsigned char));
 
-    float *hr_cache =
-        (float *)malloc((size_t)ctx->nsg * ctx->nsg * sizeof(float));
-
-    float *hi_cache =
-        (float *)malloc((size_t)ctx->nsg * ctx->nsg * sizeof(float));
-
-    unsigned char *cached =
-        (unsigned char *)calloc((size_t)ctx->nsg * ctx->nsg,
-                                sizeof(unsigned char));
-
-    /*
-     * Source-side traveltime matrix:
-     *
-     *     tau_mat[is][ic] = tau from input source ic to output source is
-     *
-     * This is the phase matrix for the butterfly algorithm.
-     */
     float **tau_mat = alloc2float(ctx->ns, ctx->ns);
-
-    /*
-     * Source-side amplitude matrix after phase removal:
-     *
-     *     Amp_mat[is,ic]
-     *       = w(is,ic) * H(tau,iw) * exp(+i * omega * tau)
-     *
-     * The full kernel is reconstructed as:
-     *
-     *     K(is,ic)
-     *       = Amp_mat[is,ic] * exp(-i * omega * tau_mat[is][ic]).
-     *
-     * Stored as a 1D complex array:
-     *
-     *     imat = is * ns + ic.
-     */
     fftwf_complex *Amp_mat =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->ns * (size_t)ctx->ns * sizeof(fftwf_complex));
-
-    /*
-     * Input and output vectors for one source-side matrix-vector product:
-     *
-     *     Uin_is[ic]  = input wavefield at input source index ic
-     *     Uout_is[is] = extrapolated output at output source index is
-     */
     fftwf_complex *Uin_is =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->ns * sizeof(fftwf_complex));
-
     fftwf_complex *Uout_is =
         (fftwf_complex *)fftwf_malloc((size_t)ctx->ns * sizeof(fftwf_complex));
 
-    if (F == NULL || hr_cache == NULL || hi_cache == NULL ||
-        cached == NULL || tau_mat == NULL || Amp_mat == NULL ||
-        Uin_is == NULL || Uout_is == NULL)
+    if (F == NULL || hr_cache == NULL || hi_cache == NULL || cached == NULL ||
+        tau_mat == NULL || Amp_mat == NULL || Uin_is == NULL || Uout_is == NULL)
     {
         ERROR(("Out of memory."));
     }
 
-    /*
-     * Physical angular frequency:
-     *
-     *     omega = 2*pi*f = 2*pi*iw/(nfft*dt).
-     */
-    float omega =
-        2.0f * (float)M_PI * (float)iw / ((float)ctx->nfft * ctx->dt);
+    float omega = 2.0f * (float)M_PI * (float)iw / ((float)ctx->nfft * ctx->dt);
 
     if (ctx->cmp == 1)
     {
-
         float s = fabsf((ctx->ns - 1) * ctx->ds);
         float h = fabsf((ctx->nh - 1) * ctx->dh);
-        float dr;
-
-        int jump =
-            (fabsf(ctx->ds) >= fabsf(ctx->dh))
-                ? 1
-                : (int)(ctx->dh / ctx->ds + 0.5f);
-
-        dr =
-            (fabsf(ctx->ds) >= fabsf(ctx->dh))
-                ? fabsf(ctx->dh)
-                : fabsf(ctx->ds);
-
+        int jump = (fabsf(ctx->ds) >= fabsf(ctx->dh)) ? 1 : (int)(ctx->dh / ctx->ds + 0.5f);
+        float dr = (fabsf(ctx->ds) >= fabsf(ctx->dh)) ? fabsf(ctx->dh) : fabsf(ctx->ds);
         int nr = (int)((s + h) / dr + 1.5f);
 
-        /*
-         * In cmp mode, source-side extrapolation is performed along
-         * constant receiver coordinate r.
-         */
         for (int ir = 0; ir < nr; ir++)
         {
-
-            float r =
-                ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->dh <= 0.f) ? -1.f : 0.f) * h;
-
-            int sleft =
-                (int)((ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->ds <= 0.f) ? 0.f : -1.f) * h) / ctx->ds + 0.5f);
-
-            int sright =
-                (int)((ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->ds <= 0.f) ? -1.f : 0.f) * h) / ctx->ds + 0.5f);
+            float r = ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->dh <= 0.f) ? -1.f : 0.f) * h;
+            int sleft = (int)((ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->ds <= 0.f) ? 0.f : -1.f) * h) / ctx->ds + 0.5f);
+            int sright = (int)((ir * dr + ((ctx->ds <= 0.f) ? -1.f : 0.f) * s + ((ctx->ds <= 0.f) ? -1.f : 0.f) * h) / ctx->ds + 0.5f);
 
             if (sleft < 0)
                 sleft = 0;
             if (sright > ctx->ns - 1)
                 sright = ctx->ns - 1;
 
-            int left =
-                (int)((r - sleft * ctx->ds) / ctx->dh + 0.5f);
-
+            int left = (int)((r - sleft * ctx->ds) / ctx->dh + 0.5f);
             if (left < 0 || left > ctx->nh - 1)
                 sleft++;
 
-            int right =
-                (int)((r - sright * ctx->ds) / ctx->dh + 0.5f);
-
+            int right = (int)((r - sright * ctx->ds) / ctx->dh + 0.5f);
             if (right < 0 || right > ctx->nh - 1)
                 sright--;
 
-            /*
-             * Initialize tau_mat, Amp_mat, Uin_is, and Uout_is
-             * for the current constant-r gather.
-             */
-            for (int is = 0; is < ctx->ns; is++)
-            {
+            memset(Uin_is, 0, (size_t)ctx->ns * sizeof(fftwf_complex));
+            zero_phase_amp_matrix(ctx->ns, tau_mat, Amp_mat);
 
-                Uin_is[is][0] = 0.0f;
-                Uin_is[is][1] = 0.0f;
-
-                Uout_is[is][0] = 0.0f;
-                Uout_is[is][1] = 0.0f;
-
-                for (int ic = 0; ic < ctx->ns; ic++)
-                {
-
-                    size_t imat =
-                        (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
-                    tau_mat[is][ic] = 0.0f;
-
-                    Amp_mat[imat][0] = 0.0f;
-                    Amp_mat[imat][1] = 0.0f;
-                }
-            }
-
-            /*
-             * Extract input vector along the current constant-r line:
-             *
-             *     Uin_is[ic] = Utmp[ic, hh, iw],
-             *
-             * where:
-             *
-             *     hh = round((r - ic * ds) / dh).
-             */
             for (int ic = sleft; ic <= sright; ic += jump)
             {
-
-                int hh =
-                    (int)((r - ic * ctx->ds) / ctx->dh + 0.5f);
-
+                int hh = (int)((r - ic * ctx->ds) / ctx->dh + 0.5f);
                 if (hh < 0 || hh >= ctx->nh)
                     continue;
 
                 size_t ia = IDX3(ic, hh, 0, ctx->nh, ctx->nw);
-
                 Uin_is[ic][0] = Utmp[ia + iw][0];
                 Uin_is[ic][1] = Utmp[ia + iw][1];
             }
 
-            /*
-             * Build tau_mat and Amp_mat for the current constant-r line.
-             */
             for (int is = sleft; is <= sright; is += jump)
             {
-
-                int c =
-                    (int)((ctx->s0 + is * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
-
+                int c = (int)((ctx->s0 + is * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
                 if (c < 0 || c >= ctx->nsg)
-                {
                     ERROR(("Source table too small."));
-                }
 
-                int ih =
-                    (int)((r - is * ctx->ds) / ctx->dh + 0.5f);
-
+                int ih = (int)((r - is * ctx->ds) / ctx->dh + 0.5f);
                 if (ih < 0 || ih >= ctx->nh)
                     continue;
 
-                int ileft =
-                    (is - jump * ctx->aper < sleft)
-                        ? sleft
-                        : is - jump * ctx->aper;
-
-                int iright =
-                    (is + jump * ctx->aper > sright)
-                        ? sright
-                        : is + jump * ctx->aper;
+                int ileft = (is - jump * ctx->aper < sleft) ? sleft : is - jump * ctx->aper;
+                int iright = (is + jump * ctx->aper > sright) ? sright : is + jump * ctx->aper;
 
                 for (int ic = ileft; ic <= iright; ic += jump)
                 {
-
-                    int cc =
-                        (int)((ctx->s0 + ic * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
-
+                    int cc = (int)((ctx->s0 + ic * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
                     if (cc < 0 || cc >= ctx->nsg)
-                    {
                         ERROR(("Source table too small."));
-                    }
 
-                    int hh =
-                        (int)((r - ic * ctx->ds) / ctx->dh + 0.5f);
-
+                    int hh = (int)((r - ic * ctx->ds) / ctx->dh + 0.5f);
                     if (hh < 0 || hh >= ctx->nh)
                         continue;
 
-                    float coef =
-                        taper_weight(ileft, ic, iright, ctx->tap, jump);
-
+                    float coef = taper_weight(ileft, ic, iright, ctx->tap, jump);
                     float tau = ctx->stable[cc][c];
+                    float dist = ctx->sdatum * ctx->sdatum + (ic - is) * (ic - is) * ctx->ds * ctx->ds;
+                    float w = coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
 
-                    float dist =
-                        ctx->sdatum * ctx->sdatum + (ic - is) * (ic - is) * ctx->ds * ctx->ds;
-
-                    float w =
-                        coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
-
-                    /*
-                     * Frequency-domain operator anti-aliasing on source summation.
-                     * In cmp mode the source loop may skip by jump, so the sampled
-                     * source interval is jump * ds.
-                     */
-                    float slope =
-                        table_slope_first_index(ctx->stable,
-                                                ctx->nsg,
-                                                cc,
-                                                c,
-                                                ctx->dsg);
-
-                    float aa =
-                        antialias_weight_iw(ctx,
-                                            iw,
-                                            slope * fabsf((float)jump * ctx->ds));
-
-                    w *= aa;
+                    float slope = table_slope_first_index(ctx->stable, ctx->nsg, cc, c, ctx->dsg);
+                    w *= antialias_weight_iw(ctx, iw, slope * fabsf((float)jump * ctx->ds));
 
                     if (fabsf(w) < 1e-20f)
                         continue;
 
-                    /*
-                     * Build H(tau, iw) using the same cache strategy
-                     * as the original direct-summation code.
-                     */
-                    size_t key =
-                        (size_t)cc * (size_t)ctx->nsg + (size_t)c;
-
+                    size_t key = (size_t)cc * (size_t)ctx->nsg + (size_t)c;
                     if (!cached[key])
                     {
-                        build_H_iw(tau,
-                                   ctx,
-                                   iw,
-                                   F,
-                                   &hr_cache[key],
-                                   &hi_cache[key]);
-
+                        build_H_iw(tau, ctx, iw, F, &hr_cache[key], &hi_cache[key]);
                         cached[key] = 1;
                     }
 
                     float hr = hr_cache[key];
                     float hi = hi_cache[key];
-
-                    /*
-                     * Phase-amplitude separation:
-                     *
-                     *     Amp = w * H(tau,iw) * exp(+i * omega * tau).
-                     */
                     float phase = omega * tau;
                     float cosp = cosf(phase);
                     float sinp = sinf(phase);
 
-                    /*
-                     * H * exp(+i*phase):
-                     *
-                     *     (hr + i hi) * (cos + i sin)
-                     *   = (hr*cos - hi*sin) + i(hr*sin + hi*cos).
-                     */
-                    float amp_r = w * (hr * cosp - hi * sinp);
-                    float amp_i = w * (hr * sinp + hi * cosp);
-
-                    size_t imat =
-                        (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
+                    size_t imat = (size_t)is * (size_t)ctx->ns + (size_t)ic;
                     tau_mat[is][ic] = tau;
-
-                    Amp_mat[imat][0] = amp_r;
-                    Amp_mat[imat][1] = amp_i;
+                    Amp_mat[imat][0] = w * (hr * cosp - hi * sinp);
+                    Amp_mat[imat][1] = w * (hr * sinp + hi * cosp);
                 }
             }
 
-            /*
-             * Direct summation for verification:
-             *
-             *     Uout_is[is]
-             *       = sum_ic Amp_mat[is,ic]
-             *                * exp(-i * omega * tau_mat[is][ic])
-             *                * Uin_is[ic].
-             *
-             * Later this block can be replaced by a butterfly algorithm.
-             */
-            // for (int is = sleft; is <= sright; is += jump) {
-            //     for (int ic = sleft; ic <= sright; ic += jump) {
+            BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->ns,
+                                                                   tau_mat,
+                                                                   Amp_mat,
+                                                                   omega,
+                                                                   ctx->p,
+                                                                   ctx->n_leaf);
+            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+            bf1d_aca_factor_destroy(factor);
 
-            //         size_t imat =
-            //             (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
-            //         float amp_r = Amp_mat[imat][0];
-            //         float amp_i = Amp_mat[imat][1];
-
-            //         if (fabsf(amp_r) < 1e-20f &&
-            //             fabsf(amp_i) < 1e-20f) {
-            //             continue;
-            //         }
-
-            //         float tau = tau_mat[is][ic];
-
-            //         float phase = omega * tau;
-            //         float cosp = cosf(phase);
-            //         float sinp = sinf(phase);
-
-            //         /*
-            //          * K = Amp * exp(-i*phase).
-            //          *
-            //          * If Amp = amp_r + i amp_i, then:
-            //          *
-            //          *     K_r = amp_r*cos + amp_i*sin
-            //          *     K_i = amp_i*cos - amp_r*sin.
-            //          */
-            //         float kr = amp_r * cosp + amp_i * sinp;
-            //         float ki = amp_i * cosp - amp_r * sinp;
-
-            //         float ar = Uin_is[ic][0];
-            //         float ai = Uin_is[ic][1];
-
-            //         Uout_is[is][0] += kr * ar - ki * ai;
-            //         Uout_is[is][1] += kr * ai + ki * ar;
-            //     }
-            // }
-
-            butterfly_apply_1d_phase_amp(ctx->ns,
-                                         tau_mat,
-                                         Amp_mat,
-                                         Uin_is,
-                                         Uout_is,
-                                         omega, ctx->p, ctx->n_leaf);
-
-            /*
-             * Butterfly replacement interface:
-             *
-             *     butterfly_source_apply(ctx,
-             *                            iw,
-             *                            tau_mat,
-             *                            Amp_mat,
-             *                            Uin_is,
-             *                            Uout_is);
-             *
-             * Inside the butterfly algorithm, the kernel should be:
-             *
-             *     K(is,ic)
-             *       = Amp_mat[is,ic]
-             *         * exp(-i * omega * tau_mat[is][ic]).
-             */
-
-            /*
-             * Write the current constant-r output vector back to Uout.
-             */
             for (int is = sleft; is <= sright; is += jump)
             {
-
-                int ih =
-                    (int)((r - is * ctx->ds) / ctx->dh + 0.5f);
-
+                int ih = (int)((r - is * ctx->ds) / ctx->dh + 0.5f);
                 if (ih < 0 || ih >= ctx->nh)
                     continue;
 
                 size_t ib = IDX3(is, ih, 0, ctx->nh, ctx->nw);
-
                 Uout[ib + iw][0] += Uout_is[is][0];
                 Uout[ib + iw][1] += Uout_is[is][1];
             }
@@ -1378,240 +1030,53 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
     }
     else
     {
-
         /*
-         * In non-cmp mode, source-side extrapolation is performed
-         * for each fixed receiver/offset index ih.
+         * For cmp=0, the source-side matrix is independent of ih.
+         * Build and compress it once for this frequency, then reuse it for
+         * all receiver/offset indices.
          */
+        build_source_phase_amp_matrix_noncmp(ctx,
+                                             iw,
+                                             omega,
+                                             F,
+                                             hr_cache,
+                                             hi_cache,
+                                             cached,
+                                             tau_mat,
+                                             Amp_mat);
+
+        BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->ns,
+                                                               tau_mat,
+                                                               Amp_mat,
+                                                               omega,
+                                                               ctx->p,
+                                                               ctx->n_leaf);
+
         for (int ih = 0; ih < ctx->nh; ih++)
         {
-
-            /*
-             * Initialize tau_mat, Amp_mat, Uin_is, and Uout_is
-             * for the current ih.
-             */
-            for (int is = 0; is < ctx->ns; is++)
-            {
-
-                Uin_is[is][0] = 0.0f;
-                Uin_is[is][1] = 0.0f;
-
-                Uout_is[is][0] = 0.0f;
-                Uout_is[is][1] = 0.0f;
-
-                for (int ic = 0; ic < ctx->ns; ic++)
-                {
-
-                    size_t imat =
-                        (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
-                    tau_mat[is][ic] = 0.0f;
-
-                    Amp_mat[imat][0] = 0.0f;
-                    Amp_mat[imat][1] = 0.0f;
-                }
-            }
-
-            /*
-             * Extract input vector for current ih:
-             *
-             *     Uin_is[ic] = Utmp[ic, ih, iw].
-             */
             for (int ic = 0; ic < ctx->ns; ic++)
             {
-
                 size_t ia = IDX3(ic, ih, 0, ctx->nh, ctx->nw);
-
                 Uin_is[ic][0] = Utmp[ia + iw][0];
                 Uin_is[ic][1] = Utmp[ia + iw][1];
             }
 
-            /*
-             * Build tau_mat and Amp_mat for current ih.
-             */
+            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+
             for (int is = 0; is < ctx->ns; is++)
             {
-
-                int c =
-                    (int)((ctx->s0 + is * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
-
-                if (c < 0 || c >= ctx->nsg)
-                {
-                    ERROR(("Source table too small."));
-                }
-
-                int left =
-                    (is - ctx->aper < 0)
-                        ? 0
-                        : is - ctx->aper;
-
-                int right =
-                    (is + ctx->aper > ctx->ns - 1)
-                        ? ctx->ns - 1
-                        : is + ctx->aper;
-
-                for (int ic = left; ic <= right; ic++)
-                {
-
-                    int cc =
-                        (int)((ctx->s0 + ic * ctx->ds - ctx->sg0) / ctx->dsg + 0.5f);
-
-                    if (cc < 0 || cc >= ctx->nsg)
-                    {
-                        ERROR(("Source table too small."));
-                    }
-
-                    float coef =
-                        taper_weight(left, ic, right, ctx->tap, 1);
-
-                    float tau = ctx->stable[cc][c];
-
-                    float dist =
-                        ctx->sdatum * ctx->sdatum + (ic - is) * (ic - is) * ctx->ds * ctx->ds;
-
-                    float w =
-                        coef / M_PI * ctx->ds * ctx->sdatum * tau / dist;
-
-                    /*
-                     * Frequency-domain operator anti-aliasing on source summation.
-                     */
-                    float slope =
-                        table_slope_first_index(ctx->stable,
-                                                ctx->nsg,
-                                                cc,
-                                                c,
-                                                ctx->dsg);
-
-                    float aa =
-                        antialias_weight_iw(ctx,
-                                            iw,
-                                            slope * fabsf(ctx->ds));
-
-                    w *= aa;
-
-                    if (fabsf(w) < 1e-20f)
-                        continue;
-
-                    /*
-                     * Build H(tau, iw) using the same cache strategy
-                     * as the original direct-summation code.
-                     */
-                    size_t key =
-                        (size_t)cc * (size_t)ctx->nsg + (size_t)c;
-
-                    if (!cached[key])
-                    {
-                        build_H_iw(tau,
-                                   ctx,
-                                   iw,
-                                   F,
-                                   &hr_cache[key],
-                                   &hi_cache[key]);
-
-                        cached[key] = 1;
-                    }
-
-                    float hr = hr_cache[key];
-                    float hi = hi_cache[key];
-
-                    /*
-                     * Phase-amplitude separation:
-                     *
-                     *     Amp = w * H(tau,iw) * exp(+i * omega * tau).
-                     */
-                    float phase = omega * tau;
-                    float cosp = cosf(phase);
-                    float sinp = sinf(phase);
-
-                    float amp_r = w * (hr * cosp - hi * sinp);
-                    float amp_i = w * (hr * sinp + hi * cosp);
-
-                    size_t imat =
-                        (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
-                    tau_mat[is][ic] = tau;
-
-                    Amp_mat[imat][0] = amp_r;
-                    Amp_mat[imat][1] = amp_i;
-                }
-            }
-
-            /*
-             * Direct summation for verification:
-             *
-             *     Uout_is[is]
-             *       = sum_ic Amp_mat[is,ic]
-             *                * exp(-i * omega * tau_mat[is][ic])
-             *                * Uin_is[ic].
-             *
-             * Later this block can be replaced by a butterfly algorithm.
-             */
-            // for (int is = 0; is < ctx->ns; is++) {
-            //     for (int ic = 0; ic < ctx->ns; ic++) {
-
-            //         size_t imat =
-            //             (size_t)is * (size_t)ctx->ns + (size_t)ic;
-
-            //         float amp_r = Amp_mat[imat][0];
-            //         float amp_i = Amp_mat[imat][1];
-
-            //         if (fabsf(amp_r) < 1e-20f &&
-            //             fabsf(amp_i) < 1e-20f) {
-            //             continue;
-            //         }
-
-            //         float tau = tau_mat[is][ic];
-
-            //         float phase = omega * tau;
-            //         float cosp = cosf(phase);
-            //         float sinp = sinf(phase);
-
-            //         float kr = amp_r * cosp + amp_i * sinp;
-            //         float ki = amp_i * cosp - amp_r * sinp;
-
-            //         float ar = Uin_is[ic][0];
-            //         float ai = Uin_is[ic][1];
-
-            //         Uout_is[is][0] += kr * ar - ki * ai;
-            //         Uout_is[is][1] += kr * ai + ki * ar;
-            //     }
-            // }
-            butterfly_apply_1d_phase_amp(ctx->ns,
-                                         tau_mat,
-                                         Amp_mat,
-                                         Uin_is,
-                                         Uout_is,
-                                         omega, ctx->p, ctx->n_leaf);
-
-            /*
-             * Butterfly replacement interface:
-             *
-             *     butterfly_source_apply(ctx,
-             *                            iw,
-             *                            tau_mat,
-             *                            Amp_mat,
-             *                            Uin_is,
-             *                            Uout_is);
-             */
-
-            /*
-             * Write current-ih output vector back to Uout.
-             */
-            for (int is = 0; is < ctx->ns; is++)
-            {
-
                 size_t ib = IDX3(is, ih, 0, ctx->nh, ctx->nw);
-
                 Uout[ib + iw][0] += Uout_is[is][0];
                 Uout[ib + iw][1] += Uout_is[is][1];
             }
         }
+
+        bf1d_aca_factor_destroy(factor);
     }
 
     fftwf_free(Amp_mat);
     fftwf_free(Uin_is);
     fftwf_free(Uout_is);
-
     free2float(tau_mat);
 
     free(hr_cache);
@@ -1713,8 +1178,12 @@ int main(int argc, char **argv)
     }
 
     use_bf = se_have_par("use_bf") ? se_get_par_int("use_bf") : 1;
-    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 6;
-    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 8;
+    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 11;
+    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 12;
+    if (ctx.p <= 0 || ctx.n_leaf <= 1)
+        ERROR(("Need bf_p > 0 and bf_n_leaf > 1."));
+    if (ctx.p >= ctx.n_leaf)
+        ERROR(("Need bf_p < bf_n_leaf for meaningful low-rank butterfly compression."));
 
     INFO(("Use butterfly: %s.", use_bf ? "yes" : "no"));
     INFO(("Butterfly parameters: p = %d, n_leaf = %d.", ctx.p, ctx.n_leaf));
