@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <vector>
+
 #include <chrono>
 
 #include <fftw3.h>
@@ -18,28 +20,26 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+static inline void fast_sincosf(float x, float *s, float *c)
+{
+#if defined(__GNUC__)
+    sincosf(x, s, c);
+#else
+    *s = sinf(x);
+    *c = cosf(x);
+#endif
+}
+
 #define IDX3(is, ih, iw, nh, nw) ((((size_t)(is) * (nh) + (ih)) * (nw)) + (iw))
 
 
-/* Cached low-rank butterfly/ACA interface.
+/* Cached segmented butterfly interface.
  * The factor is built once for a fixed matrix K(row,col) and then reused for
- * multiple input vectors.  This is the key to making the butterfly replacement
- * faster than direct summation when the operator matrix is unchanged.
+ * multiple input vectors.  The implementation uses a strict butterfly
+ * recursion for larger smooth panels and an exact leaf-stage evaluator for
+ * active leaf panels, which is important for aperture/anti-alias hard masks.
  */
-typedef struct BFAcaFactor BFAcaFactor;
 
-BFAcaFactor *bf1d_aca_factor_create_phase_amp(int n,
-                                              float **tau_mat,
-                                              const fftwf_complex *Amp_mat,
-                                              float omega,
-                                              int p,
-                                              int leaf_n);
-
-void bf1d_aca_factor_apply(const BFAcaFactor *F,
-                           const fftwf_complex *Uin_is,
-                           fftwf_complex *Uout_is);
-
-void bf1d_aca_factor_destroy(BFAcaFactor *F);
 
 
 typedef struct
@@ -52,7 +52,10 @@ typedef struct
     float sdatum, rdatum;
     float antialias;
     float **stable, **rtable;
-    int n_leaf,p;
+    int n_leaf, p;
+    int bf_panel_levels;
+    float bf_amp_eps;
+    float bf_phase_tol;
 } FreqContext;
 
 static void reverse_trace_1d(int nt, float *tr)
@@ -96,20 +99,21 @@ static int choose_nfft(int nt, int nsam, float dt, int nrg, int nsg, float **rta
 
 static void build_filter_F(float tau, float dt, int nsam, float *F)
 {
-    float *G = (float *)malloc((size_t)nsam * sizeof(float));
-    G[0] = 0.0f;
-    for (int k = 1; k < nsam; k++)
+    if (nsam <= 1)
+        return;
+
+    float prev2 = 0.0f;
+    float prev1 = sqrtf(((tau + dt) / tau) * ((tau + dt) / tau) - 1.0f);
+    F[0] = prev1 - prev2;
+
+    for (int k = 1; k < nsam - 1; k++)
     {
-        float t = (tau + k * dt) / tau;
-        G[k] = sqrtf(t * t - 1.0f);
+        float t = (tau + (float)(k + 1) * dt) / tau;
+        float curr = sqrtf(t * t - 1.0f);
+        F[k] = curr - 2.0f * prev1 + prev2;
+        prev2 = prev1;
+        prev1 = curr;
     }
-    for (int k = 0; k < nsam - 1; k++)
-        G[k] = G[k + 1] - G[k];
-    for (int k = nsam - 2; k > 0; k--)
-        G[k] = G[k] - G[k - 1];
-    for (int k = 0; k < nsam - 1; k++)
-        F[k] = G[k];
-    free(G);
 }
 
 static void build_H_iw(float tau, const FreqContext *ctx, int iw, float *F, float *hr, float *hi)
@@ -143,8 +147,9 @@ static void build_H_iw(float tau, const FreqContext *ctx, int iw, float *F, floa
     float omega = 2.0f * (float)M_PI * iw / ctx->nfft;
     float theta = -omega;
 
-    float step_r = cosf(theta);
-    float step_i = sinf(theta);
+    float step_i = 0.0f;
+    float step_r = 1.0f;
+    fast_sincosf(theta, &step_i, &step_r);
 
     float z_r = 1.0f;
     float z_i = 0.0f;
@@ -167,8 +172,12 @@ static void build_H_iw(float tau, const FreqContext *ctx, int iw, float *F, floa
     float phase_m = -omega * (float)m;
     float phase_m1 = -omega * (float)(m - 1);
 
-    float lin_r = (1.0f - delta) * cosf(phase_m) + delta * cosf(phase_m1);
-    float lin_i = (1.0f - delta) * sinf(phase_m) + delta * sinf(phase_m1);
+    float sin_m, cos_m, sin_m1, cos_m1;
+    fast_sincosf(phase_m, &sin_m, &cos_m);
+    fast_sincosf(phase_m1, &sin_m1, &cos_m1);
+
+    float lin_r = (1.0f - delta) * cos_m + delta * cos_m1;
+    float lin_i = (1.0f - delta) * sin_m + delta * sin_m1;
 
     *hr = lin_r * sum_r - lin_i * sum_i;
     *hi = lin_r * sum_i + lin_i * sum_r;
@@ -258,7 +267,7 @@ static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **sho
     }
 }
 
-static void highpassfilt(fftwf_complex *spec, int nw, float df, float fmin)
+[[maybe_unused]] static void highpassfilt(fftwf_complex *spec, int nw, float df, float fmin)
 {
     if (!spec || nw <= 0 || df <= 0.0f)
         return;
@@ -341,7 +350,7 @@ static void lowpassfilt(fftwf_complex *spec, int nw, float df, float fmax)
     }
 }
 
-static void bandpassfilt(fftwf_complex *spec, int nw, float df, float fmin, float fmax)
+[[maybe_unused]] static void bandpassfilt(fftwf_complex *spec, int nw, float df, float fmin, float fmax)
 {
     if (!spec || nw <= 0 || df <= 0.0f)
         return;
@@ -679,8 +688,8 @@ static void build_receiver_phase_amp_matrix(const FreqContext *ctx,
             float hi = hi_cache[key];
 
             float phase = omega * tau;
-            float cosp = cosf(phase);
-            float sinp = sinf(phase);
+            float sinp, cosp;
+            fast_sincosf(phase, &sinp, &cosp);
 
             size_t imat = (size_t)ih * (size_t)ctx->nh + (size_t)ic;
             tau_mat[ih][ic] = tau;
@@ -746,8 +755,8 @@ static void build_source_phase_amp_matrix_noncmp(const FreqContext *ctx,
             float hi = hi_cache[key];
 
             float phase = omega * tau;
-            float cosp = cosf(phase);
-            float sinp = sinf(phase);
+            float sinp, cosp;
+            fast_sincosf(phase, &sinp, &cosp);
 
             size_t imat = (size_t)is * (size_t)ctx->ns + (size_t)ic;
             tau_mat[is][ic] = tau;
@@ -801,12 +810,15 @@ static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
                                         tau_mat,
                                         Amp_mat);
 
-        BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->nh,
+        BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(ctx->nh,
                                                                tau_mat,
                                                                Amp_mat,
                                                                omega,
                                                                ctx->p,
-                                                               ctx->n_leaf);
+                                                               ctx->n_leaf,
+                                                               ctx->bf_panel_levels,
+                                                               ctx->bf_amp_eps,
+                                                               ctx->bf_phase_tol);
 
         for (int is = 0; is < ctx->ns; is++)
         {
@@ -817,7 +829,7 @@ static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
                 Uin_is[ic][1] = Uin[ia + iw][1];
             }
 
-            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+            bf1d_strict_segmented_apply(factor, Uin_is, Uout_is);
 
             for (int ih = 0; ih < ctx->nh; ih++)
             {
@@ -827,7 +839,7 @@ static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
             }
         }
 
-        bf1d_aca_factor_destroy(factor);
+        bf1d_strict_segmented_destroy(factor);
     }
     else
     {
@@ -857,14 +869,17 @@ static void apply_receiver_operator_freq_iw_bf(const FreqContext *ctx,
                 Uin_is[ic][1] = Uin[ia + iw][1];
             }
 
-            BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->nh,
+            BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(ctx->nh,
                                                                    tau_mat,
                                                                    Amp_mat,
                                                                    omega,
                                                                    ctx->p,
-                                                                   ctx->n_leaf);
-            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
-            bf1d_aca_factor_destroy(factor);
+                                                                   ctx->n_leaf,
+                                                                   ctx->bf_panel_levels,
+                                                                   ctx->bf_amp_eps,
+                                                                   ctx->bf_phase_tol);
+            bf1d_strict_segmented_apply(factor, Uin_is, Uout_is);
+            bf1d_strict_segmented_destroy(factor);
 
             for (int ih = 0; ih < ctx->nh; ih++)
             {
@@ -997,8 +1012,8 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
                     float hr = hr_cache[key];
                     float hi = hi_cache[key];
                     float phase = omega * tau;
-                    float cosp = cosf(phase);
-                    float sinp = sinf(phase);
+                    float sinp, cosp;
+                    fast_sincosf(phase, &sinp, &cosp);
 
                     size_t imat = (size_t)is * (size_t)ctx->ns + (size_t)ic;
                     tau_mat[is][ic] = tau;
@@ -1007,14 +1022,17 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
                 }
             }
 
-            BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->ns,
+            BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(ctx->ns,
                                                                    tau_mat,
                                                                    Amp_mat,
                                                                    omega,
                                                                    ctx->p,
-                                                                   ctx->n_leaf);
-            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
-            bf1d_aca_factor_destroy(factor);
+                                                                   ctx->n_leaf,
+                                                                   ctx->bf_panel_levels,
+                                                                   ctx->bf_amp_eps,
+                                                                   ctx->bf_phase_tol);
+            bf1d_strict_segmented_apply(factor, Uin_is, Uout_is);
+            bf1d_strict_segmented_destroy(factor);
 
             for (int is = sleft; is <= sright; is += jump)
             {
@@ -1045,12 +1063,15 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
                                              tau_mat,
                                              Amp_mat);
 
-        BFAcaFactor *factor = bf1d_aca_factor_create_phase_amp(ctx->ns,
+        BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(ctx->ns,
                                                                tau_mat,
                                                                Amp_mat,
                                                                omega,
                                                                ctx->p,
-                                                               ctx->n_leaf);
+                                                               ctx->n_leaf,
+                                                               ctx->bf_panel_levels,
+                                                               ctx->bf_amp_eps,
+                                                               ctx->bf_phase_tol);
 
         for (int ih = 0; ih < ctx->nh; ih++)
         {
@@ -1061,7 +1082,7 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
                 Uin_is[ic][1] = Utmp[ia + iw][1];
             }
 
-            bf1d_aca_factor_apply(factor, Uin_is, Uout_is);
+            bf1d_strict_segmented_apply(factor, Uin_is, Uout_is);
 
             for (int is = 0; is < ctx->ns; is++)
             {
@@ -1071,7 +1092,7 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
             }
         }
 
-        bf1d_aca_factor_destroy(factor);
+        bf1d_strict_segmented_destroy(factor);
     }
 
     fftwf_free(Amp_mat);
@@ -1087,10 +1108,8 @@ static void apply_source_operator_freq_iw_bf(const FreqContext *ctx,
 
 static int frequency_progress_step(int nw)
 {
-    int step = nw / 20; /* approximately 5% */
-    if (step < 50)
-        step = 50;
-    if (nw <= 50)
+    int step = nw / 10; /* approximately 10% */
+    if (nw <= 10)
         step = 1;
     return step;
 }
@@ -1178,21 +1197,27 @@ int main(int argc, char **argv)
     }
 
     use_bf = se_have_par("use_bf") ? se_get_par_int("use_bf") : 1;
-    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 11;
-    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 12;
+    ctx.p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 12;
+    ctx.n_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 16;
+    ctx.bf_panel_levels = se_have_par("bf_panel_levels") ? se_get_par_int("bf_panel_levels") : 1;
+    ctx.bf_amp_eps = se_have_par("bf_amp_eps") ? se_get_par_float("bf_amp_eps") : 1e-20f;
+    ctx.bf_phase_tol = se_have_par("bf_phase_tol") ? se_get_par_float("bf_phase_tol") : 2.0f;
     if (ctx.p <= 0 || ctx.n_leaf <= 1)
         ERROR(("Need bf_p > 0 and bf_n_leaf > 1."));
     if (ctx.p >= ctx.n_leaf)
-        ERROR(("Need bf_p < bf_n_leaf for meaningful low-rank butterfly compression."));
+        ERROR(("Need bf_p < bf_n_leaf for meaningful butterfly interpolation / exact leaf-stage settings."));
 
     INFO(("Use butterfly: %s.", use_bf ? "yes" : "no"));
-    INFO(("Butterfly parameters: p = %d, n_leaf = %d.", ctx.p, ctx.n_leaf));
+    INFO(("Adaptive segmented butterfly parameters: p = %d, n_leaf = %d, panel_levels = %d, amp_eps = %g, phase_tol = %g.", ctx.p, ctx.n_leaf, ctx.bf_panel_levels, ctx.bf_amp_eps, ctx.bf_phase_tol));
 
     ctx.aper = se_have_par("aperture") ? se_get_par_int("aperture") : 50;
     ctx.tap = se_have_par("taper") ? se_get_par_int("taper") : 10;
     ctx.antialias = se_have_par("antialias") ? se_get_par_float("antialias") : 1.0f;
     if (ctx.antialias < 0.0f)
         ERROR(("antialias must be >= 0."));
+    int omp_freq_chunk = se_have_par("omp_freq_chunk") ? se_get_par_int("omp_freq_chunk") : 8;
+    if (omp_freq_chunk < 1)
+        omp_freq_chunk = 1;
     float length = se_have_par("length") ? se_get_par_float("length") : 0.025f;
 
     if (in->headers->ndim < 3)
@@ -1261,7 +1286,7 @@ int main(int argc, char **argv)
     shot = NULL;
 
 #ifdef _OPENMP
-#pragma omp parallel for
+#pragma omp parallel for schedule(static, omp_freq_chunk)
 #endif
     for (int iw = 0; iw < ctx.nw; iw++)
     {
@@ -1284,7 +1309,7 @@ int main(int argc, char **argv)
     memset(Uout, 0, (size_t)ctx.ns * ctx.nh * ctx.nw * sizeof(fftwf_complex));
 
 #ifdef _OPENMP
-#pragma omp parallel for
+#pragma omp parallel for schedule(static, omp_freq_chunk)
 #endif
     for (int iw = 0; iw < ctx.nw; iw++)
     {
