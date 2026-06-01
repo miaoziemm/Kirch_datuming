@@ -38,6 +38,7 @@ int main(int argc, char *argv[])
     se_par_init(argc, argv);
     char *unit;
     const char *type = NULL;
+    int isdiff;
     int adj = 0, cig = 0, cmp = 0;
     off_t nzx = 0;
     int nt = 0, nx = 0, sny = 0, rny = 0, ns = 0, nh = 0, nz = 0, i = 0, ix = 0, iz = 0, ih = 0, is = 0, ist = 0, iht = 0, ng = 0, ithr = 0, nthr = 0;
@@ -68,6 +69,11 @@ int main(int argc, char *argv[])
         cmp = 1;
     else
         cmp = se_get_par_int("cmp");
+
+    if (!se_have_par("diff"))
+        isdiff = 0;
+    else
+        isdiff = se_get_par_int("diff");
 
     if (!se_have_par("seismic_data"))
         ERROR(("Need seismic_data="));
@@ -401,7 +407,12 @@ auto t_start = std::chrono::steady_clock::now();
                 if (aperture_trace != -1 && fabs(iht-ist) >= aperture_trace) continue;
                 doubint(nt, trace);
 
-                // diff2(trace, nt, dt);
+                if(isdiff==1)
+                {
+                    diff2(trace, nt, dt);
+                }
+
+                
 
             }
             else

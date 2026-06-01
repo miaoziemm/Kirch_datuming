@@ -30,18 +30,6 @@ static int is_end_token(const char* s)
 	        strcmp(s, "end") == 0);
 }
 
-static int imin2(int a, int b)
-{
-	return a < b ? a : b;
-}
-
-static float clamp_float(float v, float vmin, float vmax)
-{
-	if (v < vmin) return vmin;
-	if (v > vmax) return vmax;
-	return v;
-}
-
 static char* build_output_name(const char* base, int layer_index)
 {
 	const char* ext = strrchr(base, '.');
@@ -107,6 +95,24 @@ static int next_token(char** p, char* tok, int tok_size)
 	return 1;
 }
 
+
+static const char* get_raw_argv_value(int argc, char* argv[], const char* key)
+/*<
+ * Read a parameter value directly from argv.
+ * This is used for scale= because some SE-style parsers treat commas
+ * as separators and se_get_par_str("scale") may return only the
+ * first value before the first comma.
+ *>*/
+{
+	size_t key_len = strlen(key);
+	for (int i = 1; i < argc; ++i) {
+		if (strncmp(argv[i], key, key_len) == 0 && argv[i][key_len] == '=') {
+			return argv[i] + key_len + 1;
+		}
+	}
+	return NULL;
+}
+
 static int parse_int_token(const char* tok, const char* name, int line_no)
 {
 	char* endp = NULL;
@@ -123,12 +129,84 @@ static int parse_int_token(const char* tok, const char* name, int line_no)
 	return (int)v;
 }
 
+static float parse_float_token(const char* tok, const char* name, int line_no)
+{
+	char* endp = NULL;
+	double v = strtod(tok, &endp);
+
+	if (endp == tok || *endp != '\0') {
+		ERROR(("Invalid %s at line %d: %s", name, line_no, tok));
+	}
+
+	if (!isfinite(v)) {
+		ERROR(("Invalid %s at line %d: %s", name, line_no, tok));
+	}
+
+	return (float)v;
+}
+
 static int parse_start_token(const char* tok, int line_no)
 {
 	if (is_start_token(tok)) {
 		return 0;
 	}
 	return parse_int_token(tok, "start", line_no);
+}
+
+static void parse_scale_list(const char* scale_arg, float* scale_layer, int nlayers)
+/*<
+ * Read layer scale factors from scale=.
+ * Examples:
+ *   scale=1.0                 -> all layers use 1.0
+ *   scale=1.0,1.15,1.25,1.10 -> layer-by-layer scale factors
+ *>*/
+{
+	for (int i = 0; i < nlayers; ++i) {
+		scale_layer[i] = 1.0f;
+	}
+
+	if (scale_arg == NULL || scale_arg[0] == '\0') {
+		return;
+	}
+
+	char* buf = (char*)malloc(strlen(scale_arg) + 1);
+	if (buf == NULL) {
+		ERROR(("Out of memory"));
+	}
+	strcpy(buf, scale_arg);
+
+	char* p = buf;
+	char tok[256];
+	int nscale = 0;
+	float* tmp = alloc1float(nlayers);
+
+	while (next_token(&p, tok, sizeof(tok))) {
+		if (nscale >= nlayers) {
+			ERROR(("Too many scale values. nlayers=%d, scale=%s", nlayers, scale_arg));
+		}
+		tmp[nscale] = parse_float_token(tok, "scale", 0);
+		nscale++;
+	}
+
+	if (nscale == 0) {
+		ERROR(("No valid scale values in scale=%s", scale_arg));
+	}
+
+	if (nscale == 1) {
+		for (int i = 0; i < nlayers; ++i) {
+			scale_layer[i] = tmp[0];
+		}
+	} else if (nscale == nlayers) {
+		for (int i = 0; i < nlayers; ++i) {
+			scale_layer[i] = tmp[i];
+		}
+	} else {
+		ERROR(("The number of scale values must be 1 or nlayers. nscale=%d, nlayers=%d, scale=%s",
+		       nscale, nlayers, scale_arg));
+	}
+
+	free1float(tmp);
+	free(buf);
 }
 
 static layer_range_t* read_layer_txt(const char* fname, int n1, int* nlayers_out)
@@ -236,76 +314,6 @@ static layer_range_t* read_layer_txt(const char* fname, int n1, int* nlayers_out
 	return layers;
 }
 
-static float compute_overlap_energy_scale(float*** out_data,
-                                          float*** layer_data,
-                                          int n2, int n3,
-                                          int start,
-                                          int overlap,
-                                          int blend_start,
-                                          int blend_z,
-                                          int auto_scale_nz,
-                                          const float* scalex_layer,
-                                          float eps,
-                                          float scale_min,
-                                          float scale_max)
-/*<
- * Estimate the scale for the current lower layer by matching the energy of
- * the already-stitched upper image and the current lower image in the valid
- * overlap zone.
- *
- * If stitch_blend=20 and overlap=50, blend_start=30.  The default
- * auto_scale_nz=1 uses k=30, i.e., the first effective row of the lower
- * layer.  Set auto_scale_nz=0 to use the whole effective blending zone.
- *>*/
-{
-	if (overlap <= 0) return 1.0f;
-
-	int k0 = 0;
-	int nz_avail = 0;
-
-	if (blend_z > 0) {
-		k0 = blend_start;
-		nz_avail = blend_z;
-	} else {
-		/* No lower-layer sample is used inside the overlap.  Use the last
-		 * overlapping row as the closest common-depth reference.
-		 */
-		k0 = overlap - 1;
-		nz_avail = 1;
-	}
-
-	if (k0 < 0 || k0 >= overlap || nz_avail <= 0) return 1.0f;
-
-	int nz_use = (auto_scale_nz <= 0) ? nz_avail : imin2(auto_scale_nz, nz_avail);
-	if (k0 + nz_use > overlap) nz_use = overlap - k0;
-	if (nz_use <= 0) return 1.0f;
-
-	double upper_energy = 0.0;
-	double lower_energy = 0.0;
-
-	for (int i3 = 0; i3 < n3; ++i3) {
-		for (int i2 = 0; i2 < n2; ++i2) {
-			float scale_x = scalex_layer ? scalex_layer[i2] : 1.0f;
-			for (int iz = 0; iz < nz_use; ++iz) {
-				int k = k0 + iz;
-				int gz = start + k;
-				float u = out_data[i3][i2][gz];
-				float l = layer_data[i3][i2][k] * scale_x;
-				upper_energy += (double)u * (double)u;
-				lower_energy += (double)l * (double)l;
-			}
-		}
-	}
-
-	if (upper_energy <= (double)eps || lower_energy <= (double)eps) {
-		return 1.0f;
-	}
-
-	float scale = (float)sqrt(upper_energy / lower_energy);
-	if (!isfinite(scale)) scale = 1.0f;
-	return clamp_float(scale, scale_min, scale_max);
-}
-
 int main(int argc, char* argv[])
 {
 	se_par_init(argc, argv);
@@ -317,7 +325,7 @@ int main(int argc, char* argv[])
 	char* layer_image_base = NULL;
 	char* layer_txt = NULL;
 	char* out_f = NULL;
-	float scalez = 1.0f;
+	char* scale_arg = NULL;
 	float scalex_max = 1.0f;
 	int scalex_aper = 200;
 
@@ -331,12 +339,6 @@ int main(int argc, char* argv[])
 	 */
 	int stitch_blend = -1;
 
-	/* Automatic layer-amplitude scaling parameters. */
-	int auto_scale = 1;
-	int auto_scale_nz = 1;
-	float auto_scale_min = 0.70f;
-	float auto_scale_max = 1.30f;
-	float auto_scale_eps = 1e-20f;
 
 	if (!se_have_par("full_model")) ERROR(("Need full_model=")); else full_model_f = se_get_par_str("full_model");
 	if (!se_have_par("layer_model_base")) ERROR(("Need layer_model_base=")); else layer_model_base = se_get_par_str("layer_model_base");
@@ -353,35 +355,21 @@ int main(int argc, char* argv[])
 		ERROR(("Need layer_txt= or nlayers="));
 	}
 
-	/* scale is used only as a fallback when auto_scale=0. */
-	if (se_have_par("scale")) scalez = se_get_par_float("scale");
+	/* scale accepts either one value for all layers or nlayers comma-separated values.
+	 * Read it directly from argv first, because se_get_par_str("scale") may
+	 * keep only the first value when commas are used.
+	 */
+	scale_arg = (char*)get_raw_argv_value(argc, argv, "scale");
+	if (scale_arg == NULL && se_have_par("scale")) scale_arg = se_get_par_str("scale");
 	if (se_have_par("scalex_scale")) scalex_max = se_get_par_float("scalex_scale");
 	if (se_have_par("scalex_aper")) scalex_aper = se_get_par_int("scalex_aper");
 
 	if (se_have_par("stitch_blend")) stitch_blend = se_get_par_int("stitch_blend");
 
-	if (se_have_par("auto_scale")) auto_scale = se_get_par_int("auto_scale");
-	if (se_have_par("auto_scale_nz")) auto_scale_nz = se_get_par_int("auto_scale_nz");
-	if (se_have_par("auto_scale_min")) auto_scale_min = se_get_par_float("auto_scale_min");
-	if (se_have_par("auto_scale_max")) auto_scale_max = se_get_par_float("auto_scale_max");
-	if (se_have_par("auto_scale_eps")) auto_scale_eps = se_get_par_float("auto_scale_eps");
 
 	if (stitch_blend < -1) {
 		ERROR(("Invalid stitch_blend=%d", stitch_blend));
 	}
-	if (auto_scale != 0 && auto_scale != 1) {
-		ERROR(("Invalid auto_scale=%d, should be 0 or 1", auto_scale));
-	}
-	if (auto_scale_nz < 0) {
-		ERROR(("Invalid auto_scale_nz=%d", auto_scale_nz));
-	}
-	if (auto_scale_min <= 0.0f || auto_scale_max <= 0.0f || auto_scale_min > auto_scale_max) {
-		ERROR(("Invalid auto_scale_min=%g or auto_scale_max=%g", auto_scale_min, auto_scale_max));
-	}
-	if (auto_scale_eps <= 0.0f) {
-		ERROR(("Invalid auto_scale_eps=%g", auto_scale_eps));
-	}
-
 	sep_t* full_model = sep_open(full_model_f, SEP_READ, 0);
 	int full_ndim = (int)sep_get_min_ndim(full_model);
 	if (full_ndim < 1) full_ndim = 1;
@@ -413,18 +401,12 @@ int main(int argc, char* argv[])
 	}
 
 	float* scale_layer = alloc1float(nlayers);
+	parse_scale_list(scale_arg, scale_layer, nlayers);
 	for (int i = 0; i < nlayers; ++i) {
-		if (nlayers == 1) {
-			scale_layer[i] = 1.0f;
-		} else {
-			scale_layer[i] = 1.0f + (scalez - 1.0f) * (float)i / (float)(nlayers - 1);
-		}
-		INFO(("Layer %d fallback scale factor: %g", i + 1, scale_layer[i]));
+		INFO(("Layer %d scale factor: %g", i + 1, scale_layer[i]));
 	}
 
 	INFO(("Tail blending: stitch_blend=%d (-1 means full-overlap blending)", stitch_blend));
-	INFO(("Auto scale: enable=%d nz=%d min=%g max=%g eps=%g",
-	      auto_scale, auto_scale_nz, auto_scale_min, auto_scale_max, auto_scale_eps));
 
 	/* 横向 scale：两侧各按 scalex_aper 个采样点从 scalex_max 线性过渡到 1，
 	 * 中间保持 1。
@@ -553,19 +535,7 @@ int main(int argc, char* argv[])
 		se_fsio_read_float(image->data->io, layer_data[0][0],
 		                   (size_t)m1 * (size_t)n2_full * (size_t)n3_full);
 
-		float scale_z = (ilayer > 0) ? scale_layer[ilayer] : 1.0f;
-		if (ilayer > 0 && auto_scale && overlap > 0) {
-			scale_z = compute_overlap_energy_scale(out_data, layer_data,
-			                                      n2_full, n3_full,
-			                                      start, overlap,
-			                                      blend_start, blend_z,
-			                                      auto_scale_nz,
-			                                      scalex_layer,
-			                                      auto_scale_eps,
-			                                      auto_scale_min,
-			                                      auto_scale_max);
-			INFO(("Layer %d auto scale factor: %g", ilayer + 1, scale_z));
-		}
+		float scale_z = scale_layer[ilayer];
 
 		for (int i3 = 0; i3 < n3_full; ++i3) {
 			for (int i2 = 0; i2 < n2_full; ++i2) {
