@@ -3,6 +3,7 @@
 #include <SERECKIRCH/include/se_reckirch.h>
 #include "./help/eikods2d_help.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,33 @@ static void write_float_shot_at(sep_t *sep, const float *buf, size_t nsample, in
         }
         if (written == 0)
             ERROR(("pwrite wrote zero bytes for %s shot %d file %s", label, ishot + 1, io->file_name));
+        done += (size_t)written;
+    }
+}
+
+static void write_float_all(sep_t *sep, const float *buf, size_t nsample, int nshot, const char *label)
+{
+    if (sep == NULL || sep->data == NULL || sep->data->io == NULL)
+        ERROR(("Invalid SEP output handle for %s", label));
+
+    if (nsample > std::numeric_limits<size_t>::max() / (sizeof(float) * (size_t)nshot))
+        ERROR(("Byte-count overflow while writing %s", label));
+
+    const size_t nbytes = nsample * (size_t)nshot * sizeof(float);
+    const char *bytes = reinterpret_cast<const char *>(buf);
+    size_t done = 0;
+    while (done < nbytes)
+    {
+        ssize_t written = pwrite(sep->data->io->fd, bytes + done, nbytes - done, (off_t)done);
+        if (written < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ERROR(("pwrite failed for %s file %s: errno=%d - %s",
+                   label, sep->data->io->file_name, errno, strerror(errno)));
+        }
+        if (written == 0)
+            ERROR(("pwrite wrote zero bytes for %s file %s", label, sep->data->io->file_name));
         done += (size_t)written;
     }
 }
@@ -371,11 +399,45 @@ int main(int argc, char *argv[])
     if (tds2 != NULL)
         preallocate_float_output(tds2, n123, nshot, "tds2");
 
-    auto t_start = std::chrono::steady_clock::now();
+    const size_t nout = 3 + (tdl2 != NULL ? 1 : 0) + (tds2 != NULL ? 1 : 0);
+    if ((size_t)nshot > std::numeric_limits<size_t>::max() / n123)
+        ERROR(("Total output sample-count overflow: nshot=%d n123=%zu", nshot, n123));
+    const size_t samples_total = n123 * (size_t)nshot;
+    if (samples_total > std::numeric_limits<size_t>::max() / sizeof(float))
+        ERROR(("Output byte-count overflow: samples=%zu", samples_total));
+    const size_t bytes_per_output = samples_total * sizeof(float);
+    if (nout > std::numeric_limits<size_t>::max() / bytes_per_output)
+        ERROR(("Buffered output byte-count overflow: outputs=%zu bytes_per_output=%zu", nout, bytes_per_output));
+    const size_t buffered_bytes = bytes_per_output * nout;
+    int buffer_mb = se_have_par("eikods_buffer_mb") ? se_get_par_int("eikods_buffer_mb") : 4096;
+    if (buffer_mb < 0)
+        buffer_mb = 0;
+    size_t buffer_limit = (size_t)buffer_mb * 1024u * 1024u;
+    const bool buffered_output = (buffer_limit > 0 && buffered_bytes <= buffer_limit);
 
-    INFO(("streaming run: %d shots, %zu samples/shot", nshot, n123));
+    std::vector<float> time_all, dl1_all, ds1_all, dl2_all, ds2_all;
+    if (buffered_output)
+    {
+        time_all.resize(samples_total);
+        dl1_all.resize(samples_total);
+        ds1_all.resize(samples_total);
+        if (tdl2 != NULL)
+            dl2_all.resize(samples_total);
+        if (tds2 != NULL)
+            ds2_all.resize(samples_total);
+        INFO(("buffered run: %d shots, %zu samples/shot, %.1f MiB output buffer",
+              nshot, n123, buffered_bytes / (1024.0 * 1024.0)));
+    }
+    else
+    {
+        INFO(("streaming run: %d shots, %zu samples/shot (requires %.1f MiB > eikods_buffer_mb=%d)",
+              nshot, n123, buffered_bytes / (1024.0 * 1024.0), buffer_mb));
+    }
+
+    auto t_start = std::chrono::steady_clock::now();
 #ifdef SE_USE_OMP
-    INFO(("OpenMP enabled: computing shots with up to %d threads and random-access writes", omp_get_max_threads()));
+    INFO(("OpenMP enabled: computing shots with up to %d threads%s",
+          omp_get_max_threads(), buffered_output ? " and deferred output writes" : " and random-access writes"));
 #pragma omp parallel
     {
         if (!efmm)
@@ -414,13 +476,27 @@ int main(int argc, char *argv[])
                        dl2_buf.empty() ? NULL : dl2_buf.data(),
                        ds2_buf.empty() ? NULL : ds2_buf.data());
 
-            write_float_shot_at(time, t.data(), n123, is, "time");
-            write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
-            write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
-            if (tdl2 != NULL)
-                write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
-            if (tds2 != NULL)
-                write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
+            if (buffered_output)
+            {
+                const size_t off = (size_t)is * n123;
+                std::copy(t.begin(), t.end(), time_all.begin() + off);
+                std::copy(dl1.begin(), dl1.end(), dl1_all.begin() + off);
+                std::copy(ds1.begin(), ds1.end(), ds1_all.begin() + off);
+                if (tdl2 != NULL)
+                    std::copy(dl2_buf.begin(), dl2_buf.end(), dl2_all.begin() + off);
+                if (tds2 != NULL)
+                    std::copy(ds2_buf.begin(), ds2_buf.end(), ds2_all.begin() + off);
+            }
+            else
+            {
+                write_float_shot_at(time, t.data(), n123, is, "time");
+                write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+                write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+                if (tdl2 != NULL)
+                    write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
+                if (tds2 != NULL)
+                    write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
+            }
 
             if (is == 0 || is % 50 == 0 || is == nshot - 1)
                 INFO(("shot %d/%d done on thread %d", is + 1, nshot, tid));
@@ -463,17 +539,43 @@ int main(int argc, char *argv[])
                    dl2_buf.empty() ? NULL : dl2_buf.data(),
                    ds2_buf.empty() ? NULL : ds2_buf.data());
 
-        write_float_shot_at(time, t.data(), n123, is, "time");
-        write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
-        write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
-        if (tdl2 != NULL)
-            write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
-        if (tds2 != NULL)
-            write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
+        if (buffered_output)
+        {
+            const size_t off = (size_t)is * n123;
+            std::copy(t.begin(), t.end(), time_all.begin() + off);
+            std::copy(dl1.begin(), dl1.end(), dl1_all.begin() + off);
+            std::copy(ds1.begin(), ds1.end(), ds1_all.begin() + off);
+            if (tdl2 != NULL)
+                std::copy(dl2_buf.begin(), dl2_buf.end(), dl2_all.begin() + off);
+            if (tds2 != NULL)
+                std::copy(ds2_buf.begin(), ds2_buf.end(), ds2_all.begin() + off);
+        }
+        else
+        {
+            write_float_shot_at(time, t.data(), n123, is, "time");
+            write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+            write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+            if (tdl2 != NULL)
+                write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
+            if (tds2 != NULL)
+                write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
+        }
     }
     if (!efmm)
         eikods_close();
 #endif
+
+    if (buffered_output)
+    {
+        INFO(("writing buffered output"));
+        write_float_all(time, time_all.data(), n123, nshot, "time");
+        write_float_all(tdl1, dl1_all.data(), n123, nshot, "tdl1");
+        write_float_all(tds1, ds1_all.data(), n123, nshot, "tds1");
+        if (tdl2 != NULL)
+            write_float_all(tdl2, dl2_all.data(), n123, nshot, "tdl2");
+        if (tds2 != NULL)
+            write_float_all(tds2, ds2_all.data(), n123, nshot, "tds2");
+    }
 
     INFO(("FINISH."));
     auto t_end = std::chrono::steady_clock::now();
