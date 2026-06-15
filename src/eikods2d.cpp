@@ -3,9 +3,68 @@
 #include <SERECKIRCH/include/se_reckirch.h>
 #include "./help/eikods2d_help.h"
 
+#include <cerrno>
+#include <cstring>
+#include <limits>
+#include <vector>
+#include <unistd.h>
+
 #ifdef SE_USE_OMP
 #include <omp.h>
 #endif
+
+
+static void write_float_shot_at(sep_t *sep, const float *buf, size_t nsample, int ishot, const char *label)
+{
+    if (sep == NULL || sep->data == NULL || sep->data->io == NULL)
+        ERROR(("Invalid SEP output handle for %s", label));
+
+    se_fsio *io = sep->data->io;
+    if (io->io_data_type != FIO_DATA_TYPE_NATIVE_FLOAT)
+        ERROR(("Parallel random-access output for %s requires native_float data format", label));
+
+    if (nsample > std::numeric_limits<size_t>::max() / sizeof(float))
+        ERROR(("Byte-count overflow while writing %s", label));
+    const size_t nbytes = nsample * sizeof(float);
+    if ((size_t)ishot > std::numeric_limits<size_t>::max() / nbytes)
+        ERROR(("Offset overflow while writing %s", label));
+
+    const off_t offset = (off_t)((size_t)ishot * nbytes);
+    const char *bytes = reinterpret_cast<const char *>(buf);
+    size_t done = 0;
+    while (done < nbytes)
+    {
+        ssize_t written = pwrite(io->fd, bytes + done, nbytes - done, offset + (off_t)done);
+        if (written < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ERROR(("pwrite failed for %s shot %d file %s: errno=%d - %s",
+                   label, ishot + 1, io->file_name, errno, strerror(errno)));
+        }
+        if (written == 0)
+            ERROR(("pwrite wrote zero bytes for %s shot %d file %s", label, ishot + 1, io->file_name));
+        done += (size_t)written;
+    }
+}
+
+static void preallocate_float_output(sep_t *sep, size_t nsample, int nshot, const char *label)
+{
+    if (sep == NULL || sep->data == NULL || sep->data->io == NULL)
+        return;
+
+    if (nsample > std::numeric_limits<size_t>::max() / sizeof(float))
+        ERROR(("Byte-count overflow while sizing %s", label));
+    const size_t shot_bytes = nsample * sizeof(float);
+
+    if ((size_t)nshot > std::numeric_limits<size_t>::max() / shot_bytes)
+        ERROR(("Total byte-count overflow while sizing %s", label));
+    const size_t total_bytes = shot_bytes * (size_t)nshot;
+
+    if (ftruncate(sep->data->io->fd, (off_t)total_bytes) != 0)
+        ERROR(("ftruncate failed for %s file %s: errno=%d - %s",
+               label, sep->data->io->file_name, errno, strerror(errno)));
+}
 
 int main(int argc, char *argv[])
 {
@@ -15,9 +74,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int b1 = 1, b2 = 1, b3 = 1, n1 = 0, n2 = 0, n3 = 1, i, nshot = 1, ndim = 3, is, order = 2, n123, *p, l = 1;
+    int b1 = 1, b2 = 1, b3 = 1, n1 = 0, n2 = 0, n3 = 1, i, nshot = 1, ndim = 3, is, order = 2, l = 1;
+    size_t n123 = 0;
     float br1 = 0.0f, br2 = 0.0f, br3 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-    float **s, *t, *v, *dl1, *ds1, *dl2 = NULL, *ds2 = NULL;
+    float **s, *v;
     const char *sfile = NULL, *in_f = NULL, *out_f = NULL, *tdl1_f = NULL, *tds1_f = NULL, *tdl2_f = NULL, *tds2_f = NULL;
     bool isvel = true, plane[3] = {false, false, false};
     int efmm = 0;
@@ -38,7 +98,7 @@ int main(int argc, char *argv[])
     time = sep_open(out_f, SEP_WRITE, 0);
 
     time->headers->ndim = 3;
-    
+
 
     printf("Reading velocity model from %s\n", in_f);
     printf("Writing traveltime to %s\n", out_f);
@@ -191,13 +251,14 @@ int main(int argc, char *argv[])
 
     // sep_copy_headers(time, vel);
 
-    n123 = n1 * n2 * n3;
+    if (n1 <= 0 || n2 <= 0 || n3 <= 0)
+        ERROR(("Invalid input dimensions n1=%d n2=%d n3=%d", n1, n2, n3));
 
-    size_t shot_stride = (size_t)n123;
+    n123 = (size_t)n1 * (size_t)n2 * (size_t)n3;
+    if (n123 > (size_t)std::numeric_limits<int>::max())
+        ERROR(("Grid is too large for the eikods integer indexing: n1*n2*n3=%zu", n123));
 
-    t = alloc1float(n123 * nshot);
     v = alloc1float(n123);
-    p = alloc1int(n123);
 
     se_fsio_read_float(vel->data->io, v, n123);
     if (isvel)
@@ -206,7 +267,7 @@ int main(int argc, char *argv[])
 #ifdef SE_USE_OMP
 #pragma omp parallel for
 #endif
-        for (i = 0; i < n123; i++)
+        for (i = 0; i < (int)n123; i++)
         {
             float slow_i = v[i];
             v[i] = 1. / (slow_i * slow_i);
@@ -226,31 +287,19 @@ int main(int argc, char *argv[])
     tds1 = sep_open(tds1_f, SEP_WRITE, 0);
     tdl1->headers->ndim = 3;
     tds1->headers->ndim = 3;
-    // sep_copy_headers(tdl1, time);
-    // sep_copy_headers(tds1, time);
-    dl1 = alloc1float(n123 * nshot);
-    ds1 = alloc1float(n123 * nshot);
 
     /* second-order derivative */
     if (se_have_par("tdl2"))
     {
         tdl2_f = se_get_par_str("tdl2");
         tdl2 = sep_open(tdl2_f, SEP_WRITE, 0);
-        // sep_copy_headers(tdl2, time);
         tdl2->headers->ndim = 3;
     }
     if (se_have_par("tds2"))
     {
         tds2_f = se_get_par_str("tds2");
         tds2 = sep_open(tds2_f, SEP_WRITE, 0);
-        // sep_copy_headers(tds2, time);
         tds2->headers->ndim = 3;
-    }
-
-    if (tdl2 != NULL || tds2 != NULL)
-    {
-        dl2 = alloc1float(n123 * nshot);
-        ds2 = alloc1float(n123 * nshot);
     }
 
     if (!se_have_par("l"))
@@ -259,118 +308,12 @@ int main(int argc, char *argv[])
         l = se_get_par_int("l");
     /* source perturbation direction */
 
-auto t_start = std::chrono::steady_clock::now();
-
-    if (!efmm)
-        eikods_init(n3, n2, n1);
-    else
-        efmm_eikods_init(n3, n2, n1);
-
-#ifdef SE_USE_OMP
-    if (efmm)
-    {
-        int shot_done = 0;
-
-        INFO(("efmm parallel run: %d shots, %d threads", nshot, omp_get_max_threads()));
-#pragma omp parallel for schedule(dynamic)
-        for (is = 0; is < nshot; is++)
-        {
-            size_t shot_off = (size_t)is * shot_stride;
-            int tid = omp_get_thread_num();
-
-            efmm_eikods(t + shot_off, v, p, plane,
-                        n3, n2, n1,
-                        o3, o2, o1,
-                        d3, d2, d1,
-                        s[is][2], s[is][1], s[is][0],
-                        b3, b2, b1,
-                        order, l,
-                        dl1 + shot_off, ds1 + shot_off,
-                        dl2 != NULL ? dl2 + shot_off : NULL,
-                        ds2 != NULL ? ds2 + shot_off : NULL);
-
-#pragma omp critical
-            {
-                shot_done++;
-                if (shot_done == 1 || shot_done == nshot || shot_done % 50 == 0)
-                {
-                    INFO(("efmm shot %d/%d done by thread %d", shot_done, nshot, tid));
-                }
-            }
-        }
-    }
-    else
-#endif
-    {
-        INFO(("serial run: %d shots", nshot));
-        for (is = 0; is < nshot; is++)
-        {
-            size_t shot_off = (size_t)is * shot_stride;
-
-            if (is % 100 == 0)
-            {
-                INFO(("shot %d of %d;", is + 1, nshot));
-                INFO(("Shooting from zshot=%g yshot=%g xshot=%g",
-                      s[is][0], s[is][1], s[is][2]));
-            }
-
-            if (efmm)
-            {
-                if (is == 0 || is % 50 == 0 || is == nshot - 1)
-                {
-                    INFO(("efmm shot %d/%d start", is + 1, nshot));
-                }
-                efmm_eikods(t + shot_off, v, p, plane,
-                       n3, n2, n1,
-                       o3, o2, o1,
-                       d3, d2, d1,
-                       s[is][2], s[is][1], s[is][0],
-                       b3, b2, b1,
-                       order, l,
-                       dl1 + shot_off, ds1 + shot_off,
-                       dl2 != NULL ? dl2 + shot_off : NULL,
-                       ds2 != NULL ? ds2 + shot_off : NULL);
-                if (is == 0 || is % 50 == 0 || is == nshot - 1)
-                {
-                    INFO(("efmm shot %d/%d done", is + 1, nshot));
-                }
-            }
-            else
-            {
-                if (is == 0 || is % 50 == 0 || is == nshot - 1)
-                {
-                    INFO(("eikods shot %d/%d start", is + 1, nshot));
-                }
-                eikods(t + shot_off, v, p, plane,
-                       n3, n2, n1,
-                       o3, o2, o1,
-                       d3, d2, d1,
-                       s[is][2], s[is][1], s[is][0],
-                       b3, b2, b1,
-                       order, l,
-                       dl1 + shot_off, ds1 + shot_off,
-                       dl2 != NULL ? dl2 + shot_off : NULL,
-                       ds2 != NULL ? ds2 + shot_off : NULL);
-                if (is == 0 || is % 50 == 0 || is == nshot - 1)
-                {
-                    INFO(("eikods shot %d/%d done", is + 1, nshot));
-                }
-            }
-        }
-    }
-    INFO(("FINISH."));
-    auto t_end = std::chrono::steady_clock::now();
-    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
-    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
-    
     time->headers->n[0] = n1;
     time->headers->d[0] = d1;
     time->headers->o[0] = o1;
-
     time->headers->n[1] = n2;
     time->headers->d[1] = d2;
     time->headers->o[1] = o2;
-
     time->headers->n[2] = nshot;
     time->headers->d[2] = dshot;
     time->headers->o[2] = oshot;
@@ -381,7 +324,6 @@ auto t_start = std::chrono::steady_clock::now();
     tdl1->headers->n[1] = n2;
     tdl1->headers->d[1] = d2;
     tdl1->headers->o[1] = o2;
-
     tdl1->headers->n[2] = nshot;
     tdl1->headers->d[2] = dshot;
     tdl1->headers->o[2] = oshot;
@@ -392,23 +334,151 @@ auto t_start = std::chrono::steady_clock::now();
     tds1->headers->n[1] = n2;
     tds1->headers->d[1] = d2;
     tds1->headers->o[1] = o2;
-
     tds1->headers->n[2] = nshot;
     tds1->headers->d[2] = dshot;
     tds1->headers->o[2] = oshot;
 
+    if (tdl2 != NULL)
+    {
+        tdl2->headers->n[0] = n1;
+        tdl2->headers->d[0] = d1;
+        tdl2->headers->o[0] = o1;
+        tdl2->headers->n[1] = n2;
+        tdl2->headers->d[1] = d2;
+        tdl2->headers->o[1] = o2;
+        tdl2->headers->n[2] = nshot;
+        tdl2->headers->d[2] = dshot;
+        tdl2->headers->o[2] = oshot;
+    }
+    if (tds2 != NULL)
+    {
+        tds2->headers->n[0] = n1;
+        tds2->headers->d[0] = d1;
+        tds2->headers->o[0] = o1;
+        tds2->headers->n[1] = n2;
+        tds2->headers->d[1] = d2;
+        tds2->headers->o[1] = o2;
+        tds2->headers->n[2] = nshot;
+        tds2->headers->d[2] = dshot;
+        tds2->headers->o[2] = oshot;
+    }
+
+    preallocate_float_output(time, n123, nshot, "time");
+    preallocate_float_output(tdl1, n123, nshot, "tdl1");
+    preallocate_float_output(tds1, n123, nshot, "tds1");
+    if (tdl2 != NULL)
+        preallocate_float_output(tdl2, n123, nshot, "tdl2");
+    if (tds2 != NULL)
+        preallocate_float_output(tds2, n123, nshot, "tds2");
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    INFO(("streaming run: %d shots, %zu samples/shot", nshot, n123));
+#ifdef SE_USE_OMP
+    INFO(("OpenMP enabled: computing shots with up to %d threads and random-access writes", omp_get_max_threads()));
+#pragma omp parallel
+    {
+        if (!efmm)
+            eikods_init(n3, n2, n1);
+        else
+            efmm_eikods_init(n3, n2, n1);
+
+        std::vector<float> t(n123), dl1(n123), ds1(n123);
+        std::vector<float> dl2_buf, ds2_buf;
+        if (tdl2 != NULL || tds2 != NULL)
+        {
+            dl2_buf.resize(n123);
+            ds2_buf.resize(n123);
+        }
+        std::vector<int> p(n123);
+
+#pragma omp for schedule(dynamic)
+        for (is = 0; is < nshot; is++)
+        {
+            int tid = omp_get_thread_num();
+            if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                INFO(("shot %d/%d start on thread %d", is + 1, nshot, tid));
+
+            if (efmm)
+                efmm_eikods(t.data(), v, p.data(), plane,
+                            n3, n2, n1, o3, o2, o1, d3, d2, d1,
+                            s[is][2], s[is][1], s[is][0], b3, b2, b1,
+                            order, l, dl1.data(), ds1.data(),
+                            dl2_buf.empty() ? NULL : dl2_buf.data(),
+                            ds2_buf.empty() ? NULL : ds2_buf.data());
+            else
+                eikods(t.data(), v, p.data(), plane,
+                       n3, n2, n1, o3, o2, o1, d3, d2, d1,
+                       s[is][2], s[is][1], s[is][0], b3, b2, b1,
+                       order, l, dl1.data(), ds1.data(),
+                       dl2_buf.empty() ? NULL : dl2_buf.data(),
+                       ds2_buf.empty() ? NULL : ds2_buf.data());
+
+            write_float_shot_at(time, t.data(), n123, is, "time");
+            write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+            write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+            if (tdl2 != NULL)
+                write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
+            if (tds2 != NULL)
+                write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
+
+            if (is == 0 || is % 50 == 0 || is == nshot - 1)
+                INFO(("shot %d/%d done on thread %d", is + 1, nshot, tid));
+        }
+        if (!efmm)
+            eikods_close();
+    }
+#else
+    if (!efmm)
+        eikods_init(n3, n2, n1);
+    else
+        efmm_eikods_init(n3, n2, n1);
+
+    std::vector<float> t(n123), dl1(n123), ds1(n123);
+    std::vector<float> dl2_buf, ds2_buf;
+    if (tdl2 != NULL || tds2 != NULL)
+    {
+        dl2_buf.resize(n123);
+        ds2_buf.resize(n123);
+    }
+    std::vector<int> p(n123);
 
     for (is = 0; is < nshot; is++)
     {
-        size_t shot_off = (size_t)is * shot_stride;
-        se_fsio_write_float(time->data->io, t + shot_off, n123);
-        se_fsio_write_float(tdl1->data->io, dl1 + shot_off, n123);
-        se_fsio_write_float(tds1->data->io, ds1 + shot_off, n123);
+        if (is == 0 || is % 50 == 0 || is == nshot - 1)
+            INFO(("shot %d/%d start", is + 1, nshot));
+
+        if (efmm)
+            efmm_eikods(t.data(), v, p.data(), plane,
+                        n3, n2, n1, o3, o2, o1, d3, d2, d1,
+                        s[is][2], s[is][1], s[is][0], b3, b2, b1,
+                        order, l, dl1.data(), ds1.data(),
+                        dl2_buf.empty() ? NULL : dl2_buf.data(),
+                        ds2_buf.empty() ? NULL : ds2_buf.data());
+        else
+            eikods(t.data(), v, p.data(), plane,
+                   n3, n2, n1, o3, o2, o1, d3, d2, d1,
+                   s[is][2], s[is][1], s[is][0], b3, b2, b1,
+                   order, l, dl1.data(), ds1.data(),
+                   dl2_buf.empty() ? NULL : dl2_buf.data(),
+                   ds2_buf.empty() ? NULL : ds2_buf.data());
+
+        write_float_shot_at(time, t.data(), n123, is, "time");
+        write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+        write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
         if (tdl2 != NULL)
-            se_fsio_write_float(tdl2->data->io, dl2 + shot_off, n123);
+            write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
         if (tds2 != NULL)
-            se_fsio_write_float(tds2->data->io, ds2 + shot_off, n123);
+            write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
     }
+    if (!efmm)
+        eikods_close();
+#endif
+
+    INFO(("FINISH."));
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
 
     sep_close(vel);
     sep_close(time);

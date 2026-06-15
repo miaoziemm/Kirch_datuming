@@ -26,5 +26,8 @@ void eikods (float* time                /* time */,
 	     float* dl2, float* ds2     /* second-order derivatives */);
 /*< Run fast marching eikonal solver >*/
 
+void eikods_close (void);
+/*< Free allocated storage >*/
+
 
 #endif
