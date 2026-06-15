@@ -20,8 +20,8 @@
 
 #include "../include/eikods.h"
 
-static int ndim, nt, nn[3], ss[3];
-static const float *t0, *v0;
+static thread_local int ndim, nt, nn[3], ss[3];
+static thread_local const float *t0, *v0;
 
 static int fermat(const void *a, const void *b)
 /* comparison for traveltime sorting from small to large */
@@ -140,6 +140,8 @@ void eikods_dt(int l, float* dl1, float* ds1, float* dl2, float* ds2,
 	if (dl2 != NULL || ds2 != NULL) 
 	    eikods_dt2(l,dl1,dl2,ds1,ds2,i,d);
     }
+
+    free(sort);
 }
 
 

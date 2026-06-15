@@ -12,9 +12,9 @@ static bool updaten (int m, float* res, struct Upd *v[]);
 static bool updaten2 (int m, float* res, struct Upd *v[]);
 static void grid (int *i, const int *n);
 
-static int *in, *n, s[3], order;
-static float *ttime, *vv, rdx[3];
-static double v1;
+static thread_local int *in, *n, s[3], order;
+static thread_local float *ttime, *vv, rdx[3];
+static thread_local double v1;
 
 void sf_neighbors_init (int *in1     /* status flag [n[0]*n[1]*n[2]] */, 
 			float *rdx1  /* grid sampling [3] */, 
