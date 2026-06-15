@@ -108,6 +108,14 @@ Optional parameters:
       Use the same convention as the derivative implementation in the
       SERECKIRCH library. The main program does not validate this value.
 
+  eikods_buffer_mb=<int>  [default: 4096]
+      Maximum memory, in MiB, used to defer output writes until after all
+      shot computations finish. When the required output buffer fits within
+      this limit, the solver stores each shot result in memory and writes
+      each output file sequentially at the end, avoiding long-running
+      contention and dirty-page throttling from parallel pwrite calls. Set
+      eikods_buffer_mb=0 to force the original streaming random-write mode.
+
 Header requirements for in=<file>:
   Required: n1, n2, d1, d2.
   Optional/defaulted: n3=1, d3=d2, o1=0, o2=0, o3=0.
