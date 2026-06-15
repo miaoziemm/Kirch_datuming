@@ -1,6 +1,6 @@
 #include "../include/pqueue.h"
 
-static float **x, **xn, **x1;
+static thread_local float **x, **xn, **x1;
 
 void sf_pqueue_init (int n)
 /*< Initialize heap with the maximum size >*/
