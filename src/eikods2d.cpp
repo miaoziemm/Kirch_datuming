@@ -3,12 +3,68 @@
 #include <SERECKIRCH/include/se_reckirch.h>
 #include "./help/eikods2d_help.h"
 
+#include <cerrno>
+#include <cstring>
 #include <limits>
 #include <vector>
+#include <unistd.h>
 
 #ifdef SE_USE_OMP
 #include <omp.h>
 #endif
+
+
+static void write_float_shot_at(sep_t *sep, const float *buf, size_t nsample, int ishot, const char *label)
+{
+    if (sep == NULL || sep->data == NULL || sep->data->io == NULL)
+        ERROR(("Invalid SEP output handle for %s", label));
+
+    se_fsio *io = sep->data->io;
+    if (io->io_data_type != FIO_DATA_TYPE_NATIVE_FLOAT)
+        ERROR(("Parallel random-access output for %s requires native_float data format", label));
+
+    if (nsample > std::numeric_limits<size_t>::max() / sizeof(float))
+        ERROR(("Byte-count overflow while writing %s", label));
+    const size_t nbytes = nsample * sizeof(float);
+    if ((size_t)ishot > std::numeric_limits<size_t>::max() / nbytes)
+        ERROR(("Offset overflow while writing %s", label));
+
+    const off_t offset = (off_t)((size_t)ishot * nbytes);
+    const char *bytes = reinterpret_cast<const char *>(buf);
+    size_t done = 0;
+    while (done < nbytes)
+    {
+        ssize_t written = pwrite(io->fd, bytes + done, nbytes - done, offset + (off_t)done);
+        if (written < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ERROR(("pwrite failed for %s shot %d file %s: errno=%d - %s",
+                   label, ishot + 1, io->file_name, errno, strerror(errno)));
+        }
+        if (written == 0)
+            ERROR(("pwrite wrote zero bytes for %s shot %d file %s", label, ishot + 1, io->file_name));
+        done += (size_t)written;
+    }
+}
+
+static void preallocate_float_output(sep_t *sep, size_t nsample, int nshot, const char *label)
+{
+    if (sep == NULL || sep->data == NULL || sep->data->io == NULL)
+        return;
+
+    if (nsample > std::numeric_limits<size_t>::max() / sizeof(float))
+        ERROR(("Byte-count overflow while sizing %s", label));
+    const size_t shot_bytes = nsample * sizeof(float);
+
+    if ((size_t)nshot > std::numeric_limits<size_t>::max() / shot_bytes)
+        ERROR(("Total byte-count overflow while sizing %s", label));
+    const size_t total_bytes = shot_bytes * (size_t)nshot;
+
+    if (ftruncate(sep->data->io->fd, (off_t)total_bytes) != 0)
+        ERROR(("ftruncate failed for %s file %s: errno=%d - %s",
+               label, sep->data->io->file_name, errno, strerror(errno)));
+}
 
 int main(int argc, char *argv[])
 {
@@ -307,11 +363,19 @@ int main(int argc, char *argv[])
         tds2->headers->o[2] = oshot;
     }
 
-auto t_start = std::chrono::steady_clock::now();
+    preallocate_float_output(time, n123, nshot, "time");
+    preallocate_float_output(tdl1, n123, nshot, "tdl1");
+    preallocate_float_output(tds1, n123, nshot, "tds1");
+    if (tdl2 != NULL)
+        preallocate_float_output(tdl2, n123, nshot, "tdl2");
+    if (tds2 != NULL)
+        preallocate_float_output(tds2, n123, nshot, "tds2");
+
+    auto t_start = std::chrono::steady_clock::now();
 
     INFO(("streaming run: %d shots, %zu samples/shot", nshot, n123));
 #ifdef SE_USE_OMP
-    INFO(("OpenMP enabled: computing shots with up to %d threads and ordered streaming writes", omp_get_max_threads()));
+    INFO(("OpenMP enabled: computing shots with up to %d threads and random-access writes", omp_get_max_threads()));
 #pragma omp parallel
     {
         if (!efmm)
@@ -328,7 +392,7 @@ auto t_start = std::chrono::steady_clock::now();
         }
         std::vector<int> p(n123);
 
-#pragma omp for schedule(dynamic) ordered
+#pragma omp for schedule(dynamic)
         for (is = 0; is < nshot; is++)
         {
             int tid = omp_get_thread_num();
@@ -350,16 +414,13 @@ auto t_start = std::chrono::steady_clock::now();
                        dl2_buf.empty() ? NULL : dl2_buf.data(),
                        ds2_buf.empty() ? NULL : ds2_buf.data());
 
-#pragma omp ordered
-            {
-                se_fsio_write_float(time->data->io, t.data(), n123);
-                se_fsio_write_float(tdl1->data->io, dl1.data(), n123);
-                se_fsio_write_float(tds1->data->io, ds1.data(), n123);
-                if (tdl2 != NULL)
-                    se_fsio_write_float(tdl2->data->io, dl2_buf.data(), n123);
-                if (tds2 != NULL)
-                    se_fsio_write_float(tds2->data->io, ds2_buf.data(), n123);
-            }
+            write_float_shot_at(time, t.data(), n123, is, "time");
+            write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+            write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+            if (tdl2 != NULL)
+                write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
+            if (tds2 != NULL)
+                write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
 
             if (is == 0 || is % 50 == 0 || is == nshot - 1)
                 INFO(("shot %d/%d done on thread %d", is + 1, nshot, tid));
@@ -402,13 +463,13 @@ auto t_start = std::chrono::steady_clock::now();
                    dl2_buf.empty() ? NULL : dl2_buf.data(),
                    ds2_buf.empty() ? NULL : ds2_buf.data());
 
-        se_fsio_write_float(time->data->io, t.data(), n123);
-        se_fsio_write_float(tdl1->data->io, dl1.data(), n123);
-        se_fsio_write_float(tds1->data->io, ds1.data(), n123);
+        write_float_shot_at(time, t.data(), n123, is, "time");
+        write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
+        write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
         if (tdl2 != NULL)
-            se_fsio_write_float(tdl2->data->io, dl2_buf.data(), n123);
+            write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
         if (tds2 != NULL)
-            se_fsio_write_float(tds2->data->io, ds2_buf.data(), n123);
+            write_float_shot_at(tds2, ds2_buf.data(), n123, is, "tds2");
     }
     if (!efmm)
         eikods_close();
