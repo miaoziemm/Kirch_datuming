@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef SE_USE_OMP
 #include <omp.h>
@@ -69,9 +70,11 @@ int main(int argc, char *argv[])
     idatum = (int)((datum-oz)/dz+0.5);
     if (idatum < 0 || idatum >= nz) ERROR(("Datum out of range."));
     // tgreen保存的数据为ngx乘ngx的走时数据,从0平面到datum深度处的走时数据
-    float ***ttabel_data = alloc3float(nz, nx, ngx);
-    se_fsio_read_float(ttabel->data->io, ttabel_data[0][0], nz*nx*ngx);
-    float **tgreen_data = alloc2float(ngx, ngx);
+    // Do not load the full (z,x,gx) travel-time cube: large ttabel files can
+    // be far bigger than memory.  SEP data are laid out with z as the fastest
+    // dimension, then x, then gx, so each needed datum sample can be read by
+    // seeking directly to ((gx * nx + x) * nz + idatum).
+    float *tgreen_row = alloc1float(ngx);
     for (igx1=0; igx1 < ngx; igx1++) {
         for (igx2=0; igx2 < ngx; igx2++) {
             float gx1 = ogx + igx1*dgx;
@@ -79,16 +82,16 @@ int main(int argc, char *argv[])
             int ix1 = (int)((gx1-ox)/dx+0.5);
             int ix2 = (int)((gx2-ox)/dx+0.5);
             if (ix1 < 0 || ix1 >= nx || ix2 < 0 || ix2 >= nx) ERROR(("Receiver table too small."));
-            tgreen_data[igx1][igx2] = ttabel_data[igx1][ix2][idatum];
-            
+
+            int64_t sample_index = (((int64_t)igx1 * nx + ix2) * nz + idatum);
+            off_t byte_off = (off_t)(sample_index * (int64_t)sizeof(float));
+            se_fsio_seek(ttabel->data->io, byte_off);
+            se_fsio_read_float(ttabel->data->io, &tgreen_row[igx2], 1);
         }
+        se_fsio_write_float(tgreen->data->io, tgreen_row, ngx);
     }
 
-
-    se_fsio_write_float(tgreen->data->io, tgreen_data[0], ngx*ngx);
-
-    free2float(tgreen_data);
-    free3float(ttabel_data);
+    free1float(tgreen_row);
 
     sep_close(model);
     sep_close(ttabel);
