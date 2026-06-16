@@ -42,7 +42,11 @@ int main(int argc, char *argv[])
     int adj = 0, cig = 0, cmp = 0;
     off_t nzx = 0;
     int nt = 0, nx = 0, sny = 0, rny = 0, ns = 0, nh = 0, nz = 0, i = 0, ix = 0, iz = 0, ih = 0, is = 0, ist = 0, iht = 0, ng = 0, ithr = 0, nthr = 0;
-    float *trace = NULL, **traces = NULL, **out = NULL, **stbl = NULL, **rtbl = NULL, *stable = NULL, *rtable = NULL, **stblx = NULL, **rtblx = NULL, *stablex = NULL, *rtablex = NULL;
+    float *trace = NULL, **traces = NULL, **out = NULL, *stable = NULL, *rtable = NULL, *stablex = NULL, *rtablex = NULL;
+    float *stbl0 = NULL, *stbl1 = NULL, *stblx0 = NULL, *stblx1 = NULL;
+    float *rtbl0 = NULL, *rtbl1 = NULL, *rtblx0 = NULL, *rtblx1 = NULL;
+    int stbl0_idx = -1, stbl1_idx = -1, stblx0_idx = -1, stblx1_idx = -1;
+    int rtbl0_idx = -1, rtbl1_idx = -1, rtblx0_idx = -1, rtblx1_idx = -1;
     float ds = 0.0f, s0 = 0.0f, x0 = 0.0f, sy0 = 0.0f, sdy = 0.0f, ry0 = 0.0f, rdy = 0.0f, s = 0.0f, h = 0.0f, h0 = 0.0f, dh = 0.0f, dx = 0.0f, ti = 0.0f, t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, dt = 0.0f, z0 = 0.0f, dz = 0.0f, tau = 0.0f;
     float aal = 0.0f, tx = 0.0f, aper = 0.0f;
     sep_t *dat = NULL, *mig = NULL, *stim = NULL, *sder = NULL, *rtim = NULL, *rder = NULL;
@@ -195,13 +199,12 @@ int main(int argc, char *argv[])
 
     nzx = (off_t)nz * (off_t)nx;
 
-    stbl = alloc2float(nzx, sny);
-    se_fsio_read_float(stim->data->io, stbl[0], nzx * sny);
-    sep_close(stim);
-
-    stblx = alloc2float(nzx, sny);
-    se_fsio_read_float(sder->data->io, stblx[0], nzx * sny);
-    sep_close(sder);
+    /*
+     * Traveltime files can be very large.  The migration only needs one or two
+     * z-x slices from each table at a time for interpolation, so keep the files
+     * open and load slices on demand instead of reading the full (z,x,shot/rec)
+     * cubes into memory.
+     */
 
     rtim = sep_open(rtim_f, SEP_READ, 0);
     rder = sep_open(rder_f, SEP_READ, 0);
@@ -214,12 +217,6 @@ int main(int argc, char *argv[])
     rny = rtim->headers->n[2];
     ry0 = (float)rtim->headers->o[2];
     rdy = (float)rtim->headers->d[2];
-    rtbl = alloc2float(nzx, rny);
-    se_fsio_read_float(rtim->data->io, rtbl[0], nzx * rny);
-    sep_close(rtim);
-    rtblx = alloc2float(nzx, rny);
-    se_fsio_read_float(rder->data->io, rtblx[0], nzx * rny);
-    sep_close(rder);
 
     if (!se_have_par("tau"))
         tau = 0.0;
@@ -306,6 +303,25 @@ int main(int argc, char *argv[])
     stablex = alloc1float(nzx);
     rtable = alloc1float(nzx);
     rtablex = alloc1float(nzx);
+    stbl0 = alloc1float(nzx);
+    stbl1 = alloc1float(nzx);
+    stblx0 = alloc1float(nzx);
+    stblx1 = alloc1float(nzx);
+    rtbl0 = alloc1float(nzx);
+    rtbl1 = alloc1float(nzx);
+    rtblx0 = alloc1float(nzx);
+    rtblx1 = alloc1float(nzx);
+
+    auto load_table_slice = [nzx](sep_t *fp, int index, float *buf, int *cached_index, const char *name) {
+        if (*cached_index == index)
+            return;
+        off_t byte_off = (off_t)index * nzx * (off_t)sizeof(float);
+        if (se_fsio_seek(fp->data->io, byte_off) != CODE_SUCCESS)
+            ERROR(("Failed to seek %s slice %d", name, index));
+        if (se_fsio_read_float(fp->data->io, buf, (size_t)nzx) != CODE_SUCCESS)
+            ERROR(("Failed to read %s slice %d", name, index));
+        *cached_index = index;
+    };
 
     /* type of interpolation (default Hermit) */
     if (!se_have_par("type"))
@@ -357,37 +373,39 @@ auto t_start = std::chrono::steady_clock::now();
         ist = (s - sy0) / sdy;
         if (ist <= 0)
         {
-            for (i = 0; i < nzx; i++)
-            {
-                stable[i] = stbl[0][i];
-                stablex[i] = stblx[0][i];
-            }
+            load_table_slice(stim, 0, stbl0, &stbl0_idx, "stable");
+            load_table_slice(sder, 0, stblx0, &stblx0_idx, "sderiv");
+            memcpy(stable, stbl0, (size_t)nzx * sizeof(float));
+            memcpy(stablex, stblx0, (size_t)nzx * sizeof(float));
         }
         else if (ist >= sny - 1)
         {
-            for (i = 0; i < nzx; i++)
-            {
-                stable[i] = stbl[sny - 1][i];
-                stablex[i] = stblx[sny - 1][i];
-            }
+            load_table_slice(stim, sny - 1, stbl0, &stbl0_idx, "stable");
+            load_table_slice(sder, sny - 1, stblx0, &stblx0_idx, "sderiv");
+            memcpy(stable, stbl0, (size_t)nzx * sizeof(float));
+            memcpy(stablex, stblx0, (size_t)nzx * sizeof(float));
         }
         else
         {
+            load_table_slice(stim, ist, stbl0, &stbl0_idx, "stable");
+            load_table_slice(stim, ist + 1, stbl1, &stbl1_idx, "stable");
+            load_table_slice(sder, ist, stblx0, &stblx0_idx, "sderiv");
+            load_table_slice(sder, ist + 1, stblx1, &stblx1_idx, "sderiv");
             switch (type[0])
             {
             case 'l': /* linear */
-                tinterp_linear(true, stable, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1]);
-                dinterp_linear(true, stablex, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1]);
+                tinterp_linear(true, stable, s - ist * sdy - sy0, stbl0, stbl1);
+                dinterp_linear(true, stablex, s - ist * sdy - sy0, stbl0, stbl1);
                 break;
 
             case 'p': /* partial */
-                tinterp_partial(true, stable, s - ist * sdy - sy0, nz, nx, dx, stbl[ist], stbl[ist + 1]);
-                dinterp_partial(true, stablex, s - ist * sdy - sy0, nz, nx, dx, stbl[ist], stbl[ist + 1]);
+                tinterp_partial(true, stable, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
+                dinterp_partial(true, stablex, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
                 break;
 
             case 'h': /* hermit */
-                tinterp_hermite(true, stable, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1], stblx[ist], stblx[ist + 1]);
-                dinterp_hermite(true, stablex, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1], stblx[ist], stblx[ist + 1]);
+                tinterp_hermite(true, stable, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
+                dinterp_hermite(true, stablex, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
                 break;
             }
         }
@@ -428,37 +446,39 @@ auto t_start = std::chrono::steady_clock::now();
 
             if (iht <= 0)
             {
-                for (i = 0; i < nzx; i++)
-                {
-                    rtable[i] = rtbl[0][i];
-                    rtablex[i] = rtblx[0][i];
-                }
+                load_table_slice(rtim, 0, rtbl0, &rtbl0_idx, "rtable");
+                load_table_slice(rder, 0, rtblx0, &rtblx0_idx, "rderiv");
+                memcpy(rtable, rtbl0, (size_t)nzx * sizeof(float));
+                memcpy(rtablex, rtblx0, (size_t)nzx * sizeof(float));
             }
             else if (iht >= rny - 1)
             {
-                for (i = 0; i < nzx; i++)
-                {
-                    rtable[i] = rtbl[rny - 1][i];
-                    rtablex[i] = rtblx[rny - 1][i];
-                }
+                load_table_slice(rtim, rny - 1, rtbl0, &rtbl0_idx, "rtable");
+                load_table_slice(rder, rny - 1, rtblx0, &rtblx0_idx, "rderiv");
+                memcpy(rtable, rtbl0, (size_t)nzx * sizeof(float));
+                memcpy(rtablex, rtblx0, (size_t)nzx * sizeof(float));
             }
             else
             {
+                load_table_slice(rtim, iht, rtbl0, &rtbl0_idx, "rtable");
+                load_table_slice(rtim, iht + 1, rtbl1, &rtbl1_idx, "rtable");
+                load_table_slice(rder, iht, rtblx0, &rtblx0_idx, "rderiv");
+                load_table_slice(rder, iht + 1, rtblx1, &rtblx1_idx, "rderiv");
                 switch (type[0])
                 {
                 case 'l': /* linear */
-                    tinterp_linear(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl[iht], rtbl[iht + 1]);
-                    dinterp_linear(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl[iht], rtbl[iht + 1]);
+                    tinterp_linear(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl0, rtbl1);
+                    dinterp_linear(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl0, rtbl1);
                     break;
 
                 case 'p': /* partial */
-                    tinterp_partial(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, nz, nx, dx, rtbl[iht], rtbl[iht + 1]);
-                    dinterp_partial(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, nz, nx, dx, rtbl[iht], rtbl[iht + 1]);
+                    tinterp_partial(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, nz, nx, dx, rtbl0, rtbl1);
+                    dinterp_partial(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, nz, nx, dx, rtbl0, rtbl1);
                     break;
 
                 case 'h': /* hermit */
-                    tinterp_hermite(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl[iht], rtbl[iht + 1], rtblx[iht], rtblx[iht + 1]);
-                    dinterp_hermite(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl[iht], rtbl[iht + 1], rtblx[iht], rtblx[iht + 1]);
+                    tinterp_hermite(false, rtable, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl0, rtbl1, rtblx0, rtblx1);
+                    dinterp_hermite(false, rtablex, cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0, rtbl0, rtbl1, rtblx0, rtblx1);
                     break;
                 }
             }
@@ -567,14 +587,26 @@ auto t_start = std::chrono::steady_clock::now();
         free1float(rtable);
     if (rtablex)
         free1float(rtablex);
-    if (stbl)
-        free2float(stbl);
-    if (stblx)
-        free2float(stblx);
-    if (rtbl)
-        free2float(rtbl);
-    if (rtblx)
-        free2float(rtblx);
+    if (stbl0)
+        free1float(stbl0);
+    if (stbl1)
+        free1float(stbl1);
+    if (stblx0)
+        free1float(stblx0);
+    if (stblx1)
+        free1float(stblx1);
+    if (rtbl0)
+        free1float(rtbl0);
+    if (rtbl1)
+        free1float(rtbl1);
+    if (rtblx0)
+        free1float(rtblx0);
+    if (rtblx1)
+        free1float(rtblx1);
+    sep_close(stim);
+    sep_close(sder);
+    sep_close(rtim);
+    sep_close(rder);
         
     return 0;
 }
