@@ -68,10 +68,13 @@ add_executable(kirchdat2d_auto_cs kirchdat2d_auto_cs.cpp)
 add_executable(rsf_synth_gen rsf_synth_gen.cpp)
 add_executable(rsf_l2cmp rsf_l2cmp.cpp)
 add_executable(kirchmig2d_cig kirchmig2d_cig.cpp)
+add_executable(sewave2d sewave2d_app.cpp ../SEWAVE/sewave2d.cpp)
+add_executable(sewave2d_synth sewave2d_synth.cpp ../SEWAVE/sewave2d.cpp)
 
 # 查找系统库（SQLite3 依赖）
 find_library(DL_LIBRARY dl)
 find_package(Threads REQUIRED)
+find_package(OpenMP QUIET)
 
 # 链接库
 # target_link_libraries(test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
@@ -90,7 +93,15 @@ target_link_libraries(kirchdat2d_auto_cs ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SE
 target_link_libraries(rsf_synth_gen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(rsf_l2cmp ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchmig2d_cig ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(sewave2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(sewave2d_synth ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(sewave2d OpenMP::OpenMP_CXX)
+    target_link_libraries(sewave2d_synth OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+target_include_directories(sewave2d PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+target_include_directories(sewave2d_synth PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 
 # 安装所有可执行文件到 bin 目录
 install(TARGETS
@@ -110,6 +121,8 @@ install(TARGETS
     rsf_synth_gen
     rsf_l2cmp
     kirchmig2d_cig
+    sewave2d
+    sewave2d_synth
 )
 
 # 确保依赖的库先编译完成
@@ -129,3 +142,5 @@ add_dependencies(kirchdat2d_auto_cs sebasic sefs reckirch)
 add_dependencies(rsf_synth_gen sebasic sefs reckirch)
 add_dependencies(rsf_l2cmp sebasic sefs reckirch)
 add_dependencies(kirchmig2d_cig sebasic sefs reckirch)
+add_dependencies(sewave2d sebasic sefs fftw3f)
+add_dependencies(sewave2d_synth sebasic sefs fftw3f)
