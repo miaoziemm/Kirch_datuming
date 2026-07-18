@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <sstream>
 #include <vector>
@@ -12,6 +13,64 @@
 #endif
 
 namespace {
+void print_usage(const char* prog) {
+    const char* name = (prog && prog[0]) ? prog : "sewave2d";
+    std::printf(
+        "Usage:\n"
+        "  %s mode=forward velocity=vel.rsf output=data.rsf [forward parameters]\n"
+        "  %s mode=image velocity=vel.rsf seismic_data=data.rsf migration=image.rsf [imaging parameters]\n"
+        "\n"
+        "Required parameters:\n"
+        "  mode=forward|image          Run synthetic modeling or RTM imaging. Default: forward.\n"
+        "  velocity=FILE              2D RSF velocity model.\n"
+        "  output=FILE                Forward-mode output seismic RSF.\n"
+        "  seismic_data=FILE          Image-mode input seismic RSF.\n"
+        "  migration=FILE             Image-mode output RTM image RSF.\n"
+        "\n"
+        "Common wave-equation parameters:\n"
+        "  dt=FLOAT                   Time step for forward modeling. Default: 0.001.\n"
+        "  nt=INT                     Number of time samples for forward modeling. Default: 1000.\n"
+        "  fdom=FLOAT                 Ricker dominant frequency. Default: 20.\n"
+        "  sz=FLOAT                   Source depth. Default: velocity z origin.\n"
+        "  rz=FLOAT                   Receiver depth. Default: sz.\n"
+        "  nbc=INT                    Absorbing boundary cells. Default: 100.\n"
+        "  L=INT                      Absorbing boundary taper length. Default: 30.\n"
+        "  alpha=FLOAT                Absorbing boundary strength. Default: 1.\n"
+        "  type_compute_Laplace=0|1   Laplacian method: 0=FD8, 1=pseudospectral. Default: 1.\n"
+        "  type=INT                   Propagator type; type=1 uses Q/visco path. Default: 1.\n"
+        "  visco=0|1                  Enable visco-acoustic mode. Default: 0.\n"
+        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1 or type=1.\n"
+        "  q=FLOAT                    Constant Q fallback/default. Default: 1000.\n"
+        "  flag_smooth=0|1            Smooth extended velocity/Q model. Default: 1.\n"
+        "  flag_homo=0|1              Use homogeneous model at source velocity. Default: 0.\n"
+        "  progress_interval=INT      Print propagation progress every INT steps.\n"
+        "\n"
+        "Forward parameters:\n"
+        "  sx=FLOAT                   First shot x coordinate. Default: model center.\n"
+        "  ns=INT                     Number of shots. Default: 1.\n"
+        "  ds=FLOAT                   Shot x spacing. Default: 0.\n"
+        "  nr=INT r0=FLOAT dr=FLOAT   Receiver count/origin/spacing; receiver output uses model x grid.\n"
+        "\n"
+        "Image parameters:\n"
+        "  cmp=0|1                    Treat receiver axis as offset from shot when 1. Default: 1.\n"
+        "  shot_begin=INT             First shot index to image, zero-based. Alias: first_shot. Default: 0.\n"
+        "  shot_end=INT               Last shot index to image, zero-based. Alias: last_shot. Default: last input shot.\n"
+        "  max_parallel_shots=INT     Maximum shots imaged concurrently. Aliases: parallel_shots, omp_shots. Default: 1.\n"
+        "  in_memory_snapshots=0|1    Store source snapshots in memory instead of temp_img files. Default: 0.\n"
+        "  snapshot_interval=INT      Store and correlate one RTM wavefield snapshot every INT time steps. Alias: snapshot_stride. Default: 1.\n"
+        "  max_nt=INT                 Truncate input data time samples before imaging.\n"
+        "  resample_dt=FLOAT          Resample input data in time before imaging.\n"
+        "  compensate=0|1             Enable Q-compensation sign default. Default: 0.\n"
+        "  amp_compensation_sign=-1|1  -1=Q compensation, 1=Q attenuation.\n"
+        "  debug_wavefield_prefix=STR Write selected debug wavefields/gathers with this prefix.\n"
+        "  debug_snapshot_steps=LIST  Comma-separated or array time-step list for debug snapshots.\n"
+        "\n"
+        "Examples:\n"
+        "  %s mode=forward velocity=vel.rsf qfile=q.rsf output=data.rsf nt=2000 dt=0.001 sx=0 ns=10 ds=25\n"
+        "  %s mode=image velocity=vel.rsf qfile=q.rsf seismic_data=data.rsf migration=img.rsf shot_begin=0 shot_end=9 snapshot_interval=5\n",
+        name, name, name, name);
+}
+
 void truncate_nt(sewave::Data3D& d, int max_nt) {
     if (max_nt <= 0 || max_nt >= d.nt) return;
     std::vector<float> out((size_t)d.ns * d.nr * max_nt, 0.0f);
@@ -86,6 +145,10 @@ void resample_time(sewave::Data3D& d, float resample_dt) {
 }
 
 int main(int argc, char** argv) {
+    if (argc <= 1 || (argc == 2 && (!std::strcmp(argv[1], "-h") || !std::strcmp(argv[1], "--help") || !std::strcmp(argv[1], "help")))) {
+        print_usage(argv[0]);
+        return 0;
+    }
     se_par_init(argc, argv);
     try {
 #ifdef _OPENMP
@@ -133,6 +196,7 @@ int main(int argc, char** argv) {
             sewave::Grid2D qmodel;
             sewave::Grid2D* qptr = nullptr;
             if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
+            INFO(("forward shots: total=%d, calculating shot index range 0-%d", p.ns, std::max(0, p.ns - 1)));
             check_stability(vel, p.dt, p.type_compute_laplace, "forward");
             sewave::Data3D d = sewave::forward(vel, p, qptr);
             sewave::write_rsf3d(se_get_par_str("output"), d);
@@ -175,6 +239,8 @@ int main(int argc, char** argv) {
             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, d.nt/10));
             p.max_parallel_shots = se_have_par("max_parallel_shots") ? se_get_par_int("max_parallel_shots") : (se_have_par("parallel_shots") ? se_get_par_int("parallel_shots") : (se_have_par("omp_shots") ? se_get_par_int("omp_shots") : 1));
             p.in_memory_snapshots = se_have_par("in_memory_snapshots") ? se_get_par_int("in_memory_snapshots") != 0 : false;
+            p.snapshot_interval = se_have_par("snapshot_interval") ? se_get_par_int("snapshot_interval") : (se_have_par("snapshot_stride") ? se_get_par_int("snapshot_stride") : 1);
+            if (p.snapshot_interval < 1) ERROR(("snapshot_interval must be >= 1"));
             if (se_have_par("debug_wavefield_prefix")) p.debug_wavefield_prefix = se_get_par_str("debug_wavefield_prefix");
             else if (se_have_par("wavefield_snapshot_prefix")) p.debug_wavefield_prefix = se_get_par_str("wavefield_snapshot_prefix");
             if (se_have_par("debug_snapshot_steps")) {
@@ -195,6 +261,12 @@ int main(int argc, char** argv) {
             sewave::Grid2D qmodel;
             sewave::Grid2D* qptr = nullptr;
             if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
+            {
+                int shot0 = std::max(0, p.shot_begin);
+                int shot1 = (p.shot_end < 0) ? d.ns - 1 : std::min(d.ns - 1, p.shot_end);
+                INFO(("image shots: total=%d, calculating shot index range %d-%d (%d shots)",
+                      d.ns, shot0, shot1, shot0 <= shot1 ? shot1 - shot0 + 1 : 0));
+            }
             check_stability(vel, d.dt, p.type_compute_laplace, "image");
             auto img = sewave::rtm_image(vel, d, p, qptr);
             sewave::write_rsf2d(se_get_par_str("migration"), vel, img, "RTM image");
