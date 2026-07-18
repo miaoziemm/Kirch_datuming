@@ -148,6 +148,25 @@ FILE* open_snapshot_temp(int shot, std::string& path){
     return fp;
 }
 
+int count_stored_snapshots(int nt,int interval,int offset){
+    if(interval<=1) return nt;
+    if(offset<0) offset=0;
+    if(offset>=interval) offset%=interval;
+    if(offset>=nt) return 0;
+    return (nt-1-offset)/interval+1;
+}
+
+bool store_snapshot_step(int it,int interval,int offset){
+    if(interval<=1) return true;
+    int r=(it-offset)%interval;
+    return r==0;
+}
+
+int stored_snapshot_index(int it,int interval,int offset){
+    if(interval<=1) return it;
+    return (it-offset)/interval;
+}
+
 void log_progress(const char* label,int it,int nt){
 #pragma omp critical(sewave_progress_log)
     { INFO(("%s: step %d/%d",label,it,nt)); }
@@ -158,6 +177,7 @@ void propagate(const ExtModel& e,int nt,float dt,int type_lap,bool filter,int am
                const char* progress_label,const std::vector<float>* inject,
                std::vector<float>* record,std::vector<float>* snaps,std::vector<float>* image,
                const std::vector<float>* srcsnaps,FILE* snap_write=nullptr,FILE* snap_read=nullptr,
+               int snapshot_interval=1,int snapshot_offset=0,int src_snapshot_interval=1,int src_snapshot_offset=0,
                const Grid2D* debug_grid=nullptr,const std::vector<int>* debug_steps=nullptr,
                const std::string* debug_prefix=nullptr,const char* debug_kind=nullptr,int debug_shot=-1){
     int n=e.nx*e.nz;
@@ -198,16 +218,20 @@ void propagate(const ExtModel& e,int nt,float dt,int type_lap,bool filter,int am
         if(record){
             for(int ix=e.nbc;ix<e.nx-e.nbc;++ix) (*record)[(size_t)(ix-e.nbc)*nt+it]=cur[idx(record_z,ix,e.nz)];
         }
-        if(snaps) std::memcpy(&(*snaps)[(size_t)it*n],cur.data(),n*sizeof(float));
-        if(snap_write){
+        if(snaps && store_snapshot_step(it,snapshot_interval,snapshot_offset)){
+            int si=stored_snapshot_index(it,snapshot_interval,snapshot_offset);
+            std::memcpy(&(*snaps)[(size_t)si*n],cur.data(),n*sizeof(float));
+        }
+        if(snap_write && store_snapshot_step(it,snapshot_interval,snapshot_offset)){
             if(std::fwrite(cur.data(),sizeof(float),n,snap_write)!=(size_t)n) throw std::runtime_error("failed writing source snapshot temporary file");
         }
         if(image&&(srcsnaps||snap_read)){
             int rit=nt-it-1;
             const float* srcptr=nullptr;
-            if(srcsnaps) srcptr=&(*srcsnaps)[(size_t)rit*n];
+            int rsi=stored_snapshot_index(rit,src_snapshot_interval,src_snapshot_offset);
+            if(srcsnaps) srcptr=&(*srcsnaps)[(size_t)rsi*n];
             else {
-                if(fseeko(snap_read,(off_t)rit*n*sizeof(float),SEEK_SET)!=0 || std::fread(snapbuf.data(),sizeof(float),n,snap_read)!=(size_t)n) throw std::runtime_error("failed reading source snapshot temporary file");
+                if(fseeko(snap_read,(off_t)rsi*n*sizeof(float),SEEK_SET)!=0 || std::fread(snapbuf.data(),sizeof(float),n,snap_read)!=(size_t)n) throw std::runtime_error("failed reading source snapshot temporary file");
                 srcptr=snapbuf.data();
             }
             for(int ix=0;ix<e.nx-2*e.nbc;++ix) for(int iz=0;iz<e.nz-2*e.nbc;++iz){
@@ -217,17 +241,20 @@ void propagate(const ExtModel& e,int nt,float dt,int type_lap,bool filter,int am
     }
 }
 
-void correlate_snapshots(const ExtModel& e,int nt,const std::vector<float>* srcsnaps,FILE* srcfile,FILE* recfile,std::vector<float>& image){
+void correlate_snapshots(const ExtModel& e,int nt,int interval,int src_offset,int rec_offset,const std::vector<float>* srcsnaps,FILE* srcfile,FILE* recfile,std::vector<float>& image){
     int n=e.nx*e.nz;
     std::vector<float> srcbuf,recbuf(n);
     if(srcfile) srcbuf.resize(n);
     for(int it=0;it<nt;++it){
+        if(!store_snapshot_step(it,interval,rec_offset)) continue;
         int sit=nt-it-1;
-        if(fseeko(recfile,(off_t)it*n*sizeof(float),SEEK_SET)!=0 || std::fread(recbuf.data(),sizeof(float),n,recfile)!=(size_t)n) throw std::runtime_error("failed reading receiver snapshot temporary file");
+        int ri=stored_snapshot_index(it,interval,rec_offset);
+        if(fseeko(recfile,(off_t)ri*n*sizeof(float),SEEK_SET)!=0 || std::fread(recbuf.data(),sizeof(float),n,recfile)!=(size_t)n) throw std::runtime_error("failed reading receiver snapshot temporary file");
         const float* srcptr=nullptr;
-        if(srcsnaps) srcptr=&(*srcsnaps)[(size_t)sit*n];
+        int si=stored_snapshot_index(sit,interval,src_offset);
+        if(srcsnaps) srcptr=&(*srcsnaps)[(size_t)si*n];
         else {
-            if(fseeko(srcfile,(off_t)sit*n*sizeof(float),SEEK_SET)!=0 || std::fread(srcbuf.data(),sizeof(float),n,srcfile)!=(size_t)n) throw std::runtime_error("failed reading source snapshot temporary file");
+            if(fseeko(srcfile,(off_t)si*n*sizeof(float),SEEK_SET)!=0 || std::fread(srcbuf.data(),sizeof(float),n,srcfile)!=(size_t)n) throw std::runtime_error("failed reading source snapshot temporary file");
             srcptr=srcbuf.data();
         }
         for(int ix=0;ix<e.nx-2*e.nbc;++ix) for(int iz=0;iz<e.nz-2*e.nbc;++iz){
@@ -272,15 +299,20 @@ std::vector<float> rtm_image(const Grid2D& vel,const Data3D& data,const ImagePar
 #ifdef _OPENMP
     shot_threads=std::min(shot_threads,omp_get_max_threads());
 #endif
-    size_t snap_bytes=(size_t)data.nt*ebase.nx*ebase.nz*sizeof(float);
-    INFO(("RTM shot parallelism=%d, source snapshots per active shot=%.3f GiB (%s)",shot_threads,snap_bytes/(1024.0*1024.0*1024.0),p.in_memory_snapshots?"memory":"disk temporary file"));
+    int snapshot_interval=std::max(1,p.snapshot_interval);
+    int rec_snapshot_offset=0;
+    int src_snapshot_offset=(data.nt-1)%snapshot_interval;
+    int stored_snaps=count_stored_snapshots(data.nt,snapshot_interval,rec_snapshot_offset);
+    size_t snap_bytes=(size_t)stored_snaps*ebase.nx*ebase.nz*sizeof(float);
+    INFO(("RTM shot parallelism=%d, snapshot_interval=%d, stored snapshots per wavefield=%d/%d, source snapshots per active shot=%.3f GiB (%s)",
+          shot_threads,snapshot_interval,stored_snaps,data.nt,snap_bytes/(1024.0*1024.0*1024.0),p.in_memory_snapshots?"memory":"disk temporary file"));
     std::vector<float> image((size_t)vel.nx*vel.nz,0.0f);
 #pragma omp parallel for schedule(dynamic) num_threads(shot_threads)
     for(int is=shot0;is<=shot1;++is){
         ExtModel e=ebase;
         std::vector<float> local((size_t)vel.nx*vel.nz,0.0f);
         std::vector<float> src(data.nt),shot((size_t)(e.nx-2*e.nbc)*data.nt,0.0f),snaps;
-        if(p.in_memory_snapshots) snaps.resize((size_t)data.nt*e.nx*e.nz);
+        if(p.in_memory_snapshots) snaps.resize((size_t)stored_snaps*e.nx*e.nz);
         std::string snap_path,rec_snap_path;
         FILE* snap_tmp = p.in_memory_snapshots ? nullptr : open_snapshot_temp(is,snap_path);
         FILE* rec_snap_tmp = open_snapshot_temp(is,rec_snap_path);
@@ -291,7 +323,9 @@ std::vector<float> rtm_image(const Grid2D& vel,const Data3D& data,const ImagePar
         float sx=data.s0+is*data.ds;
         int six=xindex(vel,sx)+e.nbc, siz=zindex(vel,p.sz)+e.nbc;
         if(p.flag_homo) apply_homo(e,six,siz);
-        propagate(e,data.nt,data.dt,p.type_compute_laplace,true,p.amp_compensation_sign,six,siz,siz,false,p.progress_interval,src_label,&src,nullptr,p.in_memory_snapshots?&snaps:nullptr,nullptr,nullptr,snap_tmp,nullptr,&vel,&p.debug_snapshot_steps,&p.debug_wavefield_prefix,"src",is);
+        propagate(e,data.nt,data.dt,p.type_compute_laplace,true,p.amp_compensation_sign,six,siz,siz,false,p.progress_interval,src_label,&src,nullptr,p.in_memory_snapshots?&snaps:nullptr,nullptr,nullptr,snap_tmp,nullptr,
+                  snapshot_interval,src_snapshot_offset,snapshot_interval,src_snapshot_offset,
+                  &vel,&p.debug_snapshot_steps,&p.debug_wavefield_prefix,"src",is);
         int skipped_receivers=0;
         for(int ir=0;ir<data.nr;++ir){
             float rx=p.cmp?sx+data.r0+ir*data.dr:data.r0+ir*data.dr;
@@ -301,8 +335,10 @@ std::vector<float> rtm_image(const Grid2D& vel,const Data3D& data,const ImagePar
         }
         if(skipped_receivers>0) INFO(("image shot %d: skipped %d receivers outside velocity model",is,skipped_receivers));
         if(!p.debug_wavefield_prefix.empty()) report_gather_energy(shot,e.nx-2*e.nbc,data.nt,is,p.debug_wavefield_prefix,vel.x0,vel.dx,data.dt);
-        propagate(e,data.nt,data.dt,p.type_compute_laplace,true,p.amp_compensation_sign,0,zindex(vel,p.rz)+e.nbc,zindex(vel,p.rz)+e.nbc,false,p.progress_interval,rec_label,&shot,nullptr,nullptr,nullptr,nullptr,rec_snap_tmp,nullptr,&vel,&p.debug_snapshot_steps,&p.debug_wavefield_prefix,"rec",is);
-        correlate_snapshots(e,data.nt,p.in_memory_snapshots?&snaps:nullptr,snap_tmp,rec_snap_tmp,local);
+        propagate(e,data.nt,data.dt,p.type_compute_laplace,true,p.amp_compensation_sign,0,zindex(vel,p.rz)+e.nbc,zindex(vel,p.rz)+e.nbc,false,p.progress_interval,rec_label,&shot,nullptr,nullptr,nullptr,nullptr,rec_snap_tmp,nullptr,
+                  snapshot_interval,rec_snapshot_offset,snapshot_interval,src_snapshot_offset,
+                  &vel,&p.debug_snapshot_steps,&p.debug_wavefield_prefix,"rec",is);
+        correlate_snapshots(e,data.nt,snapshot_interval,src_snapshot_offset,rec_snapshot_offset,p.in_memory_snapshots?&snaps:nullptr,snap_tmp,rec_snap_tmp,local);
         if(rec_snap_tmp){ std::fclose(rec_snap_tmp); if(!rec_snap_path.empty()) ::unlink(rec_snap_path.c_str()); }
         if(snap_tmp){ std::fclose(snap_tmp); if(!snap_path.empty()) ::unlink(snap_path.c_str()); }
 #pragma omp critical(sewave_image_stack)
