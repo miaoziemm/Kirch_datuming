@@ -58,6 +58,10 @@ add_executable(eikods2d eikods2d.cpp)
 add_executable(kirchdat2d kirchdat2d.cpp)
 add_executable(kirchdat2d_auto kirchdat2d_auto.cpp)
 add_executable(kirchdat2d_freq kirchdat2d_frequency_cs.cpp)
+add_executable(layer_kirchhoff_test layer_kirchhoff_test.cpp)
+add_executable(layer_wavefield_fill layer_wavefield_fill.cpp)
+add_executable(layered_frequency_wavefield layered_frequency_wavefield.cpp)
+add_executable(layered_model_gen layered_model_gen.cpp)
 add_executable(shotgen shotgen.cpp)
 add_executable(greensol greensol.cpp)
 add_executable(greensol_auto greensol_auto.cpp)
@@ -83,6 +87,10 @@ target_link_libraries(eikods2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_L
 target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchdat2d_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(kirchdat2d_freq ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layer_kirchhoff_test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layer_wavefield_fill ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layered_frequency_wavefield ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+target_link_libraries(layered_model_gen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
 target_link_libraries(greensol_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
@@ -100,6 +108,8 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(sewave2d_synth OpenMP::OpenMP_CXX)
 endif()
 target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+target_include_directories(layer_kirchhoff_test PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+target_include_directories(layered_frequency_wavefield PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 target_include_directories(sewave2d PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 target_include_directories(sewave2d_synth PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
 
@@ -111,6 +121,10 @@ install(TARGETS
     kirchdat2d
     kirchdat2d_auto
     kirchdat2d_freq
+    layer_kirchhoff_test
+    layer_wavefield_fill
+    layered_frequency_wavefield
+    layered_model_gen
     shotgen
     greensol
     greensol_auto
@@ -132,6 +146,10 @@ add_dependencies(eikods2d sebasic sefs reckirch)
 add_dependencies(kirchdat2d sebasic sefs reckirch)
 add_dependencies(kirchdat2d_auto sebasic sefs reckirch)
 add_dependencies(kirchdat2d_freq sebasic sefs reckirch fftw3f)
+add_dependencies(layer_kirchhoff_test sebasic sefs reckirch fftw3f)
+add_dependencies(layer_wavefield_fill sebasic sefs)
+add_dependencies(layered_frequency_wavefield sebasic sefs reckirch fftw3f)
+add_dependencies(layered_model_gen sebasic sefs)
 add_dependencies(shotgen sebasic sefs reckirch)
 add_dependencies(greensol sebasic sefs reckirch)
 add_dependencies(greensol_auto sebasic sefs reckirch)
