@@ -1,1971 +1,717 @@
  (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/scripts/run_layer_wavefield_pipeline.sh b/scripts/run_layer_wavefield_pipeline.sh
-new file mode 100755
-index 0000000000000000000000000000000000000000..29ddd8eb02b19d6c3987e73cac52aff1a65075eb
---- /dev/null
-+++ b/scripts/run_layer_wavefield_pipeline.sh
-@@ -0,0 +1,184 @@
-+#!/usr/bin/env bash
-+set -euo pipefail
-+
-+usage() {
-+  cat <<'EOF'
-+Usage:
-+  MODEL=vel.H OUT=full_wavefield.H FREQ=20 ./scripts/run_layer_wavefield_pipeline.sh
-+
-+Required environment variables:
-+  MODEL                 Input 2-D SEP velocity model. Axis 1 is z, axis 2 is x.
-+  OUT                   Output full complex wavefield SEP header.
-+  FREQ                  Frequency in Hz.
-+
-+Optional environment variables:
-+  DEPTHS                Comma-separated physical boundary depths below the model top.
-+                        Use only when depth units are known to match the model reader.
-+  DEPTH_INDICES         Comma-separated boundary z sample indices. If neither
-+                        DEPTHS nor DEPTH_INDICES is set, these are generated.
-+  LAYER_STEP_SAMPLES    Depth interval in z samples when DEPTH_INDICES is omitted [10].
-+  WORKDIR               Directory for intermediate files [OUT directory/pipeline_FREQHz].
-+  BIN_DIR               Directory containing built executables [build/bin].
-+  USE_BF                Use butterfly Kirchhoff boundary extrapolation [1].
-+  BF_P                  Butterfly interpolation order [12].
-+  BF_N_LEAF             Butterfly leaf size [16].
-+  BF_PANEL_LEVELS       Butterfly panel levels [1].
-+  BF_AMP_EPS            Butterfly amplitude cutoff [1e-20].
-+  BF_PHASE_TOL          Butterfly phase tolerance [2.0].
-+  SRCX                  Source x coordinate [model center].
-+  SRCZ                  Source z coordinate [model top].
-+  VREF                  Reference velocity for Hankel initialization [model top center].
-+  SPONGE                Lateral sponge width for dense Helmholtz fill [0].
-+  SPONGE_STRENGTH       Lateral sponge strength [0.0].
-+  HELMHOLTZ_DAMPING     Complex Helmholtz damping/shift [0.0].
-+  MAX_DENSE_UNKNOWNS    Maximum dense unknowns per layer [20000].
-+  KEEP_WORKDIR          Keep intermediate boundary file when set to 1 [1].
-+
-+Outputs:
-+  OUT                   Complex wavefield volume with n1=2(real,imag), n2=nx,
-+                        n3=nz when generated DEPTH_INDICES includes the model bottom.
-+  WORKDIR/boundaries.H  Kirchhoff-propagated top and layer-boundary wavefields.
-+
-+Pipeline stages:
-+  1) Parse model geometry and build/validate layer boundary sample indices/depths.
-+  2) Run layer_kirchhoff_test. This computes per-layer traveltimes internally and
-+     performs Kirchhoff extrapolation to produce boundary wavefields.
-+  3) Run layer_wavefield_fill. This solves dense-direct per-layer Helmholtz
-+     systems constrained by the boundary wavefields and writes the full field.
-+EOF
-+}
-+
-+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-+  usage
-+  exit 0
-+fi
-+
-+: "${MODEL:?Need MODEL= input 2-D SEP velocity model}"
-+: "${OUT:?Need OUT= output SEP header}"
-+: "${FREQ:?Need FREQ= frequency in Hz}"
-+
-+BIN_DIR=${BIN_DIR:-build/bin}
-+KIRCH=${KIRCH:-"${BIN_DIR}/layer_kirchhoff_test"}
-+FILL=${FILL:-"${BIN_DIR}/layer_wavefield_fill"}
-+
-+if [[ ! -x "$KIRCH" ]]; then
-+  echo "ERROR: missing executable $KIRCH. Build target layer_kirchhoff_test first." >&2
-+  exit 1
-+fi
-+if [[ ! -x "$FILL" ]]; then
-+  echo "ERROR: missing executable $FILL. Build target layer_wavefield_fill first." >&2
-+  exit 1
-+fi
-+
-+OUT_DIR=$(dirname "$OUT")
-+if [[ "$OUT_DIR" == "." ]]; then
-+  OUT_DIR=$(pwd)
-+fi
-+WORKDIR=${WORKDIR:-"${OUT_DIR}/pipeline_${FREQ}Hz"}
-+mkdir -p "$WORKDIR"
-+BOUNDARY=${BOUNDARY:-"${WORKDIR}/boundaries.H"}
-+
-+MODEL_GEOM=$(python3 - "$MODEL" <<'PY'
-+import re
-+import sys
-+from pathlib import Path
-+text = Path(sys.argv[1]).read_text(errors='ignore')
-+def get(name, default=None):
-+    m = re.search(r'(^|\s)' + re.escape(name) + r'\s*=\s*([^\s]+)', text)
-+    if not m:
-+        if default is None:
-+            raise SystemExit(f"missing {name}= in {sys.argv[1]}")
-+        return default
-+    return m.group(2).strip('"')
-+n1 = int(float(get('n1')))
-+o1 = float(get('o1', '0'))
-+d1 = float(get('d1'))
-+n2 = int(float(get('n2')))
-+o2 = float(get('o2', '0'))
-+d2 = float(get('d2'))
-+print(n1, o1, d1, n2, o2, d2)
-+PY
-+)
-+read -r NZ OZ DZ NX OX DX <<<"$MODEL_GEOM"
-+
-+if [[ -n "${DEPTHS:-}" && -n "${DEPTH_INDICES:-}" ]]; then
-+  echo "ERROR: set only one of DEPTHS or DEPTH_INDICES." >&2
-+  exit 1
-+fi
-+
-+DEPTH_PARAM_NAME=depth_indices
-+if [[ -n "${DEPTHS:-}" ]]; then
-+  DEPTH_PARAM_NAME=depths
-+  DEPTH_PARAM_VALUE=${DEPTHS}
-+else
-+  LAYER_STEP_SAMPLES=${LAYER_STEP_SAMPLES:-10}
-+  DEPTH_INDICES=${DEPTH_INDICES:-$(python3 - "$NZ" "$LAYER_STEP_SAMPLES" <<'PY'
-+import sys
-+nz = int(sys.argv[1])
-+step = max(1, int(sys.argv[2]))
-+idx = list(range(step, nz, step))
-+if not idx or idx[-1] != nz - 1:
-+    idx.append(nz - 1)
-+print(','.join(str(i) for i in idx))
-+PY
-+)}
-+  DEPTH_PARAM_VALUE=${DEPTH_INDICES}
-+fi
-+
-+USE_BF=${USE_BF:-1}
-+BF_P=${BF_P:-12}
-+BF_N_LEAF=${BF_N_LEAF:-16}
-+BF_PANEL_LEVELS=${BF_PANEL_LEVELS:-1}
-+BF_AMP_EPS=${BF_AMP_EPS:-1e-20}
-+BF_PHASE_TOL=${BF_PHASE_TOL:-2.0}
-+SPONGE=${SPONGE:-0}
-+SPONGE_STRENGTH=${SPONGE_STRENGTH:-0.0}
-+HELMHOLTZ_DAMPING=${HELMHOLTZ_DAMPING:-0.0}
-+MAX_DENSE_UNKNOWNS=${MAX_DENSE_UNKNOWNS:-20000}
-+KEEP_WORKDIR=${KEEP_WORKDIR:-1}
-+
-+KIRCH_ARGS=(
-+  "in=${MODEL}"
-+  "out=${BOUNDARY}"
-+  "${DEPTH_PARAM_NAME}=${DEPTH_PARAM_VALUE}"
-+  "freq=${FREQ}"
-+  "include_top=1"
-+  "use_bf=${USE_BF}"
-+  "bf_p=${BF_P}"
-+  "bf_n_leaf=${BF_N_LEAF}"
-+  "bf_panel_levels=${BF_PANEL_LEVELS}"
-+  "bf_amp_eps=${BF_AMP_EPS}"
-+  "bf_phase_tol=${BF_PHASE_TOL}"
-+)
-+[[ -n "${SRCX:-}" ]] && KIRCH_ARGS+=("srcx=${SRCX}")
-+[[ -n "${SRCZ:-}" ]] && KIRCH_ARGS+=("srcz=${SRCZ}")
-+[[ -n "${VREF:-}" ]] && KIRCH_ARGS+=("vref=${VREF}")
-+
-+FILL_ARGS=(
-+  "model=${MODEL}"
-+  "in=${BOUNDARY}"
-+  "out=${OUT}"
-+  "${DEPTH_PARAM_NAME}=${DEPTH_PARAM_VALUE}"
-+  "freq=${FREQ}"
-+  "sponge=${SPONGE}"
-+  "sponge_strength=${SPONGE_STRENGTH}"
-+  "helmholtz_damping=${HELMHOLTZ_DAMPING}"
-+  "max_dense_unknowns=${MAX_DENSE_UNKNOWNS}"
-+)
-+
-+echo "[1/3] Model geometry: nz=${NZ} oz=${OZ} dz=${DZ} nx=${NX} ox=${OX} dx=${DX}"
-+if [[ "${DEPTH_PARAM_NAME}" == "depths" ]]; then
-+  echo "[1/3] Boundary depths: ${DEPTH_PARAM_VALUE}"
-+else
-+  echo "[1/3] Boundary depth indices: ${DEPTH_PARAM_VALUE}"
-+fi
-+echo "[2/3] Kirchhoff boundary extrapolation -> ${BOUNDARY}"
-+"$KIRCH" "${KIRCH_ARGS[@]}"
-+echo "[3/3] Dense-direct Helmholtz layer fill -> ${OUT}"
-+"$FILL" "${FILL_ARGS[@]}"
-+
-+if [[ "$KEEP_WORKDIR" != "1" ]]; then
-+  rm -f "${BOUNDARY}" "${BOUNDARY}@"
-+fi
-+
-+echo "Done. Full complex wavefield: ${OUT}"
-diff --git a/scripts/test_layer_wavefield_fill.py b/scripts/test_layer_wavefield_fill.py
-new file mode 100755
-index 0000000000000000000000000000000000000000..359fa5a202f8640a8b9c3835c3ffa1692bdb41e1
---- /dev/null
-+++ b/scripts/test_layer_wavefield_fill.py
-@@ -0,0 +1,194 @@
-+#!/usr/bin/env python3
-+"""Runtime validation for the dense-direct layer Helmholtz fill.
-+
-+The script generates small SEP velocity/boundary files, runs layer_wavefield_fill
-+for several frequencies, grids, layer splits, and velocity models, and reports
-+timing plus accuracy metrics. It intentionally avoids numpy so it can run in
-+minimal CI/container environments.
-+"""
-+
-+import argparse
-+import cmath
-+import math
-+import pathlib
-+import struct
-+import subprocess
-+import tempfile
-+import time
-+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
-+
-+ROOT = pathlib.Path(__file__).resolve().parents[1]
-+BIN_FILL = ROOT / "build" / "bin" / "layer_wavefield_fill"
-+
-+
-+def write_sep_header(path: pathlib.Path, axes: Sequence[Tuple[int, float, float]], data_name: str) -> None:
-+    lines: List[str] = []
-+    for iax, (n, o, d) in enumerate(axes, start=1):
-+        lines.extend([f"n{iax}={n}", f"o{iax}={o}", f"d{iax}={d}"])
-+    lines.extend(["esize=4", "data_format=native_float", f'in="{data_name}"'])
-+    path.write_text("\n".join(lines) + "\n")
-+
-+
-+def write_velocity(case_dir: pathlib.Path, nx: int, nz: int, dx: float, dz: float,
-+                   vel_fn: Callable[[int, int], float]) -> pathlib.Path:
-+    data = case_dir / "vel.H@"
-+    with data.open("wb") as f:
-+        for ix in range(nx):
-+            for iz in range(nz):
-+                f.write(struct.pack("<f", float(vel_fn(ix, iz))))
-+    hdr = case_dir / "vel.H"
-+    write_sep_header(hdr, [(nz, 0.0, dz), (nx, 0.0, dx)], data.name)
-+    return hdr
-+
-+
-+def boundary_value(z: float, freq: float, vref: float, model: str, ix: int, nx: int) -> complex:
-+    omega = 2.0 * math.pi * freq
-+    base = cmath.exp(-1j * omega * z / vref)
-+    if model == "constant":
-+        return base
-+    taper = 1.0 + 0.15 * math.sin(2.0 * math.pi * ix / max(nx - 1, 1))
-+    phase_x = 0.25 * math.sin(math.pi * ix / max(nx - 1, 1))
-+    return taper * base * cmath.exp(1j * phase_x)
-+
-+
-+def write_boundaries(case_dir: pathlib.Path, nx: int, dx: float, depths: Sequence[float],
-+                     freq: float, vref: float, model: str) -> pathlib.Path:
-+    data = case_dir / "bound.H@"
-+    with data.open("wb") as f:
-+        for z in depths:
-+            for ix in range(nx):
-+                u = boundary_value(z, freq, vref, model, ix, nx)
-+                f.write(struct.pack("<ff", float(u.real), float(u.imag)))
-+    hdr = case_dir / "bound.H"
-+    d3 = depths[1] - depths[0] if len(depths) > 1 else 1.0
-+    write_sep_header(hdr, [(2, 0.0, 1.0), (nx, 0.0, dx), (len(depths), depths[0], d3)], data.name)
-+    return hdr
-+
-+
-+def read_complex_field(data_path: pathlib.Path, nx: int, nzout: int) -> List[complex]:
-+    raw = data_path.read_bytes()
-+    vals = struct.unpack("<%df" % (len(raw) // 4), raw)
-+    out: List[complex] = []
-+    for iz in range(nzout):
-+        for ix in range(nx):
-+            off = (iz * nx + ix) * 2
-+            out.append(complex(vals[off], vals[off + 1]))
-+    return out
-+
-+
-+def run_fill(case_dir: pathlib.Path, vel: pathlib.Path, bound: pathlib.Path,
-+             depths_arg: str, freq: float, sponge: int, strength: float,
-+             damping: float = 0.0) -> Tuple[float, str, pathlib.Path]:
-+    out = case_dir / "full_dense_direct.H"
-+    cmd = [
-+        str(BIN_FILL), f"model={vel}", f"in={bound}", f"out={out}",
-+        f"depths={depths_arg}", f"freq={freq}",
-+        f"sponge={sponge}", f"sponge_strength={strength}", f"helmholtz_damping={damping}",
-+    ]
-+    start = time.perf_counter()
-+    proc = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-+    elapsed = time.perf_counter() - start
-+    if proc.returncode != 0:
-+        raise RuntimeError(f"{' '.join(cmd)} failed:\n{proc.stdout}")
-+    return elapsed, proc.stdout, out
-+
-+
-+def nonfinite_count(field: Sequence[complex]) -> int:
-+    return sum(1 for u in field if not (math.isfinite(u.real) and math.isfinite(u.imag)))
-+
-+
-+def analytic_metrics(field: Sequence[complex], nx: int, nzout: int, dz: float,
-+                     freq: float, vref: float) -> Tuple[int, float, float, float]:
-+    bad = nonfinite_count(field)
-+    if bad:
-+        return bad, float("nan"), float("nan"), float("nan")
-+    max_amp = 0.0
-+    max_phase = 0.0
-+    rms = 0.0
-+    n = 0
-+    omega = 2.0 * math.pi * freq
-+    for iz in range(nzout):
-+        exact = cmath.exp(-1j * omega * (iz * dz) / vref)
-+        for ix in range(nx):
-+            got = field[iz * nx + ix]
-+            rms += abs(got - exact) ** 2
-+            max_amp = max(max_amp, abs(abs(got) - 1.0))
-+            max_phase = max(max_phase, abs(math.atan2((got / exact).imag, (got / exact).real)))
-+            n += 1
-+    return bad, max_amp, max_phase, math.sqrt(rms / max(n, 1))
-+
-+
-+def relative_l2(a: Sequence[complex], b: Sequence[complex]) -> float:
-+    pairs = [(x, y) for x, y in zip(a, b)
-+             if math.isfinite(x.real) and math.isfinite(x.imag) and math.isfinite(y.real) and math.isfinite(y.imag)]
-+    if not pairs:
-+        return float("nan")
-+    num = math.sqrt(sum(abs(x - y) ** 2 for x, y in pairs))
-+    den = math.sqrt(sum(abs(y) ** 2 for _, y in pairs))
-+    return num / max(den, 1.0e-30)
-+
-+
-+def main() -> int:
-+    ap = argparse.ArgumentParser()
-+    ap.add_argument("--work-dir", default=None)
-+    args = ap.parse_args()
-+
-+    if not BIN_FILL.exists():
-+        raise SystemExit(f"Missing executable {BIN_FILL}; build layer_wavefield_fill first")
-+
-+    cases = [
-+        {"name": "constant_f1_32x21_2layers", "nx": 32, "nz": 21, "dx": 10.0, "dz": 5.0, "freq": 1.0, "depths": [0.0, 50.0, 100.0], "model": "constant"},
-+        {"name": "constant_f5_32x21_2layers", "nx": 32, "nz": 21, "dx": 10.0, "dz": 5.0, "freq": 5.0, "depths": [0.0, 50.0, 100.0], "model": "constant"},
-+        {"name": "constant_f10_64x21_2layers", "nx": 64, "nz": 21, "dx": 10.0, "dz": 5.0, "freq": 10.0, "depths": [0.0, 50.0, 100.0], "model": "constant"},
-+        {"name": "constant_f20_64x41_4layers", "nx": 64, "nz": 41, "dx": 10.0, "dz": 5.0, "freq": 20.0, "depths": [0.0, 50.0, 100.0, 150.0, 200.0], "model": "constant"},
-+        {"name": "gradient_f10_64x41_4layers", "nx": 64, "nz": 41, "dx": 10.0, "dz": 5.0, "freq": 10.0, "depths": [0.0, 50.0, 100.0, 150.0, 200.0], "model": "gradient"},
-+        {"name": "lens_f15_80x41_4layers", "nx": 80, "nz": 41, "dx": 8.0, "dz": 5.0, "freq": 15.0, "depths": [0.0, 50.0, 100.0, 150.0, 200.0], "model": "lens"},
-+        {"name": "constant_f80_64x51_5layers", "nx": 64, "nz": 51, "dx": 2.0, "dz": 2.0, "freq": 80.0, "depths": [0.0, 20.0, 40.0, 60.0, 80.0, 100.0], "model": "constant"},
-+        {"name": "lens_f80_64x51_5layers", "nx": 64, "nz": 51, "dx": 2.0, "dz": 2.0, "freq": 80.0, "depths": [0.0, 20.0, 40.0, 60.0, 80.0, 100.0], "model": "lens"},
-+        {"name": "constant_f100_64x51_5layers", "nx": 64, "nz": 51, "dx": 2.0, "dz": 2.0, "freq": 100.0, "depths": [0.0, 20.0, 40.0, 60.0, 80.0, 100.0], "model": "constant"},
-+        {"name": "lens_f100_64x51_5layers", "nx": 64, "nz": 51, "dx": 2.0, "dz": 2.0, "freq": 100.0, "depths": [0.0, 20.0, 40.0, 60.0, 80.0, 100.0], "model": "lens"},
-+    ]
-+
-+    vref = 2000.0
-+    root = pathlib.Path(args.work_dir) if args.work_dir else pathlib.Path(tempfile.mkdtemp(prefix="layer_fill_bench_"))
-+    root.mkdir(parents=True, exist_ok=True)
-+    print(f"work_dir={root}")
-+    print("case,elapsed_s,samples,nonfinite,max_amp_error,max_phase_error_rad,rms")
-+
-+    for case in cases:
-+        case_dir = root / case["name"]
-+        case_dir.mkdir(parents=True, exist_ok=True)
-+        nx = int(case["nx"]); nz = int(case["nz"]); dx = float(case["dx"]); dz = float(case["dz"])
-+        freq = float(case["freq"]); depths = list(case["depths"]); model = str(case["model"])
-+
-+        def vel_fn(ix: int, iz: int) -> float:
-+            if model == "constant":
-+                return vref
-+            if model == "gradient":
-+                return 1800.0 + 1.5 * iz * dz + 80.0 * math.sin(2.0 * math.pi * ix / max(nx - 1, 1))
-+            cx = 0.5 * (nx - 1); cz = 0.55 * (nz - 1)
-+            r2 = ((ix - cx) / (0.22 * nx)) ** 2 + ((iz - cz) / (0.25 * nz)) ** 2
-+            return 2000.0 - 260.0 * math.exp(-r2) + 0.8 * iz * dz
-+
-+        vel = write_velocity(case_dir, nx, nz, dx, dz, vel_fn)
-+        bound = write_boundaries(case_dir, nx, dx, depths, freq, vref, model)
-+        depths_arg = ",".join(str(d) for d in depths)
-+        nzout = int(round((depths[-1] - depths[0]) / dz)) + 1
-+
-+        damping = 0.02 if freq >= 60.0 else 0.0
-+        dense_t, _, dense_out = run_fill(case_dir, vel, bound, depths_arg, freq, 0, 0.0, damping)
-+        dense = read_complex_field(dense_out.with_name(dense_out.name + "@"), nx, nzout)
-+        if model == "constant":
-+            bad, max_amp, max_phase, metric = analytic_metrics(dense, nx, nzout, dz, freq, vref)
-+        else:
-+            bad = nonfinite_count(dense)
-+            max_amp = float("nan")
-+            max_phase = float("nan")
-+            metric = float("nan")
-+        print(f"{case['name']},{dense_t:.6f},{len(dense)*2},{bad},{max_amp:.6g},{max_phase:.6g},{metric:.6g}")
-+
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
-diff --git a/scripts/test_layered_frequency_wavefield.sh b/scripts/test_layered_frequency_wavefield.sh
-new file mode 100755
-index 0000000000000000000000000000000000000000..15dc9cbbe68e126b6b792a634b61d9c677780918
---- /dev/null
-+++ b/scripts/test_layered_frequency_wavefield.sh
-@@ -0,0 +1,98 @@
-+#!/usr/bin/env bash
-+set -euo pipefail
-+
-+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-+REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-+BIN_DIR=${BIN_DIR:-"${REPO_ROOT}/build/bin"}
-+WORKDIR=${WORKDIR:-$(pwd)}
-+MODEL=${MODEL:-"${WORKDIR}/layered_model.H"}
-+OUT=${OUT:-"${WORKDIR}/freq_wavefield.H"}
-+OUT_REAL=${OUT_REAL:-"${OUT}.real"}
-+OUT_IMAG=${OUT_IMAG:-"${OUT}.imag"}
-+TAU_PREFIX=${TAU_PREFIX:-"${WORKDIR}/tau_check"}
-+BOUNDARY_PREFIX=${BOUNDARY_PREFIX:-"${WORKDIR}/boundary_field"}
-+BLOCK_PREFIX=${BLOCK_PREFIX:-"${WORKDIR}/block_wavefield"}
-+NX=${NX:-32}
-+NZ=${NZ:-31}
-+NLAYER=${NLAYER:-3}
-+FREQS=${FREQS:-10,40,60}
-+USE_BF=${USE_BF:-0}
-+
-+mkdir -p "$WORKDIR"
-+"${BIN_DIR}/layered_model_gen" out="$MODEL" nx="$NX" nz="$NZ" dx=10 dz=10
-+"${BIN_DIR}/layered_frequency_wavefield" model="$MODEL" out="$OUT" tau_prefix="$TAU_PREFIX" boundary_prefix="$BOUNDARY_PREFIX" block_prefix="$BLOCK_PREFIX" out_real="$OUT_REAL" out_imag="$OUT_IMAG" nlayer="$NLAYER" freqs="$FREQS" mode=source use_bf="$USE_BF" fpeak=30
-+
-+python3 - "$OUT" "$NX" "$NZ" "$FREQS" "$TAU_PREFIX" "$NLAYER" "$BOUNDARY_PREFIX" "$BLOCK_PREFIX" "$OUT_REAL" "$OUT_IMAG" <<'PY'
-+import math
-+import re
-+import struct
-+import sys
-+from pathlib import Path
-+out = Path(sys.argv[1])
-+nx = int(sys.argv[2]); nz = int(sys.argv[3]); nf = len(sys.argv[4].split(','))
-+tau_prefix = sys.argv[5]; nlayer = int(sys.argv[6])
-+boundary_prefix = sys.argv[7]; block_prefix = sys.argv[8]
-+out_real = Path(sys.argv[9]); out_imag = Path(sys.argv[10])
-+text = out.read_text(errors='ignore')
-+def get(name):
-+    m = re.search(r'(^|\s)' + name + r'\s*=\s*([^\s]+)', text)
-+    if not m:
-+        raise SystemExit(f'missing {name}= in {out}')
-+    return m.group(2).strip('"')
-+assert int(float(get('n1'))) == 2
-+assert int(float(get('n2'))) == nx
-+assert int(float(get('n3'))) == nz
-+assert int(float(get('n4'))) == nf
-+data_name = get('in')
-+data_path = Path(data_name)
-+if not data_path.is_absolute():
-+    data_path = out.parent / data_path
-+raw = data_path.read_bytes()
-+vals = struct.unpack('<%df' % (len(raw)//4), raw)
-+expected = 2 * nx * nz * nf
-+assert len(vals) == expected, (len(vals), expected)
-+assert all(math.isfinite(v) for v in vals)
-+assert math.sqrt(sum(v*v for v in vals)) > 0.0
-+assert out_real.exists(), out_real
-+assert out_imag.exists(), out_imag
-+assert out_real.stat().st_size == 4 * nx * nz * nf
-+assert out_imag.stat().st_size == 4 * nx * nz * nf
-+def header_path(hdr, key):
-+    h = hdr.read_text(errors='ignore')
-+    m = re.search(key + r'="([^"]+)"', h)
-+    assert m, (hdr, key)
-+    d = Path(m.group(1))
-+    if not d.is_absolute():
-+        d = hdr.parent / d
-+    return d
-+def data_file(hdr):
-+    return header_path(hdr, 'in')
-+def split_files(hdr):
-+    return header_path(hdr, 'in_real'), header_path(hdr, 'in_imag')
-+for il in range(1, nlayer + 1):
-+    hdr = Path(f'{tau_prefix}_layer{il:03d}.H')
-+    assert hdr.exists(), hdr
-+    d = data_file(hdr)
-+    assert d.exists(), d
-+    assert d.stat().st_size == 4 * nx * nx
-+for freq in sys.argv[4].split(','):
-+    tag = freq.replace('.', '_').replace('-', '_').replace('+', '_')
-+    for il in range(0, nlayer + 1):
-+        hdr = Path(f'{boundary_prefix}_f{tag}_layer{il:03d}.H')
-+        assert hdr.exists(), hdr
-+        real, imag = split_files(hdr)
-+        assert real.stat().st_size == 4 * nx
-+        assert imag.stat().st_size == 4 * nx
-+    for il in range(1, nlayer + 1):
-+        hdr = Path(f'{block_prefix}_f{tag}_layer{il:03d}.H')
-+        assert hdr.exists(), hdr
-+        htxt = hdr.read_text(errors='ignore')
-+        assert int(float(re.search(r'(^|\s)n1\s*=\s*([^\s]+)', htxt).group(2))) >= 2
-+        assert int(float(re.search(r'(^|\s)n2\s*=\s*([^\s]+)', htxt).group(2))) == nx
-+        real, imag = split_files(hdr)
-+        assert real.stat().st_size > 4 * nx
-+        assert imag.stat().st_size > 4 * nx
-+print(f'validated wavefield samples={len(vals)} tau_layers={nlayer} boundary/block checks passed')
-+PY
-+
-+echo "Test completed: MODEL=$MODEL OUT=$OUT WORKDIR=$WORKDIR"
-diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index e98bf5d7f3ab5e3f1c7e3fd66272badccbc80f9b..e18928025289910dd1a5a7772af2a74c8d5d1d5a 100644
---- a/src/CMakeLists.txt
-+++ b/src/CMakeLists.txt
-@@ -36,111 +36,129 @@ else()
-     endif()
- endif()
+diff --git a/SEWAVE/sewave2d.cpp b/SEWAVE/sewave2d.cpp
+index 7b15c6b94fd69f5df9a4db840591c524ce6988ef..9fb6737adb8a48bd42c48abce5a75a5f6457c3ab 100644
+--- a/SEWAVE/sewave2d.cpp
++++ b/SEWAVE/sewave2d.cpp
+@@ -10,50 +10,51 @@
+ #include <stdexcept>
+ #include <fftw3.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
  
- # 查找 SERECKIRCH 库
- if(TARGET reckirch)
-     set(SERECKIRCH_LIB reckirch)
- else()
-     find_library(SERECKIRCH_LIB
-         NAMES reckirch
-         PATHS ${CMAKE_BINARY_DIR}/lib
-         NO_DEFAULT_PATH
-     )
-     if(NOT SERECKIRCH_LIB)
-         set(SERECKIRCH_LIB reckirch)
-     endif()
- endif()
+ #ifdef _OPENMP
+ #include <omp.h>
+ #endif
  
+ namespace sewave
+ {
+     namespace
+     {
+         constexpr float PI = 3.14159265358979323846f;
+         inline int idx(int iz, int ix, int nz) { return ix * nz + iz; }
+         float ricker(float t, float f)
+         {
+             float tau = t - 1.5f / f;
+             float a = PI * f * tau;
+             return (1.0f - 2.0f * a * a) * std::exp(-a * a);
+         }
+         int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
+         int xindex(const Grid2D &g, float x) { return clampi((int)std::lround((x - g.x0) / g.dx), 0, g.nx - 1); }
+         int xindex_unclamped(const Grid2D &g, float x) { return (int)std::lround((x - g.x0) / g.dx); }
+         int zindex(const Grid2D &g, float z) { return clampi((int)std::lround((z - g.z0) / g.dz), 0, g.nz - 1); }
++        int zindex_unclamped(const Grid2D &g, float z) { return (int)std::lround((z - g.z0) / g.dz); }
+         void check_same_grid(const Grid2D &a, const Grid2D &b, const char *name)
+         {
+             if (a.nz != b.nz || a.nx != b.nx || a.dz != b.dz || a.dx != b.dx || a.z0 != b.z0 || a.x0 != b.x0)
+                 throw std::runtime_error(std::string(name) + " grid must match velocity grid");
+         }
  
- # 编译可执行文件
- # add_executable(test test.cpp)
- add_executable(kirchmig2d kirchmig2d.cpp)
- add_executable(eikods2d eikods2d.cpp)
- add_executable(kirchdat2d kirchdat2d.cpp)
- add_executable(kirchdat2d_auto kirchdat2d_auto.cpp)
- add_executable(kirchdat2d_freq kirchdat2d_frequency_cs.cpp)
-+add_executable(layer_kirchhoff_test layer_kirchhoff_test.cpp)
-+add_executable(layer_wavefield_fill layer_wavefield_fill.cpp)
-+add_executable(layered_frequency_wavefield layered_frequency_wavefield.cpp)
-+add_executable(layered_model_gen layered_model_gen.cpp)
- add_executable(shotgen shotgen.cpp)
- add_executable(greensol greensol.cpp)
- add_executable(greensol_auto greensol_auto.cpp)
- add_executable(layercom layercom.cpp)
- add_executable(window window.cpp)
- add_executable(layervel layervel.cpp)
- add_executable(kirchdat2d_auto_cs kirchdat2d_auto_cs.cpp)
- add_executable(rsf_synth_gen rsf_synth_gen.cpp)
- add_executable(rsf_l2cmp rsf_l2cmp.cpp)
- add_executable(kirchmig2d_cig kirchmig2d_cig.cpp)
- add_executable(sewave2d sewave2d_app.cpp ../SEWAVE/sewave2d.cpp)
- add_executable(sewave2d_synth sewave2d_synth.cpp ../SEWAVE/sewave2d.cpp)
+         void tripd(std::vector<float> &d, std::vector<float> &e, std::vector<float> &b, int n)
+         {
+             for (int k = 1; k < n; ++k)
+             {
+                 float temp = e[k - 1];
+                 e[k - 1] = temp / d[k - 1];
+                 d[k] -= temp * e[k - 1];
+             }
+             for (int k = 1; k < n; ++k)
+                 b[k] -= e[k - 1] * b[k - 1];
+             b[n - 1] /= d[n - 1];
+             for (int k = n - 1; k > 0; --k)
+                 b[k - 1] = b[k - 1] / d[k - 1] - e[k - 1] * b[k];
+         }
+         void smooth2d_flat(int n1, int n2, float r1, float r2, std::vector<float> &v)
+         {
+             int nmax = std::max(n1, n2);
+             std::vector<float> w((size_t)n1 * n2, 1.0f), d(nmax), e(nmax), f(nmax);
+             r1 = r1 * r1 * 0.25f;
+@@ -71,73 +72,73 @@ namespace sewave
+                 f[n2 - 1] = v[idx(iz, n2 - 1, n1)];
+                 tripd(d, e, f, n2);
+                 for (int ix = 0; ix < n2; ++ix)
+                     v[idx(iz, ix, n1)] = f[ix];
+             }
+             for (int ix = 0; ix < n2; ++ix)
+             {
+                 for (int iz = 0; iz < n1 - 2; ++iz)
+                 {
+                     d[iz] = 1.0f + r1 * (w[idx(iz + 1, ix, n1)] + w[idx(iz + 2, ix, n1)]);
+                     e[iz] = -r1 * w[idx(iz + 2, ix, n1)];
+                     f[iz] = v[idx(iz + 1, ix, n1)];
+                 }
+                 f[0] += r1 * w[idx(1, ix, n1)] * v[idx(0, ix, n1)];
+                 d[n1 - 2] = 1.0f + r1 * w[idx(n1 - 1, ix, n1)];
+                 f[n1 - 2] = v[idx(n1 - 1, ix, n1)];
+                 tripd(d, e, f, n1 - 1);
+                 for (int iz = 0; iz < n1 - 1; ++iz)
+                     v[idx(iz + 1, ix, n1)] = f[iz];
+             }
+         }
+         struct ExtModel
+         {
+             int nx = 0, nz = 0, nbc = 0, L = 30;
+             float dx = 1, dz = 1, alpha = 1, Omega0 = 0, fc = 120;
+-            int order = 2, type = 1;
++            int order = 2, type = 0;
+             std::vector<float> vp, Q;
+         };
  
- # 查找系统库（SQLite3 依赖）
- find_library(DL_LIBRARY dl)
- find_package(Threads REQUIRED)
- find_package(OpenMP QUIET)
+         template <class P>
+         ExtModel make_ext(const Grid2D &vel, const Grid2D *q, const P &p)
+         {
+-            if ((p.visco || p.type == 1) && !q)
+-                throw std::runtime_error("visco/type=1 requires qfile= RSF Q model");
++            if (p.visco && !q)
++                throw std::runtime_error("visco=1 requires qfile= RSF Q model");
+             if (q)
+                 check_same_grid(vel, *q, "Q model");
+             ExtModel e;
+             e.nbc = p.nbc;
+             e.L = p.L;
+             e.nx = vel.nx + 2 * p.nbc;
+             e.nz = vel.nz + 2 * p.nbc;
+             e.dx = vel.dx;
+             e.dz = vel.dz;
+             e.alpha = p.alpha;
+             e.Omega0 = (p.Omega0 > 0 ? p.Omega0 : 2 * PI * p.f0);
+             e.fc = p.fc;
+             e.order = p.order;
+-            e.type = p.visco ? 1 : p.type;
++            e.type = p.visco ? 1 : 0;
+             e.vp.assign((size_t)e.nx * e.nz, 0);
+             e.Q.assign((size_t)e.nx * e.nz, std::max(1.0f, p.q));
+             for (int ix = 0; ix < e.nx; ++ix)
+             {
+                 int sx = clampi(ix - p.nbc, 0, vel.nx - 1);
+                 for (int iz = 0; iz < e.nz; ++iz)
+                 {
+                     int sz = clampi(iz - p.nbc, 0, vel.nz - 1);
+                     e.vp[idx(iz, ix, e.nz)] = vel.v[idx(sz, sx, vel.nz)];
+                     e.Q[idx(iz, ix, e.nz)] = q ? q->v[idx(sz, sx, vel.nz)] : p.q;
+                 }
+             }
+             if (p.flag_smooth)
+             {
+                 smooth2d_flat(e.nz, e.nx, 5, 5, e.vp);
+                 smooth2d_flat(e.nz, e.nx, 5, 5, e.Q);
+             }
+             return e;
+         }
  
- # 链接库
- # target_link_libraries(test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchmig2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(eikods2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchdat2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchdat2d_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchdat2d_freq ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
-+target_link_libraries(layer_kirchhoff_test ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
-+target_link_libraries(layer_wavefield_fill ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${DL_LIBRARY} Threads::Threads)
-+target_link_libraries(layered_frequency_wavefield ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
-+target_link_libraries(layered_model_gen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(shotgen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(greensol ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(greensol_auto ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(layercom ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(window ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(layervel ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchdat2d_auto_cs ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(rsf_synth_gen ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(rsf_l2cmp ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(kirchmig2d_cig ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(sewave2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
- target_link_libraries(sewave2d_synth ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
- if(OpenMP_CXX_FOUND)
-     target_link_libraries(sewave2d OpenMP::OpenMP_CXX)
-     target_link_libraries(sewave2d_synth OpenMP::OpenMP_CXX)
- endif()
- target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
-+target_include_directories(layer_kirchhoff_test PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
-+target_include_directories(layered_frequency_wavefield PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
- target_include_directories(sewave2d PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
- target_include_directories(sewave2d_synth PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+         void apply_homo(ExtModel &e, int sx, int sz)
+         {
+             int is = idx(clampi(sz, 0, e.nz - 1), clampi(sx, 0, e.nx - 1), e.nz);
+             std::fill(e.vp.begin(), e.vp.end(), e.vp[is]);
+             std::fill(e.Q.begin(), e.Q.end(), e.Q[is]);
+@@ -324,55 +325,91 @@ namespace sewave
+             out->headers->n[0] = g.nz;
+             out->headers->n[1] = g.nx;
+             out->headers->o[0] = g.z0;
+             out->headers->o[1] = g.x0;
+             out->headers->d[0] = g.dz;
+             out->headers->d[1] = g.dx;
+             sep_set_header(out, "label1", "Depth");
+             sep_set_header(out, "label2", "Lateral");
+             sep_set_header(out, "label", "Wavefield");
+             se_fsio_write_float(out->data->io, crop.data(), crop.size());
+             sep_write_headers(out);
+             sep_close(out);
+         }
  
- # 安装所有可执行文件到 bin 目录
- install(TARGETS
-     # test
-     kirchmig2d
-     eikods2d
-     kirchdat2d
-     kirchdat2d_auto
-     kirchdat2d_freq
-+    layer_kirchhoff_test
-+    layer_wavefield_fill
-+    layered_frequency_wavefield
-+    layered_model_gen
-     shotgen
-     greensol
-     greensol_auto
-     layercom
-     window
-     layervel
-     kirchdat2d_auto_cs
-     rsf_synth_gen
-     rsf_l2cmp
-     kirchmig2d_cig
-     sewave2d
-     sewave2d_synth
- )
+         void maybe_write_debug_snapshot(const ExtModel &e, const Grid2D *g, const std::vector<float> &wave, int step, const std::vector<int> *steps, const std::string *prefix, const char *kind, int shot)
+         {
+             if (!g || !steps || !prefix || prefix->empty() || !kind)
+                 return;
+             if (std::find(steps->begin(), steps->end(), step) == steps->end())
+                 return;
+             char name[512];
+             std::snprintf(name, sizeof(name), "%s_shot%d_%s_it%d.rsf", prefix->c_str(), shot, kind, step);
+             write_debug_snapshot(e, *g, wave, name);
+             INFO(("Wrote debug wavefield snapshot %s", name));
+         }
++        void ensure_directory(const char *dir, const char *purpose)
++        {
++            if (::mkdir(dir, 0777) != 0 && errno != EEXIST)
++                throw std::runtime_error(std::string("cannot create ") + dir + " directory for " + purpose);
++        }
++
++        std::string shot_image_path(int shot)
++        {
++            char name[256];
++            std::snprintf(name, sizeof(name), "temp_shot_img/shot_%06d.rsf", shot);
++            return name;
++        }
++
++        void write_shot_image_rsf(const std::string &path, const Grid2D &g, const std::vector<float> &data, int shot, float shot_x, float shot_z)
++        {
++            sep_t *s = sep_open(path.c_str(), SEP_WRITE, 0);
++            if (!s)
++                throw std::runtime_error("cannot create per-shot image " + path);
++            s->headers->ndim = 2;
++            s->headers->n[0] = g.nz;
++            s->headers->n[1] = g.nx;
++            s->headers->o[0] = g.z0;
++            s->headers->o[1] = g.x0;
++            s->headers->d[0] = g.dz;
++            s->headers->d[1] = g.dx;
++            sep_set_header(s, "label1", "Depth");
++            sep_set_header(s, "label2", "Lateral");
++            sep_set_header(s, "label", "Per-shot RTM Image");
++            sep_set_header_int(s, "shot_index", shot);
++            sep_set_header_float(s, "shot_x", shot_x);
++            sep_set_header_float(s, "shot_z", shot_z);
++            sep_set_header_float(s, "sx", shot_x);
++            sep_set_header_float(s, "sz", shot_z);
++            se_fsio_write_float(s->data->io, const_cast<float *>(data.data()), data.size());
++            sep_write_headers(s);
++            sep_close(s);
++        }
  
- # 确保依赖的库先编译完成
- # add_dependencies(test sebasic sefs reckirch)
- add_dependencies(kirchmig2d sebasic sefs reckirch)
- add_dependencies(eikods2d sebasic sefs reckirch)
- add_dependencies(kirchdat2d sebasic sefs reckirch)
- add_dependencies(kirchdat2d_auto sebasic sefs reckirch)
- add_dependencies(kirchdat2d_freq sebasic sefs reckirch fftw3f)
-+add_dependencies(layer_kirchhoff_test sebasic sefs reckirch fftw3f)
-+add_dependencies(layer_wavefield_fill sebasic sefs)
-+add_dependencies(layered_frequency_wavefield sebasic sefs reckirch fftw3f)
-+add_dependencies(layered_model_gen sebasic sefs)
- add_dependencies(shotgen sebasic sefs reckirch)
- add_dependencies(greensol sebasic sefs reckirch)
- add_dependencies(greensol_auto sebasic sefs reckirch)
- add_dependencies(layercom sebasic sefs reckirch)
- add_dependencies(window sebasic sefs reckirch)
- add_dependencies(layervel sebasic sefs reckirch)
- add_dependencies(kirchdat2d_auto_cs sebasic sefs reckirch)
- add_dependencies(rsf_synth_gen sebasic sefs reckirch)
- add_dependencies(rsf_l2cmp sebasic sefs reckirch)
- add_dependencies(kirchmig2d_cig sebasic sefs reckirch)
- add_dependencies(sewave2d sebasic sefs fftw3f)
- add_dependencies(sewave2d_synth sebasic sefs fftw3f)
-diff --git a/src/layer_kirchhoff_test.cpp b/src/layer_kirchhoff_test.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..9e11f3bd44d4d05fa7f78fb7ad68e8075d13b4a7
---- /dev/null
-+++ b/src/layer_kirchhoff_test.cpp
-@@ -0,0 +1,362 @@
-+#include <SEBASIC/include/se_basic.h>
-+#include <SEFILESYSTEM/include/se_fs.h>
-+#include <SERECKIRCH/include/se_reckirch.h>
-+
-+#include <algorithm>
-+#include <cmath>
-+#include <complex>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
-+#include <sstream>
-+#include <string>
-+#include <vector>
-+
-+#include <fftw3.h>
-+
-+#ifndef M_PI
-+#define M_PI 3.14159265358979323846
-+#endif
-+
-+struct LayerBoundary
-+{
-+    int iz;
-+    float z;
-+};
-+
-+static std::vector<float> parse_depths(const char *text)
-+{
-+    std::vector<float> depths;
-+    if (text == NULL || text[0] == '\0')
-+        return depths;
-+
-+    std::string s(text);
-+    std::replace(s.begin(), s.end(), ',', ' ');
-+    std::stringstream ss(s);
-+    float z = 0.0f;
-+    while (ss >> z)
-+        depths.push_back(z);
-+    return depths;
-+}
-+
-+static int clamp_index(int i, int n)
-+{
-+    if (i < 0)
-+        return 0;
-+    if (i >= n)
-+        return n - 1;
-+    return i;
-+}
-+
-+static float velocity_at(const std::vector<float> &vel, int nz, int nx, int iz, int ix)
-+{
-+    iz = clamp_index(iz, nz);
-+    ix = clamp_index(ix, nx);
-+    float v = vel[(size_t)ix * (size_t)nz + (size_t)iz];
-+    if (!(v > 0.0f) || !std::isfinite(v))
-+        ERROR(("Velocity model contains non-positive or invalid sample at iz=%d ix=%d", iz, ix));
-+    return v;
-+}
-+
-+static float segment_traveltime(const std::vector<float> &vel,
-+                                int nz,
-+                                int nx,
-+                                float oz,
-+                                float dz,
-+                                float ox,
-+                                float dx,
-+                                int iz_top,
-+                                int iz_bot,
-+                                int ix_top,
-+                                int ix_bot)
-+{
-+    if (iz_bot <= iz_top)
-+        return 0.0f;
-+
-+    const float x_top = ox + ix_top * dx;
-+    const float x_bot = ox + ix_bot * dx;
-+    const float z_top = oz + iz_top * dz;
-+    const float z_bot = oz + iz_bot * dz;
-+    const float length = std::hypot(x_bot - x_top, z_bot - z_top);
-+    const int nstep = std::max(2, iz_bot - iz_top + std::abs(ix_bot - ix_top) + 1);
-+
-+    float sum_slowness = 0.0f;
-+    for (int is = 0; is < nstep; ++is)
-+    {
-+        const float a = (nstep == 1) ? 0.0f : (float)is / (float)(nstep - 1);
-+        const float x = x_top + a * (x_bot - x_top);
-+        const float z = z_top + a * (z_bot - z_top);
-+        const int ix = (int)std::floor((x - ox) / dx + 0.5f);
-+        const int iz = (int)std::floor((z - oz) / dz + 0.5f);
-+        sum_slowness += 1.0f / velocity_at(vel, nz, nx, iz, ix);
-+    }
-+    return length * sum_slowness / (float)nstep;
-+}
-+
-+static void build_layer_traveltime(const std::vector<float> &vel,
-+                                   int nz,
-+                                   int nx,
-+                                   float oz,
-+                                   float dz,
-+                                   float ox,
-+                                   float dx,
-+                                   int iz_top,
-+                                   int iz_bot,
-+                                   float **tau)
-+{
-+    for (int ix_top = 0; ix_top < nx; ++ix_top)
-+    {
-+        for (int ix_bot = 0; ix_bot < nx; ++ix_bot)
-+        {
-+            tau[ix_bot][ix_top] = segment_traveltime(vel, nz, nx, oz, dz, ox, dx,
-+                                                     iz_top, iz_bot, ix_top, ix_bot);
-+        }
-+    }
-+}
-+
-+static void build_kirchhoff_amp(float **tau,
-+                                int nx,
-+                                float dx,
-+                                fftwf_complex *amp)
-+{
-+    for (int ix_bot = 0; ix_bot < nx; ++ix_bot)
-+    {
-+        for (int ix_top = 0; ix_top < nx; ++ix_top)
-+        {
-+            const float t = std::max(tau[ix_bot][ix_top], 1.0e-6f);
-+            const float scale = dx / std::sqrt(t);
-+            const size_t k = (size_t)ix_bot * (size_t)nx + (size_t)ix_top;
-+            amp[k][0] = scale;
-+            amp[k][1] = 0.0f;
-+        }
-+    }
-+}
-+
-+static void propagate_direct(float **tau,
-+                             int nx,
-+                             float dx,
-+                             float omega,
-+                             const std::vector<std::complex<float>> &uin,
-+                             std::vector<std::complex<float>> &uout)
-+{
-+    std::fill(uout.begin(), uout.end(), std::complex<float>(0.0f, 0.0f));
-+    for (int ix_bot = 0; ix_bot < nx; ++ix_bot)
-+    {
-+        std::complex<float> sum(0.0f, 0.0f);
-+        for (int ix_top = 0; ix_top < nx; ++ix_top)
-+        {
-+            const float t = std::max(tau[ix_bot][ix_top], 1.0e-6f);
-+            const float phase = omega * t;
-+            const std::complex<float> g = (dx / std::sqrt(t)) *
-+                                          std::complex<float>(std::cos(phase), -std::sin(phase));
-+            sum += g * uin[ix_top];
-+        }
-+        uout[ix_bot] = sum;
-+    }
-+}
-+
-+static void propagate_butterfly(float **tau,
-+                                int nx,
-+                                float dx,
-+                                float omega,
-+                                int bf_p,
-+                                int bf_leaf,
-+                                int bf_panel_levels,
-+                                float bf_amp_eps,
-+                                float bf_phase_tol,
-+                                const std::vector<std::complex<float>> &uin,
-+                                std::vector<std::complex<float>> &uout)
-+{
-+    fftwf_complex *amp = (fftwf_complex *)fftwf_malloc((size_t)nx * (size_t)nx * sizeof(fftwf_complex));
-+    fftwf_complex *bin = (fftwf_complex *)fftwf_malloc((size_t)nx * sizeof(fftwf_complex));
-+    fftwf_complex *bout = (fftwf_complex *)fftwf_malloc((size_t)nx * sizeof(fftwf_complex));
-+    if (amp == NULL || bin == NULL || bout == NULL)
-+        ERROR(("Out of memory for butterfly propagation."));
-+
-+    build_kirchhoff_amp(tau, nx, dx, amp);
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        bin[ix][0] = uin[ix].real();
-+        bin[ix][1] = uin[ix].imag();
-+    }
-+
-+    BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(nx, tau, amp, omega,
-+                                                                              bf_p, bf_leaf,
-+                                                                              bf_panel_levels,
-+                                                                              bf_amp_eps,
-+                                                                              bf_phase_tol);
-+    bf1d_strict_segmented_apply(factor, bin, bout);
-+    bf1d_strict_segmented_destroy(factor);
-+
-+    for (int ix = 0; ix < nx; ++ix)
-+        uout[ix] = std::complex<float>(bout[ix][0], bout[ix][1]);
-+
-+    fftwf_free(amp);
-+    fftwf_free(bin);
-+    fftwf_free(bout);
-+}
-+
-+static void initialize_hankel_wavefield(int nx,
-+                                        float ox,
-+                                        float dx,
-+                                        float srcx,
-+                                        float srcz,
-+                                        float topz,
-+                                        float freq,
-+                                        float vref,
-+                                        std::vector<std::complex<float>> &u)
-+{
-+    const float k = 2.0f * (float)M_PI * freq / vref;
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        const float x = ox + ix * dx;
-+        const float r = std::max(std::hypot(x - srcx, topz - srcz), 0.25f * std::fabs(dx));
-+        const float kr = std::max(k * r, 1.0e-4f);
-+        u[ix] = std::complex<float>((float)std::cyl_bessel_j(0, kr), (float)std::cyl_neumann(0, kr));
-+    }
-+}
-+
-+int main(int argc, char *argv[])
-+{
-+    se_par_init(argc, argv);
-+
-+    if (!se_have_par("in"))
-+        ERROR(("Need in= velocity-model SEP file"));
-+    if (!se_have_par("out"))
-+        ERROR(("Need out= output wavefield SEP file"));
-+    if (!se_have_par("depths") && !se_have_par("depth_indices"))
-+        ERROR(("Need depths= output depths or depth_indices= output z sample indices"));
-+    if (!se_have_par("freq"))
-+        ERROR(("Need freq= frequency in Hz"));
-+
-+    const char *in_f = se_get_par_str("in");
-+    const char *out_f = se_get_par_str("out");
-+    int ndepth = 0;
-+    float *depth_array = se_have_par("depths") ? se_get_pararray_float("depths", &ndepth) : NULL;
-+    std::vector<float> depths;
-+    if (depth_array != NULL && ndepth > 0)
-+    {
-+        depths.assign(depth_array, depth_array + ndepth);
-+        free1float(depth_array);
-+    }
-+    else if (se_have_par("depths"))
-+    {
-+        depths = parse_depths(se_get_par_str("depths"));
-+    }
-+    const float freq = se_get_par_float("freq");
-+    const int use_bf = se_have_par("use_bf") ? se_get_par_int("use_bf") : 1;
-+    const int include_top = se_have_par("include_top") ? se_get_par_int("include_top") : 1;
-+    const int bf_p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 12;
-+    const int bf_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 16;
-+    const int bf_panel_levels = se_have_par("bf_panel_levels") ? se_get_par_int("bf_panel_levels") : 1;
-+    const float bf_amp_eps = se_have_par("bf_amp_eps") ? se_get_par_float("bf_amp_eps") : 1.0e-20f;
-+    const float bf_phase_tol = se_have_par("bf_phase_tol") ? se_get_par_float("bf_phase_tol") : 2.0f;
-+
-+    sep_t *model = sep_open(in_f, SEP_READ, 0);
-+    sep_t *out = sep_open(out_f, SEP_WRITE, 0);
-+    if (model->headers->ndim < 2)
-+        ERROR(("Need a 2-D velocity model with n1=z and n2=x."));
-+
-+    const int nz = model->headers->n[0];
-+    const int nx = model->headers->n[1];
-+    const float dz = (float)model->headers->d[0];
-+    const float dx = (float)model->headers->d[1];
-+    const float oz = (float)model->headers->o[0];
-+    const float ox = (float)model->headers->o[1];
-+    if (nz <= 1 || nx <= 1 || dz == 0.0f || dx == 0.0f)
-+        ERROR(("Invalid model geometry."));
-+    if (!se_have_par("depth_indices") && depths.empty())
-+        ERROR(("No valid depths parsed from depths=."));
-+
-+    std::vector<LayerBoundary> layers;
-+    if (se_have_par("depth_indices"))
-+    {
-+        int nidx = 0;
-+        int32_t *idx_array = se_get_pararray_int("depth_indices", &nidx);
-+        if (idx_array == NULL || nidx <= 0)
-+            ERROR(("No valid indices parsed from depth_indices=."));
-+        std::vector<int> indices(idx_array, idx_array + nidx);
-+        free1int(idx_array);
-+        std::sort(indices.begin(), indices.end());
-+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-+        for (int iz : indices)
-+        {
-+            if (iz <= 0 || iz >= nz)
-+                ERROR(("Requested depth index %d outside valid propagated range 1..%d", iz, nz - 1));
-+            layers.push_back({iz, oz + iz * dz});
-+        }
-+    }
-+    else
-+    {
-+        std::sort(depths.begin(), depths.end());
-+        depths.erase(std::unique(depths.begin(), depths.end()), depths.end());
-+        for (float z : depths)
-+        {
-+            int iz = (int)std::floor((z - oz) / dz + 0.5f);
-+            if (iz <= 0 || iz >= nz)
-+                ERROR(("Requested depth %g maps to iz=%d outside valid propagated range 1..%d", z, iz, nz - 1));
-+            if (layers.empty() || layers.back().iz != iz)
-+                layers.push_back({iz, oz + iz * dz});
-+        }
-+    }
-+
-+    std::vector<float> vel((size_t)nz * (size_t)nx);
-+    se_fsio_read_float(model->data->io, vel.data(), vel.size());
-+
-+    const float srcx = se_have_par("srcx") ? se_get_par_float("srcx") : ox + 0.5f * (nx - 1) * dx;
-+    const float srcz = se_have_par("srcz") ? se_get_par_float("srcz") : oz;
-+    const float vref = se_have_par("vref") ? se_get_par_float("vref") : velocity_at(vel, nz, nx, 0, nx / 2);
-+    const float omega = 2.0f * (float)M_PI * freq;
-+
-+    out->headers->ndim = 3;
-+    out->headers->n[0] = 2;
-+    out->headers->n[1] = nx;
-+    out->headers->n[2] = (int)layers.size() + (include_top ? 1 : 0);
-+    out->headers->d[0] = 1.0;
-+    out->headers->d[1] = dx;
-+    out->headers->d[2] = dz;
-+    out->headers->o[0] = 0.0;
-+    out->headers->o[1] = ox;
-+    out->headers->o[2] = include_top ? oz : layers.front().z;
-+
-+    std::vector<std::complex<float>> u_top(nx), u_bot(nx);
-+    initialize_hankel_wavefield(nx, ox, dx, srcx, srcz, oz, freq, vref, u_top);
-+
-+    int iz_top = 0;
-+    std::vector<float> row((size_t)2 * (size_t)nx);
-+    if (include_top)
-+    {
-+        for (int ix = 0; ix < nx; ++ix)
-+        {
-+            row[(size_t)ix * 2] = u_top[ix].real();
-+            row[(size_t)ix * 2 + 1] = u_top[ix].imag();
-+        }
-+        se_fsio_write_float(out->data->io, row.data(), row.size());
-+        INFO(("Wrote top wavefield at depth=%g (iz=0)", oz));
-+    }
-+    for (size_t il = 0; il < layers.size(); ++il)
-+    {
-+        float **tau = alloc2float(nx, nx);
-+        build_layer_traveltime(vel, nz, nx, oz, dz, ox, dx, iz_top, layers[il].iz, tau);
-+        if (use_bf)
-+            propagate_butterfly(tau, nx, dx, omega, bf_p, bf_leaf, bf_panel_levels, bf_amp_eps, bf_phase_tol, u_top, u_bot);
-+        else
-+            propagate_direct(tau, nx, dx, omega, u_top, u_bot);
-+        free2float(tau);
-+
-+        for (int ix = 0; ix < nx; ++ix)
-+        {
-+            row[(size_t)ix * 2] = u_bot[ix].real();
-+            row[(size_t)ix * 2 + 1] = u_bot[ix].imag();
-+        }
-+        se_fsio_write_float(out->data->io, row.data(), row.size());
-+        INFO(("Wrote layer %zu wavefield at depth=%g (iz=%d)", il + 1, layers[il].z, layers[il].iz));
-+        u_top.swap(u_bot);
-+        iz_top = layers[il].iz;
-+    }
-+
-+    sep_close(model);
-+    sep_close(out);
-+    se_par_destroy();
-+    return 0;
-+}
-diff --git a/src/layer_wavefield_fill.cpp b/src/layer_wavefield_fill.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..82a269e8523970af737ad4483d8e2bbd5554a9e4
---- /dev/null
-+++ b/src/layer_wavefield_fill.cpp
-@@ -0,0 +1,365 @@
-+#include <SEBASIC/include/se_basic.h>
-+#include <SEFILESYSTEM/include/se_fs.h>
-+
-+#include <algorithm>
-+#include <cmath>
-+#include <complex>
-+#include <cstring>
-+#include <sstream>
-+#include <string>
-+#include <vector>
-+
-+#ifndef M_PI
-+#define M_PI 3.14159265358979323846
-+#endif
-+
-+struct Boundary
-+{
-+    int iz;
-+    float z;
-+};
-+
-+static std::vector<float> parse_depths_fallback(const char *text)
-+{
-+    std::vector<float> depths;
-+    if (text == NULL || text[0] == '\0')
-+        return depths;
-+    std::string s(text);
-+    std::replace(s.begin(), s.end(), ',', ' ');
-+    std::stringstream ss(s);
-+    float v = 0.0f;
-+    while (ss >> v)
-+        depths.push_back(v);
-+    return depths;
-+}
-+
-+static std::vector<float> read_depths_param()
-+{
-+    int ndepth = 0;
-+    float *arr = se_get_pararray_float("depths", &ndepth);
-+    std::vector<float> depths;
-+    if (arr != NULL && ndepth > 0)
-+    {
-+        depths.assign(arr, arr + ndepth);
-+        free1float(arr);
-+    }
-+    else
-+    {
-+        depths = parse_depths_fallback(se_get_par_str("depths"));
-+    }
-+    return depths;
-+}
-+
-+static int clamp_index(int i, int n)
-+{
-+    if (i < 0)
-+        return 0;
-+    if (i >= n)
-+        return n - 1;
-+    return i;
-+}
-+
-+static float velocity_at(const std::vector<float> &vel, int nz, int nx, int iz, int ix)
-+{
-+    iz = clamp_index(iz, nz);
-+    ix = clamp_index(ix, nx);
-+    float v = vel[(size_t)ix * (size_t)nz + (size_t)iz];
-+    if (!(v > 0.0f) || !std::isfinite(v))
-+        ERROR(("Velocity model contains non-positive or invalid sample at iz=%d ix=%d", iz, ix));
-+    return v;
-+}
-+
-+static float sponge_weight(int ix, int nx, int sponge, float strength)
-+{
-+    if (sponge <= 0 || strength <= 0.0f)
-+        return 1.0f;
-+    int dist = std::min(ix, nx - 1 - ix);
-+    if (dist >= sponge)
-+        return 1.0f;
-+    float x = (float)(sponge - dist) / (float)sponge;
-+    return std::exp(-strength * x * x);
-+}
-+
-+static std::vector<std::vector<std::complex<float>>> solve_helmholtz_layer(const std::vector<float> &vel,
-+                                                                            int nz,
-+                                                                            int nx,
-+                                                                            int iz_top,
-+                                                                            int iz_bot,
-+                                                                            float dx,
-+                                                                            float dz,
-+                                                                            float omega,
-+                                                                            int sponge_n,
-+                                                                            float sponge_strength,
-+                                                                            float helmholtz_damping,
-+                                                                            int max_dense_unknowns,
-+                                                                            const std::vector<std::complex<float>> &top_field,
-+                                                                            const std::vector<std::complex<float>> &bottom_field)
-+{
-+    const int nzl = iz_bot - iz_top + 1;
-+    std::vector<std::vector<std::complex<float>>> u((size_t)nzl, std::vector<std::complex<float>>(nx));
-+    if (nzl <= 1)
-+    {
-+        u[0] = top_field;
-+        return u;
-+    }
-+
-+    const float idx2 = 1.0f / (dx * dx);
-+    const float idz2 = 1.0f / (dz * dz);
-+
-+    for (int iz = 0; iz < nzl; ++iz)
-+    {
-+        const float a = (float)iz / (float)(nzl - 1);
-+        for (int ix = 0; ix < nx; ++ix)
-+            u[(size_t)iz][ix] = (1.0f - a) * top_field[ix] + a * bottom_field[ix];
-+    }
-+    u.front() = top_field;
-+    u.back() = bottom_field;
-+
-+    if (nzl <= 2 || nx <= 2)
-+        return u;
-+
-+    const int nxint = nx - 2;
-+    const int nzint = nzl - 2;
-+    const int nunk = nxint * nzint;
-+    if (nunk > max_dense_unknowns)
-+        ERROR(("dense_direct layer has %d unknowns, exceeding max_dense_unknowns=%d. Increase MAX_DENSE_UNKNOWNS/max_dense_unknowns for this test, reduce the layer thickness, or use more closely spaced DEPTH_INDICES so each dense layer solve remains tractable.", nunk, max_dense_unknowns));
-+
-+    std::vector<std::complex<float>> A((size_t)nunk * (size_t)nunk, std::complex<float>(0.0f, 0.0f));
-+    std::vector<std::complex<float>> b((size_t)nunk, std::complex<float>(0.0f, 0.0f));
-+    auto uid = [nxint](int iz_local, int ix) { return (iz_local - 1) * nxint + (ix - 1); };
-+
-+    for (int iz = 1; iz < nzl - 1; ++iz)
-+    {
-+        const int giz = iz_top + iz;
-+        for (int ix = 1; ix < nx - 1; ++ix)
-+        {
-+            const int row = uid(iz, ix);
-+            const float v = velocity_at(vel, nz, nx, giz, ix);
-+            const float k = omega / v;
-+            const float side = 1.0f - sponge_weight(ix, nx, sponge_n, sponge_strength);
-+            const std::complex<float> k2 = std::complex<float>(k * k, (helmholtz_damping + side) * k * k);
-+            A[(size_t)row * nunk + row] = k2 - 2.0f * (idx2 + idz2);
-+
-+            auto add_neighbor = [&](int niz, int nix, float coeff) {
-+                if (niz > 0 && niz < nzl - 1 && nix > 0 && nix < nx - 1)
-+                {
-+                    const int col = uid(niz, nix);
-+                    A[(size_t)row * nunk + col] += coeff;
-+                }
-+                else
-+                {
-+                    b[(size_t)row] -= coeff * u[(size_t)niz][nix];
-+                }
-+            };
-+            add_neighbor(iz, ix - 1, idx2);
-+            add_neighbor(iz, ix + 1, idx2);
-+            add_neighbor(iz - 1, ix, idz2);
-+            add_neighbor(iz + 1, ix, idz2);
-+        }
-+    }
-+
-+    for (int krow = 0; krow < nunk; ++krow)
-+    {
-+        int piv = krow;
-+        float piv_abs = std::abs(A[(size_t)krow * nunk + krow]);
-+        for (int r = krow + 1; r < nunk; ++r)
-+        {
-+            const float a = std::abs(A[(size_t)r * nunk + krow]);
-+            if (a > piv_abs)
+         FILE *open_snapshot_temp(int shot, std::string &path)
+         {
+-            if (::mkdir("temp_img", 0777) != 0 && errno != EEXIST)
+-                throw std::runtime_error("cannot create temp_img directory for source snapshots");
++            ensure_directory("temp_img", "source snapshots");
+             char name[256];
+             std::snprintf(name, sizeof(name), "temp_img/sewave_snap_%ld_shot_%d_XXXXXX", (long)::getpid(), shot);
+             int fd = ::mkstemp(name);
+             if (fd < 0)
+                 throw std::runtime_error("cannot create source snapshot temporary file in temp_img");
+             FILE *fp = ::fdopen(fd, "w+b");
+             if (!fp)
+             {
+                 ::close(fd);
+                 ::unlink(name);
+                 throw std::runtime_error("cannot open source snapshot temporary file stream");
+             }
+             path = name;
+             return fp;
+         }
+ 
+         int count_stored_snapshots(int nt, int interval, int offset)
+         {
+             if (interval <= 1)
+                 return nt;
+             if (offset < 0)
+                 offset = 0;
+             if (offset >= interval)
+                 offset %= interval;
+             if (offset >= nt)
+@@ -637,93 +674,126 @@ namespace sewave
+             int sx = xindex(vel, p.sx + is * p.ds) + e.nbc, sz = zindex(vel, p.sz) + e.nbc, rz = zindex(vel, p.rz) + e.nbc;
+             if (p.flag_homo)
+                 apply_homo(e, sx, sz);
+             propagate(e, out.nt, out.dt, p.type_compute_laplace, false, 1, sx, sz, rz, true, p.progress_interval, label, &src, &rec, nullptr, nullptr, nullptr);
+             std::memcpy(&out.d[(size_t)is * out.nr * out.nt], rec.data(), rec.size() * sizeof(float));
+         }
+         return out;
+     }
+ 
+     std::vector<float> rtm_image(const Grid2D &vel, const Data3D &data, const ImageParams &p, const Grid2D *qmodel)
+     {
+         ExtModel ebase = make_ext(vel, qmodel, p);
+         int shot0 = std::max(0, p.shot_begin);
+         int shot1 = (p.shot_end < 0) ? data.ns - 1 : std::min(data.ns - 1, p.shot_end);
+         if (shot0 > shot1)
+             throw std::runtime_error("empty shot range for imaging");
+         int shot_threads = std::max(1, p.max_parallel_shots);
+ #ifdef _OPENMP
+         shot_threads = std::min(shot_threads, omp_get_max_threads());
+ #endif
+         int snapshot_interval = std::max(1, p.snapshot_interval);
+         int rec_snapshot_offset = 0;
+         int src_snapshot_offset = (data.nt - 1) % snapshot_interval;
+         int stored_snaps = count_stored_snapshots(data.nt, snapshot_interval, rec_snapshot_offset);
+         size_t snap_bytes = (size_t)stored_snaps * ebase.nx * ebase.nz * sizeof(float);
++        int amp_sign = p.compensate ? -1 : 1;
+         INFO(("RTM shot parallelism=%d, snapshot_interval=%d, stored snapshots per wavefield=%d/%d, source snapshots per active shot=%.3f GiB (%s)",
+               shot_threads, snapshot_interval, stored_snaps, data.nt, snap_bytes / (1024.0 * 1024.0 * 1024.0), p.in_memory_snapshots ? "memory" : "disk temporary file"));
+-        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
++        ensure_directory("temp_shot_img", "per-shot images");
++        std::vector<int> shot_imaged(data.ns, 0);
+ #pragma omp parallel for schedule(dynamic) num_threads(shot_threads)
+         for (int is = shot0; is <= shot1; ++is)
+         {
+             ExtModel e = ebase;
++            float sx = data.s0 + is * data.ds;
++            int six0 = xindex_unclamped(vel, sx);
++            int siz0 = zindex_unclamped(vel, p.sz);
++            if (six0 < 0 || six0 >= vel.nx || siz0 < 0 || siz0 >= vel.nz)
 +            {
-+                piv = r;
-+                piv_abs = a;
-+            }
-+        }
-+        if (piv_abs <= 1.0e-20f || !std::isfinite(piv_abs))
-+            ERROR(("dense_direct encountered singular/non-finite pivot at row %d", krow));
-+        if (piv != krow)
-+        {
-+            for (int c = krow; c < nunk; ++c)
-+                std::swap(A[(size_t)krow * nunk + c], A[(size_t)piv * nunk + c]);
-+            std::swap(b[(size_t)krow], b[(size_t)piv]);
-+        }
-+        const std::complex<float> pivot = A[(size_t)krow * nunk + krow];
-+        for (int r = krow + 1; r < nunk; ++r)
-+        {
-+            const std::complex<float> factor = A[(size_t)r * nunk + krow] / pivot;
-+            if (std::abs(factor) == 0.0f)
++#pragma omp critical(sewave_shot_skip_log)
++                {
++                    INFO(("image shot %d skipped: source position outside velocity model (shot_x=%g shot_z=%g, ix=%d iz=%d, valid ix=0-%d iz=0-%d)",
++                          is, sx, p.sz, six0, siz0, vel.nx - 1, vel.nz - 1));
++                }
 +                continue;
-+            A[(size_t)r * nunk + krow] = 0.0f;
-+            for (int c = krow + 1; c < nunk; ++c)
-+                A[(size_t)r * nunk + c] -= factor * A[(size_t)krow * nunk + c];
-+            b[(size_t)r] -= factor * b[(size_t)krow];
-+        }
-+    }
-+
-+    std::vector<std::complex<float>> x((size_t)nunk);
-+    for (int r = nunk - 1; r >= 0; --r)
-+    {
-+        std::complex<float> sum = b[(size_t)r];
-+        for (int c = r + 1; c < nunk; ++c)
-+            sum -= A[(size_t)r * nunk + c] * x[(size_t)c];
-+        x[(size_t)r] = sum / A[(size_t)r * nunk + r];
-+    }
-+    for (int iz = 1; iz < nzl - 1; ++iz)
-+        for (int ix = 1; ix < nx - 1; ++ix)
-+            u[(size_t)iz][ix] = x[(size_t)uid(iz, ix)];
-+    INFO(("Helmholtz dense_direct layer solve completed with %d unknowns", nunk));
-+    return u;
-+}
-+
-+int main(int argc, char *argv[])
-+{
-+    se_par_init(argc, argv);
-+
-+    if (!se_have_par("model"))
-+        ERROR(("Need model= 2-D velocity SEP file"));
-+    if (!se_have_par("in"))
-+        ERROR(("Need in= boundary wavefield SEP file from layer_kirchhoff_test"));
-+    if (!se_have_par("out"))
-+        ERROR(("Need out= complete wavefield SEP file"));
-+    if (!se_have_par("depths") && !se_have_par("depth_indices"))
-+        ERROR(("Need depths= boundary depths or depth_indices= boundary z sample indices matching in.n3"));
-+    if (!se_have_par("freq"))
-+        ERROR(("Need freq= frequency in Hz"));
-+
-+    const char *model_f = se_get_par_str("model");
-+    const char *in_f = se_get_par_str("in");
-+    const char *out_f = se_get_par_str("out");
-+    const float freq = se_get_par_float("freq");
-+    const int sponge_n = se_have_par("sponge") ? se_get_par_int("sponge") : 0;
-+    const float sponge_strength = se_have_par("sponge_strength") ? se_get_par_float("sponge_strength") : 0.0f;
-+    const float helmholtz_damping = se_have_par("helmholtz_damping") ? se_get_par_float("helmholtz_damping") : 0.0f;
-+    const int max_dense_unknowns = se_have_par("max_dense_unknowns") ? se_get_par_int("max_dense_unknowns") : 20000;
-+
-+    std::vector<float> depths;
-+    if (se_have_par("depths"))
-+        depths = read_depths_param();
-+
-+    sep_t *model = sep_open(model_f, SEP_READ, 0);
-+    sep_t *bound = sep_open(in_f, SEP_READ, 0);
-+    sep_t *out = sep_open(out_f, SEP_WRITE, 0);
-+
-+    if (model->headers->ndim < 2)
-+        ERROR(("model= must be a 2-D velocity model with n1=z and n2=x."));
-+    if (bound->headers->ndim < 3 || bound->headers->n[0] != 2)
-+        ERROR(("in= must have n1=2(real/imag), n2=nx, n3=number of boundary depths."));
-+
-+    const int nz = model->headers->n[0];
-+    const int nx = model->headers->n[1];
-+    const float oz = (float)model->headers->o[0];
-+    const float dz = (float)model->headers->d[0];
-+    const float ox = (float)model->headers->o[1];
-+    const float dx = (float)model->headers->d[1];
-+    if (nx != bound->headers->n[1])
-+        ERROR(("model n2=%d does not match boundary n2=%d", nx, bound->headers->n[1]));
-+    std::vector<Boundary> bnd;
-+    if (se_have_par("depth_indices"))
-+    {
-+        int nidx = 0;
-+        int32_t *idx_array = se_get_pararray_int("depth_indices", &nidx);
-+        if (idx_array == NULL || nidx <= 0)
-+            ERROR(("No valid indices parsed from depth_indices=."));
-+        std::vector<int> indices(idx_array, idx_array + nidx);
-+        free1int(idx_array);
-+        std::sort(indices.begin(), indices.end());
-+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-+        if ((int)indices.size() != bound->headers->n[2] && (int)indices.size() + 1 != bound->headers->n[2])
-+            ERROR(("depth index count %zu must match boundary n3=%d, or be one smaller when the boundary file includes the model top", indices.size(), bound->headers->n[2]));
-+        if ((int)indices.size() + 1 == bound->headers->n[2])
-+            bnd.push_back({0, oz});
-+        for (int iz : indices)
-+        {
-+            if (iz < 0 || iz >= nz)
-+                ERROR(("Boundary depth index %d outside model range 0..%d", iz, nz - 1));
-+            if (!bnd.empty() && iz <= bnd.back().iz)
-+                ERROR(("Boundary depth indices must be strictly increasing."));
-+            bnd.push_back({iz, oz + iz * dz});
-+        }
-+    }
-+    else
-+    {
-+        if (depths.size() < 2)
-+            ERROR(("Need at least two boundary depths to fill a layer."));
-+        if ((int)depths.size() != bound->headers->n[2] && (int)depths.size() + 1 != bound->headers->n[2])
-+            ERROR(("depth count %zu must match boundary n3=%d, or be one smaller when the boundary file includes the model top", depths.size(), bound->headers->n[2]));
-+
-+        std::vector<float> boundary_depths;
-+        boundary_depths.reserve((size_t)bound->headers->n[2]);
-+        if ((int)depths.size() + 1 == bound->headers->n[2])
-+            boundary_depths.push_back(oz);
-+        boundary_depths.insert(boundary_depths.end(), depths.begin(), depths.end());
-+        for (float z : boundary_depths)
-+        {
-+            int iz = (int)std::floor((z - oz) / dz + 0.5f);
-+            if (iz < 0 || iz >= nz)
-+                ERROR(("Boundary depth %g maps to iz=%d outside model range 0..%d", z, iz, nz - 1));
-+            if (!bnd.empty() && iz <= bnd.back().iz)
-+                ERROR(("Boundary depths must be strictly increasing after mapping to samples."));
-+            bnd.push_back({iz, oz + iz * dz});
-+        }
-+    }
-+
-+    std::vector<float> vel((size_t)nz * (size_t)nx);
-+    se_fsio_read_float(model->data->io, vel.data(), vel.size());
-+
-+    std::vector<float> raw_bound((size_t)2 * (size_t)nx * bnd.size());
-+    se_fsio_read_float(bound->data->io, raw_bound.data(), raw_bound.size());
-+
-+    std::vector<std::vector<std::complex<float>>> boundary_fields(bnd.size(), std::vector<std::complex<float>>(nx));
-+    for (size_t ib = 0; ib < bnd.size(); ++ib)
-+    {
-+        const size_t base = ib * (size_t)2 * (size_t)nx;
-+        for (int ix = 0; ix < nx; ++ix)
-+            boundary_fields[ib][ix] = std::complex<float>(raw_bound[base + (size_t)2 * ix],
-+                                                          raw_bound[base + (size_t)2 * ix + 1]);
-+    }
-+
-+    std::vector<float> sponge(nx, 1.0f);
-+    for (int ix = 0; ix < nx; ++ix)
-+        sponge[ix] = sponge_weight(ix, nx, sponge_n, sponge_strength);
-+
-+    const int iz0 = bnd.front().iz;
-+    const int iz1 = bnd.back().iz;
-+    const int nzout = iz1 - iz0 + 1;
-+    out->headers->ndim = 3;
-+    out->headers->n[0] = 2;
-+    out->headers->n[1] = nx;
-+    out->headers->n[2] = nzout;
-+    out->headers->d[0] = 1.0;
-+    out->headers->d[1] = dx;
-+    out->headers->d[2] = dz;
-+    out->headers->o[0] = 0.0;
-+    out->headers->o[1] = ox;
-+    out->headers->o[2] = oz + iz0 * dz;
-+
-+    std::vector<float> row((size_t)2 * (size_t)nx);
-+    const float omega = 2.0f * (float)M_PI * freq;
-+    for (size_t il = 0; il + 1 < bnd.size(); ++il)
-+    {
-+        const int top = bnd[il].iz;
-+        const int bot = bnd[il + 1].iz;
-+        std::vector<std::vector<std::complex<float>>> layer_field =
-+            solve_helmholtz_layer(vel, nz, nx, top, bot, dx, dz, omega,
-+                                  sponge_n, sponge_strength, helmholtz_damping, max_dense_unknowns,
-+                                  boundary_fields[il], boundary_fields[il + 1]);
-+
-+        const int first_local = (il == 0) ? 0 : 1;
-+        for (int loc = first_local; loc <= bot - top; ++loc)
-+        {
-+            for (int ix = 0; ix < nx; ++ix)
-+            {
-+                const std::complex<float> &u = layer_field[(size_t)loc][ix];
-+                row[(size_t)2 * ix] = u.real();
-+                row[(size_t)2 * ix + 1] = u.imag();
 +            }
-+            se_fsio_write_float(out->data->io, row.data(), row.size());
-+        }
-+        INFO(("Filled layer %zu between depth=%g and depth=%g", il + 1, bnd[il].z, bnd[il + 1].z));
-+    }
-+
-+    sep_close(model);
-+    sep_close(bound);
-+    sep_close(out);
-+    se_par_destroy();
-+    return 0;
-+}
-diff --git a/src/layered_frequency_wavefield.cpp b/src/layered_frequency_wavefield.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..5db65d30b77ff36eca4824680c04af45b7a5ec67
---- /dev/null
-+++ b/src/layered_frequency_wavefield.cpp
-@@ -0,0 +1,531 @@
-+#include <SEBASIC/include/se_basic.h>
-+#include <SEFILESYSTEM/include/se_fs.h>
-+#include <SERECKIRCH/include/se_reckirch.h>
-+
-+#include <algorithm>
-+#include <cmath>
-+#include <complex>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <fstream>
-+#include <sstream>
-+#include <string>
-+#include <vector>
-+
-+#include <fftw3.h>
-+
-+#ifndef M_PI
-+#define M_PI 3.14159265358979323846
-+#endif
-+
-+struct Boundary { int iz; float z; };
-+
-+static std::vector<float> parse_float_list(const char *text)
-+{
-+    std::vector<float> vals;
-+    if (text == NULL) return vals;
-+    std::string s(text);
-+    std::replace(s.begin(), s.end(), ',', ' ');
-+    std::stringstream ss(s);
-+    float v;
-+    while (ss >> v) vals.push_back(v);
-+    return vals;
-+}
-+
-+static int clamp_index(int i, int n)
-+{
-+    return std::max(0, std::min(n - 1, i));
-+}
-+
-+static float velocity_at(const std::vector<float> &vel, int nz, int nx, int iz, int ix)
-+{
-+    iz = clamp_index(iz, nz);
-+    ix = clamp_index(ix, nx);
-+    const float v = vel[(size_t)ix * (size_t)nz + (size_t)iz];
-+    if (!(v > 0.0f) || !std::isfinite(v))
-+        ERROR(("Invalid velocity sample at iz=%d ix=%d", iz, ix));
-+    return v;
-+}
-+
-+static void build_tau_fmm(const std::vector<float> &vel, int nz, int nx,
-+                          float dz, float dx,
-+                          int iz_top, int iz_out, std::vector<float> &tau)
-+{
-+    if (iz_out < iz_top)
-+        ERROR(("FMM tau requires iz_out >= iz_top"));
-+    const int nzl = iz_out - iz_top + 1;
-+    tau.assign((size_t)nx * (size_t)nx, 0.0f);
-+
-+    std::vector<float> subvel((size_t)nx * (size_t)nzl);
-+    for (int iz = 0; iz < nzl; ++iz)
-+        for (int ix = 0; ix < nx; ++ix)
-+            subvel[(size_t)ix + (size_t)iz * (size_t)nx] = velocity_at(vel, nz, nx, iz_top + iz, ix);
-+
-+    std::vector<float> tt((size_t)nx * (size_t)nzl);
-+    for (int ix_src = 0; ix_src < nx; ++ix_src)
-+    {
-+        efmm_t ctx;
-+        if (efmm_init(&ctx, nx, nzl, dx, dz, ix_src * dx, 0.0f) != 0)
-+            ERROR(("efmm_init failed for source ix=%d", ix_src));
-+        if (efmm_set_vel(&ctx, subvel.data()) != 0 || efmm_solver(&ctx) != 0)
+             std::vector<float> local((size_t)vel.nx * vel.nz, 0.0f);
+             std::vector<float> src(data.nt), shot((size_t)(e.nx - 2 * e.nbc) * data.nt, 0.0f), snaps;
+             if (p.in_memory_snapshots)
+                 snaps.resize((size_t)stored_snaps * e.nx * e.nz);
+             std::string snap_path, rec_snap_path;
+             FILE *snap_tmp = p.in_memory_snapshots ? nullptr : open_snapshot_temp(is, snap_path);
+             FILE *rec_snap_tmp = open_snapshot_temp(is, rec_snap_path);
+             char src_label[80], rec_label[80];
+             std::snprintf(src_label, sizeof(src_label), "image source shot %d", is);
+             std::snprintf(rec_label, sizeof(rec_label), "image receiver shot %d", is);
+             for (int it = 0; it < data.nt; ++it)
+                 src[it] = ricker(it * data.dt, p.fdom);
+-            float sx = data.s0 + is * data.ds;
+-            int six = xindex(vel, sx) + e.nbc, siz = zindex(vel, p.sz) + e.nbc;
++            int six = six0 + e.nbc, siz = siz0 + e.nbc;
+             if (p.flag_homo)
+                 apply_homo(e, six, siz);
+-            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
++            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
+                       snapshot_interval, src_snapshot_offset, snapshot_interval, src_snapshot_offset,
+                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "src", is);
+             int skipped_receivers = 0;
+             for (int ir = 0; ir < data.nr; ++ir)
+             {
+                 float rx = p.cmp ? sx + data.r0 + ir * data.dr : data.r0 + ir * data.dr;
+                 int ix = xindex_unclamped(vel, rx);
+                 if (ix < 0 || ix >= vel.nx)
+                 {
+                     ++skipped_receivers;
+                     continue;
+                 }
+                 for (int it = 0; it < data.nt; ++it)
+                     shot[(size_t)ix * data.nt + it] += data.d[((size_t)is * data.nr + ir) * data.nt + it];
+             }
+             if (skipped_receivers > 0)
+                 INFO(("image shot %d: skipped %d receivers outside velocity model", is, skipped_receivers));
+             if (!p.debug_wavefield_prefix.empty())
+                 report_gather_energy(shot, e.nx - 2 * e.nbc, data.nt, is, p.debug_wavefield_prefix, vel.x0, vel.dx, data.dt);
+-            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
++            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
+                       snapshot_interval, rec_snapshot_offset, snapshot_interval, src_snapshot_offset,
+                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "rec", is);
+             correlate_snapshots(e, data.nt, snapshot_interval, src_snapshot_offset, rec_snapshot_offset, p.in_memory_snapshots ? &snaps : nullptr, snap_tmp, rec_snap_tmp, local);
+             if (rec_snap_tmp)
+             {
+                 std::fclose(rec_snap_tmp);
+                 if (!rec_snap_path.empty())
+                     ::unlink(rec_snap_path.c_str());
+             }
+             if (snap_tmp)
+             {
+                 std::fclose(snap_tmp);
+                 if (!snap_path.empty())
+                     ::unlink(snap_path.c_str());
+             }
+-#pragma omp critical(sewave_image_stack)
++            std::string shot_img_path = shot_image_path(is);
++#pragma omp critical(sewave_shot_image_write)
+             {
+-                for (size_t i = 0; i < image.size(); ++i)
+-                    image[i] += local[i];
++                write_shot_image_rsf(shot_img_path, vel, local, is, sx, p.sz);
++                shot_imaged[is] = 1;
++                INFO(("Wrote per-shot image %s with shot_x=%g shot_z=%g", shot_img_path.c_str(), sx, p.sz));
+             }
+         }
++        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
++        int stacked_shots = 0;
++        for (int is = shot0; is <= shot1; ++is)
 +        {
-+            efmm_free(&ctx);
-+            ERROR(("efmm_solver failed for source ix=%d", ix_src));
++            if (!shot_imaged[is])
++                continue;
++            std::string shot_img_path = shot_image_path(is);
++            Grid2D shot_img = read_rsf2d(shot_img_path);
++            check_same_grid(vel, shot_img, shot_img_path.c_str());
++            for (size_t i = 0; i < image.size(); ++i)
++                image[i] += shot_img.v[i];
++            ++stacked_shots;
 +        }
-+        std::copy(ctx.tt, ctx.tt + (size_t)nx * (size_t)nzl, tt.begin());
-+        efmm_free(&ctx);
-+
-+        for (int ix_out = 0; ix_out < nx; ++ix_out)
-+            tau[(size_t)ix_out * (size_t)nx + (size_t)ix_src] = tt[(size_t)ix_out + (size_t)(nzl - 1) * (size_t)nx];
-+    }
++        if (stacked_shots == 0)
++            INFO(("image shot stack: no shots were inside the velocity model; returning zero image"));
++        else if (stacked_shots < shot1 - shot0 + 1)
++            INFO(("image shot stack: stacked %d/%d shots; skipped %d shots outside the velocity model",
++                  stacked_shots, shot1 - shot0 + 1, shot1 - shot0 + 1 - stacked_shots));
+         return image;
+     }
+ } // namespace sewave
+diff --git a/SEWAVE/sewave2d.h b/SEWAVE/sewave2d.h
+index 07ffb8caa959af7276344798cbcdc94ea0950f27..c4b28ea7468d63890e7aeb891a5c0903e5edcf3d 100644
+--- a/SEWAVE/sewave2d.h
++++ b/SEWAVE/sewave2d.h
+@@ -1,22 +1,22 @@
+ #ifndef SEWAVE2D_H
+ #define SEWAVE2D_H
+ 
+ #include <string>
+ #include <vector>
+ 
+ namespace sewave {
+ 
+ struct Grid2D { int nz=0,nx=0; float dz=1,dx=1,z0=0,x0=0; std::vector<float> v; };
+ struct Data3D { int nt=0,nr=0,ns=0; float dt=0.001f,dr=1,ds=1,t0=0,r0=0,s0=0; std::vector<float> d; };
+-struct ForwardParams { float dt=0.001f; int nt=1000; float fdom=20; float sx=0, sz=0; float rz=0; int nr=0; float r0=0, dr=1; int ns=1; float ds=0; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; int type=1; bool visco=false; float q=1000; float f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; };
+-struct ImageParams { bool cmp=true; bool compensate=false; int type=1; bool visco=false; float q=1000; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; float sz=0, rz=0; int shot_begin=0, shot_end=-1; int amp_compensation_sign=-1; float fdom=20, f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; int max_parallel_shots=1; bool in_memory_snapshots=false; int snapshot_interval=1; std::vector<int> debug_snapshot_steps; std::string debug_wavefield_prefix; };
++struct ForwardParams { float dt=0.001f; int nt=1000; float fdom=20; float sx=0, sz=0; float rz=0; int nr=0; float r0=0, dr=1; int ns=1; float ds=0; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; int type=0; bool visco=false; float q=1000; float f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; };
++struct ImageParams { bool cmp=true; bool compensate=false; int type=0; bool visco=false; float q=1000; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; float sz=0, rz=0; int shot_begin=0, shot_end=-1; int amp_compensation_sign=1; float fdom=20, f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; int max_parallel_shots=1; bool in_memory_snapshots=false; int snapshot_interval=1; std::vector<int> debug_snapshot_steps; std::string debug_wavefield_prefix; };
+ 
+ Grid2D read_rsf2d(const std::string& path);
+ Data3D read_rsf3d(const std::string& path);
+ void write_rsf2d(const std::string& path, const Grid2D& g, const std::vector<float>& data, const char* label="Amplitude");
+ void write_rsf3d(const std::string& path, const Data3D& d);
+ Data3D forward(const Grid2D& vel, const ForwardParams& p, const Grid2D* qmodel=nullptr);
+ std::vector<float> rtm_image(const Grid2D& vel, const Data3D& data, const ImageParams& p, const Grid2D* qmodel=nullptr);
+ 
+ } // namespace sewave
+ #endif
+diff --git a/src/sewave2d_app.cpp b/src/sewave2d_app.cpp
+index 32ab6e8acc70f9bb7dda24369072c6f7bbbf151d..c90e57acda58b3ab6dbfba1fa04fe95b864086cc 100644
+--- a/src/sewave2d_app.cpp
++++ b/src/sewave2d_app.cpp
+@@ -15,96 +15,101 @@
+ namespace {
+ void print_usage(const char* prog) {
+     const char* name = (prog && prog[0]) ? prog : "sewave2d";
+     std::printf(
+         "Usage:\n"
+         "  %s mode=forward velocity=vel.rsf output=data.rsf [forward parameters]\n"
+         "  %s mode=image velocity=vel.rsf seismic_data=data.rsf migration=image.rsf [imaging parameters]\n"
+         "\n"
+         "Required parameters:\n"
+         "  mode=forward|image          Run synthetic modeling or RTM imaging. Default: forward.\n"
+         "  velocity=FILE              2D RSF velocity model.\n"
+         "  output=FILE                Forward-mode output seismic RSF.\n"
+         "  seismic_data=FILE          Image-mode input seismic RSF.\n"
+         "  migration=FILE             Image-mode output RTM image RSF.\n"
+         "\n"
+         "Common wave-equation parameters:\n"
+         "  dt=FLOAT                   Time step for forward modeling. Default: 0.001.\n"
+         "  nt=INT                     Number of time samples for forward modeling. Default: 1000.\n"
+         "  fdom=FLOAT                 Ricker dominant frequency. Default: 20.\n"
+         "  sz=FLOAT                   Source depth. Default: velocity z origin.\n"
+         "  rz=FLOAT                   Receiver depth. Default: sz.\n"
+         "  nbc=INT                    Absorbing boundary cells. Default: 100.\n"
+         "  L=INT                      Absorbing boundary taper length. Default: 30.\n"
+         "  alpha=FLOAT                Absorbing boundary strength. Default: 1.\n"
+         "  type_compute_Laplace=0|1   Laplacian method: 0=FD8, 1=pseudospectral. Default: 1.\n"
+-        "  type=INT                   Propagator type; type=1 uses Q/visco path. Default: 1.\n"
+-        "  visco=0|1                  Enable visco-acoustic mode. Default: 0.\n"
+-        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1 or type=1.\n"
+-        "  q=FLOAT                    Constant Q fallback/default. Default: 1000.\n"
++        "  visco=0|1                  Wave mode: 0=acoustic, 1=visco-acoustic/Q path. Default: 0.\n"
++        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1.\n"
++        "  f0=FLOAT                   Reference frequency for visco mode. Default: fdom.\n"
++        "  Omega0=FLOAT               Reference angular frequency override. Default: 2*pi*f0.\n"
++        "  fc=FLOAT order=INT         Wavenumber filter cutoff/order. Defaults: 120, 2.\n"
+         "  flag_smooth=0|1            Smooth extended velocity/Q model. Default: 1.\n"
+         "  flag_homo=0|1              Use homogeneous model at source velocity. Default: 0.\n"
+         "  progress_interval=INT      Print propagation progress every INT steps.\n"
+         "\n"
+         "Forward parameters:\n"
+         "  sx=FLOAT                   First shot x coordinate. Default: model center.\n"
+         "  ns=INT                     Number of shots. Default: 1.\n"
+         "  ds=FLOAT                   Shot x spacing. Default: 0.\n"
+         "  nr=INT r0=FLOAT dr=FLOAT   Receiver count/origin/spacing; receiver output uses model x grid.\n"
+         "\n"
+         "Image parameters:\n"
+         "  cmp=0|1                    Treat receiver axis as offset from shot when 1. Default: 1.\n"
+         "  shot_begin=INT             First shot index to image, zero-based. Alias: first_shot. Default: 0.\n"
+         "  shot_end=INT               Last shot index to image, zero-based. Alias: last_shot. Default: last input shot.\n"
+         "  max_parallel_shots=INT     Maximum shots imaged concurrently. Aliases: parallel_shots, omp_shots. Default: 1.\n"
+         "  in_memory_snapshots=0|1    Store source snapshots in memory instead of temp_img files. Default: 0.\n"
+         "  snapshot_interval=INT      Store and correlate one RTM wavefield snapshot every INT time steps. Alias: snapshot_stride. Default: 1.\n"
+         "  max_nt=INT                 Truncate input data time samples before imaging.\n"
+         "  resample_dt=FLOAT          Resample input data in time before imaging.\n"
+-        "  compensate=0|1             Enable Q-compensation sign default. Default: 0.\n"
+-        "  amp_compensation_sign=-1|1  -1=Q compensation, 1=Q attenuation.\n"
++        "  compensate=0|1             Enable RTM Q compensation: 0=attenuation/no compensation, 1=Q compensation. Default: 0.\n"
+         "  debug_wavefield_prefix=STR Write selected debug wavefields/gathers with this prefix.\n"
+         "  debug_snapshot_steps=LIST  Comma-separated or array time-step list for debug snapshots.\n"
+         "\n"
+         "Examples:\n"
+         "  %s mode=forward velocity=vel.rsf qfile=q.rsf output=data.rsf nt=2000 dt=0.001 sx=0 ns=10 ds=25\n"
+         "  %s mode=image velocity=vel.rsf qfile=q.rsf seismic_data=data.rsf migration=img.rsf shot_begin=0 shot_end=9 snapshot_interval=5\n",
+         name, name, name, name);
+ }
+ 
+ void truncate_nt(sewave::Data3D& d, int max_nt) {
+     if (max_nt <= 0 || max_nt >= d.nt) return;
+     std::vector<float> out((size_t)d.ns * d.nr * max_nt, 0.0f);
+     for (int is = 0; is < d.ns; ++is)
+         for (int ir = 0; ir < d.nr; ++ir)
+             std::copy_n(&d.d[((size_t)is * d.nr + ir) * d.nt], max_nt,
+                         &out[((size_t)is * d.nr + ir) * max_nt]);
+     d.nt = max_nt;
+     d.d.swap(out);
+ }
++const char* laplace_name(int type_laplace) {
++    return type_laplace == 1 ? "pseudospectral" : "FD8";
 +}
-+
-+static void write_tau_file(const std::string &hdr, const std::vector<float> &tau,
-+                           int nx, float ox, float dx, int layer, int iz_top, int iz_bot,
-+                           float z_top, float z_bot)
-+{
-+    const std::string data = hdr + "@";
-+    FILE *fp = std::fopen(data.c_str(), "wb");
-+    if (!fp) ERROR(("Cannot open tau data file %s", data.c_str()));
-+    if (std::fwrite(tau.data(), sizeof(float), tau.size(), fp) != tau.size())
-+        ERROR(("Failed to write tau data %s", data.c_str()));
-+    std::fclose(fp);
-+    std::ofstream h(hdr.c_str());
-+    h << "n1=" << nx << " o1=" << ox << " d1=" << dx << "\n";
-+    h << "n2=" << nx << " o2=" << ox << " d2=" << dx << "\n";
-+    h << "esize=4 data_format=native_float in=\"" << data << "\"\n";
-+    h << "layer=" << layer << " iz_top=" << iz_top << " iz_bot=" << iz_bot
-+      << " z_top=" << z_top << " z_bot=" << z_bot << "\n";
+ 
+-
++double effective_omega0(float f0, float Omega0) {
++    return Omega0 > 0.0f ? Omega0 : 2.0 * M_PI * f0;
 +}
-+
-+static std::string freq_tag(float freq)
-+{
-+    char buf[64];
-+    std::snprintf(buf, sizeof(buf), "%g", freq);
-+    std::string s(buf);
-+    for (char &c : s)
-+        if (c == '.' || c == '-' || c == '+') c = '_';
-+    return s;
-+}
-+
-+static void write_complex_boundary_file(const std::string &hdr,
-+                                        const std::vector<std::complex<float>> &field,
-+                                        int nx, float ox, float dx, float z,
-+                                        float freq, int layer)
-+{
-+    const std::string real_data = hdr + ".real";
-+    const std::string imag_data = hdr + ".imag";
-+    FILE *fr = std::fopen(real_data.c_str(), "wb");
-+    FILE *fi = std::fopen(imag_data.c_str(), "wb");
-+    if (!fr || !fi) ERROR(("Cannot open split boundary data files for %s", hdr.c_str()));
-+    std::vector<float> real_row((size_t)nx), imag_row((size_t)nx);
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        real_row[(size_t)ix] = field[ix].real();
-+        imag_row[(size_t)ix] = field[ix].imag();
-+    }
-+    if (std::fwrite(real_row.data(), sizeof(float), real_row.size(), fr) != real_row.size() ||
-+        std::fwrite(imag_row.data(), sizeof(float), imag_row.size(), fi) != imag_row.size())
-+        ERROR(("Failed to write split boundary data %s", hdr.c_str()));
-+    std::fclose(fr);
-+    std::fclose(fi);
-+    std::ofstream h(hdr.c_str());
-+    h << "n1=" << nx << " o1=" << ox << " d1=" << dx << "\n";
-+    h << "esize=4 data_format=native_float complex_storage=split_float in_real=\"" << real_data << "\" in_imag=\"" << imag_data << "\"\n";
-+    h << "freq=" << freq << " layer=" << layer << " z=" << z << "\n";
-+}
-+
-+static void write_complex_block_file(const std::string &hdr,
-+                                     const std::vector<std::vector<std::complex<float>>> &block,
-+                                     int nx, float ox, float dx, float z0, float dz,
-+                                     float freq, int layer)
-+{
-+    const int nzl = (int)block.size();
-+    const std::string real_data = hdr + ".real";
-+    const std::string imag_data = hdr + ".imag";
-+    FILE *fr = std::fopen(real_data.c_str(), "wb");
-+    FILE *fi = std::fopen(imag_data.c_str(), "wb");
-+    if (!fr || !fi) ERROR(("Cannot open split block data files for %s", hdr.c_str()));
-+    std::vector<float> real_col((size_t)nzl), imag_col((size_t)nzl);
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        for (int iz = 0; iz < nzl; ++iz)
-+        {
-+            real_col[(size_t)iz] = block[(size_t)iz][ix].real();
-+            imag_col[(size_t)iz] = block[(size_t)iz][ix].imag();
-+        }
-+        if (std::fwrite(real_col.data(), sizeof(float), real_col.size(), fr) != real_col.size() ||
-+            std::fwrite(imag_col.data(), sizeof(float), imag_col.size(), fi) != imag_col.size())
-+            ERROR(("Failed to write split block data %s", hdr.c_str()));
-+    }
-+    std::fclose(fr);
-+    std::fclose(fi);
-+    std::ofstream h(hdr.c_str());
-+    h << "n1=" << nzl << " o1=" << z0 << " d1=" << dz << "\n";
-+    h << "n2=" << nx << " o2=" << ox << " d2=" << dx << "\n";
-+    h << "esize=4 data_format=native_float complex_storage=split_float in_real=\"" << real_data << "\" in_imag=\"" << imag_data << "\"\n";
-+    h << "freq=" << freq << " layer=" << layer << "\n";
-+}
-+
-+static float taper_weight(int left, int i, int right, int tap)
-+{
-+    if (tap <= 0) return 1.0f;
-+    float coef = 1.0f;
-+    coef *= (i - left >= tap) ? 1.0f : (float)(i - left) / (float)tap;
-+    coef *= (right - i >= tap) ? 1.0f : (float)(right - i) / (float)tap;
-+    return coef;
-+}
-+
-+static void build_kirdat_filter_F(float tau, float dt, int nsam, std::vector<float> &F)
-+{
-+    F.assign((size_t)std::max(0, nsam - 1), 0.0f);
-+    if (tau <= 0.0f || nsam <= 1) return;
-+    float prev2 = 0.0f;
-+    float prev1 = std::sqrt(((tau + dt) / tau) * ((tau + dt) / tau) - 1.0f);
-+    F[0] = prev1 - prev2;
-+    for (int k = 1; k < nsam - 1; ++k)
-+    {
-+        const float t = (tau + (float)(k + 1) * dt) / tau;
-+        const float curr = std::sqrt(t * t - 1.0f);
-+        F[(size_t)k] = curr - 2.0f * prev1 + prev2;
-+        prev2 = prev1;
-+        prev1 = curr;
-+    }
-+}
-+
-+static std::complex<float> kirdat_frequency_filter(float tau, float omega, float dt, int nsam)
-+{
-+    if (tau <= 0.0f || !std::isfinite(tau)) return std::complex<float>(0.0f, 0.0f);
-+    std::vector<float> F;
-+    build_kirdat_filter_F(tau, dt, nsam, F);
-+    const float q = tau / dt;
-+    const int m = (int)std::ceil(q);
-+    const float delta = (float)m - q;
-+    std::complex<float> sum(0.0f, 0.0f);
-+    for (int k = 0; k <= nsam - 2; ++k)
-+    {
-+        const float phase = -omega * dt * (float)k;
-+        sum += (F[(size_t)k] / dt) * std::complex<float>(std::cos(phase), std::sin(phase));
-+    }
-+    const std::complex<float> e_m(std::cos(-omega * dt * (float)m), std::sin(-omega * dt * (float)m));
-+    const std::complex<float> e_m1(std::cos(-omega * dt * (float)(m - 1)), std::sin(-omega * dt * (float)(m - 1)));
-+    return ((1.0f - delta) * e_m + delta * e_m1) * sum;
-+}
-+
-+static std::complex<float> kirdat_matrix_value(float tau, int ix_out, int ix_in, int nx,
-+                                                float dx, float datum, float omega,
-+                                                float dt, int nsam, int aperture, int taper,
-+                                                bool bf_amplitude)
-+{
-+    if (tau <= 0.0f || !std::isfinite(tau)) return std::complex<float>(0.0f, 0.0f);
-+    const int left = std::max(0, ix_out - aperture);
-+    const int right = std::min(nx - 1, ix_out + aperture);
-+    if (ix_in < left || ix_in > right) return std::complex<float>(0.0f, 0.0f);
-+    const float coef = taper_weight(left, ix_in, right, taper);
-+    const float lateral = (float)(ix_in - ix_out) * dx;
-+    const float dist = datum * datum + lateral * lateral;
-+    if (dist <= 0.0f) return std::complex<float>(0.0f, 0.0f);
-+    const float w = coef / (float)M_PI * dx * datum * tau / dist;
-+    std::complex<float> amp = w * kirdat_frequency_filter(tau, omega, dt, nsam);
-+    if (bf_amplitude)
-+        amp *= std::complex<float>(std::cos(omega * tau), std::sin(omega * tau));
-+    return amp;
-+}
-+
-+static void apply_direct(const std::vector<float> &tau, int nx, float dx, float datum,
-+                         float omega, float dt, int nsam, int aperture, int taper,
-+                         const std::vector<std::complex<float>> &uin,
-+                         std::vector<std::complex<float>> &uout)
-+{
-+    std::fill(uout.begin(), uout.end(), std::complex<float>(0.0f, 0.0f));
-+    for (int ix_out = 0; ix_out < nx; ++ix_out)
-+    {
-+        std::complex<float> sum(0.0f, 0.0f);
-+        for (int ix_in = 0; ix_in < nx; ++ix_in)
-+        {
-+            const float t = tau[(size_t)ix_out * (size_t)nx + (size_t)ix_in];
-+            sum += kirdat_matrix_value(t, ix_out, ix_in, nx, dx, datum, omega, dt, nsam, aperture, taper, false) * uin[ix_in];
-+        }
-+        uout[ix_out] = sum;
-+    }
-+}
-+
-+static float ricker_spectrum(float freq, float fpeak)
-+{
-+    if (fpeak <= 0.0f) return 1.0f;
-+    const float a = freq / fpeak;
-+    return a * a * std::exp(-a * a);
-+}
-+
-+static void source_boundary(int nx, float ox, float dx, float z, float srcx, float srcz,
-+                            float freq, float vref, float fpeak,
-+                            std::vector<std::complex<float>> &u)
-+{
-+    const float omega = 2.0f * (float)M_PI * freq;
-+    const float amp = ricker_spectrum(freq, fpeak);
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        const float x = ox + ix * dx;
-+        const float r = std::max(std::hypot(x - srcx, z - srcz), 0.25f * std::fabs(dx));
-+        const float phase = omega * r / vref;
-+        u[ix] = amp * std::complex<float>(std::cos(phase), -std::sin(phase)) / std::sqrt(r);
-+    }
-+}
-+
-+static std::vector<std::complex<float>> data_boundary_at_freq(const std::vector<float> &data, int nt, int nx, float ot, float dt, float freq)
-+{
-+    std::vector<std::complex<float>> spec(nx, std::complex<float>(0.0f, 0.0f));
-+    const float omega = 2.0f * (float)M_PI * freq;
-+    for (int ix = 0; ix < nx; ++ix)
-+        for (int it = 0; it < nt; ++it)
-+        {
-+            const float t = ot + it * dt;
-+            const std::complex<float> e(std::cos(omega * t), -std::sin(omega * t));
-+            spec[ix] += data[(size_t)ix * (size_t)nt + it] * e * dt;
-+        }
-+    return spec;
-+}
-+
-+int main(int argc, char **argv)
-+{
-+    se_par_init(argc, argv);
-+    if (!se_have_par("model")) ERROR(("Need model= velocity SEP file"));
-+    if (!se_have_par("out")) ERROR(("Need out= output wavefield SEP file"));
-+    if (!se_have_par("tau_prefix")) ERROR(("Need tau_prefix= prefix for tau check files"));
-+    if (!se_have_par("nlayer")) ERROR(("Need nlayer= number of uniform layers"));
-+    if (!se_have_par("freqs")) ERROR(("Need freqs= comma-separated frequencies"));
-+
-+    const char *model_f = se_get_par_str("model");
-+    const char *out_f = se_get_par_str("out");
-+    const std::string tau_prefix = se_get_par_str("tau_prefix");
-+    const std::string boundary_prefix = se_have_par("boundary_prefix") ? se_get_par_str("boundary_prefix") : std::string(out_f) + "_boundary";
-+    const std::string block_prefix = se_have_par("block_prefix") ? se_get_par_str("block_prefix") : std::string(out_f) + "_block";
-+    const std::string out_real_f = se_have_par("out_real") ? se_get_par_str("out_real") : std::string(out_f) + ".real";
-+    const std::string out_imag_f = se_have_par("out_imag") ? se_get_par_str("out_imag") : std::string(out_f) + ".imag";
-+    const int nlayer = se_get_par_int("nlayer");
-+    const std::string mode = se_have_par("mode") ? se_get_par_str("mode") : "source";
-+    const int use_bf = se_have_par("use_bf") ? se_get_par_int("use_bf") : 1;
-+    const int bf_p = se_have_par("bf_p") ? se_get_par_int("bf_p") : 12;
-+    const int bf_leaf = se_have_par("bf_n_leaf") ? se_get_par_int("bf_n_leaf") : 16;
-+    const int bf_panel_levels = se_have_par("bf_panel_levels") ? se_get_par_int("bf_panel_levels") : 1;
-+    const float bf_amp_eps = se_have_par("bf_amp_eps") ? se_get_par_float("bf_amp_eps") : 1.0e-20f;
-+    const float bf_phase_tol = se_have_par("bf_phase_tol") ? se_get_par_float("bf_phase_tol") : 2.0f;
-+    const float kirdat_dt = se_have_par("dt") ? se_get_par_float("dt") : 0.001f;
-+    const float kirdat_length = se_have_par("length") ? se_get_par_float("length") : 0.025f;
-+    const int taper = se_have_par("taper") ? se_get_par_int("taper") : 10;
-+    int nfreq = 0;
-+    float *freq_array = se_get_pararray_float("freqs", &nfreq);
-+    std::vector<float> freqs;
-+    if (freq_array != NULL && nfreq > 0)
-+    {
-+        freqs.assign(freq_array, freq_array + nfreq);
-+        free1float(freq_array);
-+    }
-+    else
-+    {
-+        freqs = parse_float_list(se_get_par_str("freqs"));
-+    }
-+    if (nlayer <= 0) ERROR(("nlayer must be positive"));
-+    if (freqs.empty()) ERROR(("No frequencies parsed from freqs="));
-+    if (kirdat_dt <= 0.0f || kirdat_length <= 0.0f) ERROR(("dt= and length= must be positive for the kirdat frequency-domain filter"));
-+    const int nsam = (int)(kirdat_length / kirdat_dt) + 2;
-+
-+    sep_t *model = sep_open(model_f, SEP_READ, 0);
-+    sep_t *out = sep_open(out_f, SEP_WRITE, 0);
-+    if (model->headers->ndim < 2) ERROR(("model must be 2-D with n1=z,n2=x"));
-+    const int nz = model->headers->n[0];
-+    const int nx = model->headers->n[1];
-+    const float dz = (float)model->headers->d[0];
-+    const float dx = (float)model->headers->d[1];
-+    const float oz = (float)model->headers->o[0];
-+    const float ox = (float)model->headers->o[1];
-+    if (nlayer >= nz) ERROR(("nlayer=%d must be smaller than nz=%d", nlayer, nz));
-+    const int aperture = se_have_par("aperture") ? se_get_par_int("aperture") : nx;
-+
-+    std::vector<float> vel((size_t)nz * (size_t)nx);
-+    se_fsio_read_float(model->data->io, vel.data(), vel.size());
-+
-+    std::vector<Boundary> bnd;
-+    bnd.push_back({0, oz});
-+    for (int il = 1; il <= nlayer; ++il)
-+    {
-+        int iz = (int)std::llround((double)il * (double)(nz - 1) / (double)nlayer);
-+        if (iz <= bnd.back().iz) iz = bnd.back().iz + 1;
-+        if (iz > nz - 1) iz = nz - 1;
-+        bnd.push_back({iz, oz + iz * dz});
-+    }
-+    bnd.back().iz = nz - 1;
-+    bnd.back().z = oz + (nz - 1) * dz;
-+
-+    std::vector<std::vector<float>> layer_tau((size_t)nlayer);
-+    for (int il = 0; il < nlayer; ++il)
-+    {
-+        build_tau_fmm(vel, nz, nx, dz, dx, bnd[il].iz, bnd[il + 1].iz, layer_tau[il]);
-+        char name[1024];
-+        std::snprintf(name, sizeof(name), "%s_layer%03d.H", tau_prefix.c_str(), il + 1);
-+        write_tau_file(name, layer_tau[il], nx, ox, dx, il + 1, bnd[il].iz, bnd[il + 1].iz, bnd[il].z, bnd[il + 1].z);
-+        INFO(("Wrote tau for layer %d: iz %d -> %d", il + 1, bnd[il].iz, bnd[il + 1].iz));
-+    }
-+
-+    sep_t *shot = NULL;
-+    int nt = 0;
-+    float ot = 0.0f, dt = 0.0f;
-+    std::vector<float> shot_data;
-+    if (mode == "data")
-+    {
-+        if (!se_have_par("data")) ERROR(("mode=data requires data= single-shot gather"));
-+        shot = sep_open(se_get_par_str("data"), SEP_READ, 0);
-+        if (shot->headers->ndim < 2 || shot->headers->n[1] != nx)
-+            ERROR(("data must have n1=time and n2=model nx=%d", nx));
-+        nt = shot->headers->n[0];
-+        ot = (float)shot->headers->o[0];
-+        dt = (float)shot->headers->d[0];
-+        shot_data.resize((size_t)nt * (size_t)nx);
-+        se_fsio_read_float(shot->data->io, shot_data.data(), shot_data.size());
-+    }
-+
-+    out->headers->ndim = 4;
-+    out->headers->n[0] = 2;
-+    out->headers->n[1] = nx;
-+    out->headers->n[2] = nz;
-+    out->headers->n[3] = (int)freqs.size();
-+    out->headers->d[0] = 1.0;
-+    out->headers->d[1] = dx;
-+    out->headers->d[2] = dz;
-+    out->headers->d[3] = 1.0;
-+    out->headers->o[0] = 0.0;
-+    out->headers->o[1] = ox;
-+    out->headers->o[2] = oz;
-+    out->headers->o[3] = 0.0;
-+
-+    const float srcx = se_have_par("srcx") ? se_get_par_float("srcx") : ox + 0.5f * (nx - 1) * dx;
-+    const float srcz = se_have_par("srcz") ? se_get_par_float("srcz") : oz;
-+    const float vref = se_have_par("vref") ? se_get_par_float("vref") : velocity_at(vel, nz, nx, 0, nx / 2);
-+    const float fpeak = se_have_par("fpeak") ? se_get_par_float("fpeak") : 25.0f;
-+
-+    FILE *final_real = std::fopen(out_real_f.c_str(), "wb");
-+    FILE *final_imag = std::fopen(out_imag_f.c_str(), "wb");
-+    if (!final_real || !final_imag) ERROR(("Cannot open split final wavefield files %s / %s", out_real_f.c_str(), out_imag_f.c_str()));
-+
-+    std::vector<float> row((size_t)2 * (size_t)nx);
-+    std::vector<float> final_real_vol((size_t)nx * (size_t)nz), final_imag_vol((size_t)nx * (size_t)nz);
-+    auto store_final_split = [&](const std::vector<std::complex<float>> &field, int iz_global) {
-+        for (int ix = 0; ix < nx; ++ix)
-+        {
-+            final_real_vol[(size_t)ix * (size_t)nz + (size_t)iz_global] = field[ix].real();
-+            final_imag_vol[(size_t)ix * (size_t)nz + (size_t)iz_global] = field[ix].imag();
-+        }
-+    };
-+    auto flush_final_split = [&]() {
-+        if (std::fwrite(final_real_vol.data(), sizeof(float), final_real_vol.size(), final_real) != final_real_vol.size() ||
-+            std::fwrite(final_imag_vol.data(), sizeof(float), final_imag_vol.size(), final_imag) != final_imag_vol.size())
-+            ERROR(("Failed to write split final wavefield volume"));
-+    };
-+    std::vector<std::complex<float>> u_top(nx), u_bot(nx), u_z(nx);
-+    for (size_t jf = 0; jf < freqs.size(); ++jf)
-+    {
-+        const float freq = freqs[jf];
-+        const float omega = 2.0f * (float)M_PI * freq;
-+        std::fill(final_real_vol.begin(), final_real_vol.end(), 0.0f);
-+        std::fill(final_imag_vol.begin(), final_imag_vol.end(), 0.0f);
-+        if (mode == "data")
-+            u_top = data_boundary_at_freq(shot_data, nt, nx, ot, dt, freq);
-+        else if (mode == "source")
-+            source_boundary(nx, ox, dx, oz, srcx, srcz, freq, vref, fpeak, u_top);
-+        else
-+            ERROR(("Unknown mode=%s; use mode=source or mode=data", mode.c_str()));
-+
-+        {
-+            char bname[1024];
-+            std::snprintf(bname, sizeof(bname), "%s_f%s_layer%03d.H", boundary_prefix.c_str(), freq_tag(freq).c_str(), 0);
-+            write_complex_boundary_file(bname, u_top, nx, ox, dx, bnd.front().z, freq, 0);
-+        }
-+
-+        for (int il = 0; il < nlayer; ++il)
-+        {
-+            const int nzl_block = bnd[il + 1].iz - bnd[il].iz + 1;
-+            std::vector<std::vector<std::complex<float>>> block_field((size_t)nzl_block, std::vector<std::complex<float>>(nx));
-+            block_field[0] = u_top;
-+
-+            if (il == 0)
-+            {
-+                for (int ix = 0; ix < nx; ++ix) { row[2 * ix] = u_top[ix].real(); row[2 * ix + 1] = u_top[ix].imag(); }
-+                se_fsio_write_float(out->data->io, row.data(), row.size());
-+                store_final_split(u_top, bnd[il].iz);
-+            }
-+
-+            if (use_bf)
-+            {
-+                float **tau_ptr = alloc2float(nx, nx);
-+                fftwf_complex *amp = (fftwf_complex *)fftwf_malloc((size_t)nx * (size_t)nx * sizeof(fftwf_complex));
-+                fftwf_complex *bin = (fftwf_complex *)fftwf_malloc((size_t)nx * sizeof(fftwf_complex));
-+                fftwf_complex *bout = (fftwf_complex *)fftwf_malloc((size_t)nx * sizeof(fftwf_complex));
-+                if (!tau_ptr || !amp || !bin || !bout) ERROR(("Out of memory for butterfly work arrays"));
-+                for (int ix_out = 0; ix_out < nx; ++ix_out)
-+                    for (int ix_in = 0; ix_in < nx; ++ix_in)
-+                    {
-+                        const float t = layer_tau[il][(size_t)ix_out * nx + ix_in];
-+                        tau_ptr[ix_out][ix_in] = t;
-+                        const size_t k = (size_t)ix_out * nx + ix_in;
-+                        const std::complex<float> a = kirdat_matrix_value(t, ix_out, ix_in, nx, dx,
-+                                                                          std::fabs(bnd[il + 1].z - bnd[il].z),
-+                                                                          omega, kirdat_dt, nsam, aperture, taper, true);
-+                        amp[k][0] = a.real();
-+                        amp[k][1] = a.imag();
-+                    }
-+                for (int ix = 0; ix < nx; ++ix) { bin[ix][0] = u_top[ix].real(); bin[ix][1] = u_top[ix].imag(); }
-+                BFStrictSegmentedFactor *factor = bf1d_strict_segmented_create_phase_amp(nx, tau_ptr, amp, omega, bf_p, bf_leaf, bf_panel_levels, bf_amp_eps, bf_phase_tol);
-+                bf1d_strict_segmented_apply(factor, bin, bout);
-+                bf1d_strict_segmented_destroy(factor);
-+                for (int ix = 0; ix < nx; ++ix) u_bot[ix] = std::complex<float>(bout[ix][0], bout[ix][1]);
-+                free2float(tau_ptr); fftwf_free(amp); fftwf_free(bin); fftwf_free(bout);
-+            }
-+            else
-+            {
-+                apply_direct(layer_tau[il], nx, dx, std::fabs(bnd[il + 1].z - bnd[il].z), omega, kirdat_dt, nsam, aperture, taper, u_top, u_bot);
-+            }
-+
-+            for (int iz = bnd[il].iz + 1; iz <= bnd[il + 1].iz; ++iz)
-+            {
-+                if (iz == bnd[il + 1].iz)
-+                    u_z = u_bot;
-+                else
-+                {
-+                    std::vector<float> tau_z;
-+                    build_tau_fmm(vel, nz, nx, dz, dx, bnd[il].iz, iz, tau_z);
-+                    apply_direct(tau_z, nx, dx, std::fabs((oz + iz * dz) - bnd[il].z), omega, kirdat_dt, nsam, aperture, taper, u_top, u_z);
-+                }
-+                block_field[(size_t)(iz - bnd[il].iz)] = u_z;
-+                for (int ix = 0; ix < nx; ++ix)
-+                {
-+                    row[(size_t)2 * ix] = u_z[ix].real();
-+                    row[(size_t)2 * ix + 1] = u_z[ix].imag();
-+                }
-+                se_fsio_write_float(out->data->io, row.data(), row.size());
-+                store_final_split(u_z, iz);
-+            }
-+            {
-+                char bname[1024];
-+                std::snprintf(bname, sizeof(bname), "%s_f%s_layer%03d.H", boundary_prefix.c_str(), freq_tag(freq).c_str(), il + 1);
-+                write_complex_boundary_file(bname, u_bot, nx, ox, dx, bnd[il + 1].z, freq, il + 1);
-+                char lname[1024];
-+                std::snprintf(lname, sizeof(lname), "%s_f%s_layer%03d.H", block_prefix.c_str(), freq_tag(freq).c_str(), il + 1);
-+                write_complex_block_file(lname, block_field, nx, ox, dx, bnd[il].z, dz, freq, il + 1);
-+                INFO(("Finished block wavefield for frequency %g Hz, layer %d/%d: iz %d -> %d",
-+                      freq, il + 1, nlayer, bnd[il].iz, bnd[il + 1].iz));
-+            }
-+            u_top.swap(u_bot);
-+        }
-+        flush_final_split();
-+        INFO(("Finished frequency %g Hz", freq));
-+    }
-+
-+    std::fclose(final_real);
-+    std::fclose(final_imag);
-+
-+    if (shot) sep_close(shot);
-+    sep_close(model);
-+    sep_close(out);
-+    se_par_destroy();
-+    return 0;
-+}
-diff --git a/src/layered_model_gen.cpp b/src/layered_model_gen.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..f660f1e3f1495b0d25d9a0755c520ac3bce67f70
---- /dev/null
-+++ b/src/layered_model_gen.cpp
-@@ -0,0 +1,57 @@
-+#include <SEBASIC/include/se_basic.h>
-+#include <SEFILESYSTEM/include/se_fs.h>
-+
-+#include <cmath>
-+#include <cstdio>
-+#include <fstream>
-+#include <string>
-+#include <vector>
-+
-+int main(int argc, char **argv)
-+{
-+    se_par_init(argc, argv);
-+    if (!se_have_par("out")) ERROR(("Need out= output SEP velocity model"));
-+    const char *out_f = se_get_par_str("out");
-+    const int nz = se_have_par("nz") ? se_get_par_int("nz") : 81;
-+    const int nx = se_have_par("nx") ? se_get_par_int("nx") : 96;
-+    const float dz = se_have_par("dz") ? se_get_par_float("dz") : 10.0f;
-+    const float dx = se_have_par("dx") ? se_get_par_float("dx") : 10.0f;
-+    const float oz = se_have_par("oz") ? se_get_par_float("oz") : 0.0f;
-+    const float ox = se_have_par("ox") ? se_get_par_float("ox") : 0.0f;
-+    if (nz <= 1 || nx <= 1 || dz <= 0.0f || dx <= 0.0f) ERROR(("Invalid grid"));
-+
-+    std::vector<float> vel((size_t)nz * (size_t)nx);
-+    const float xmax = ox + (nx - 1) * dx;
-+    const float xc = ox + 0.5f * (nx - 1) * dx;
-+    for (int ix = 0; ix < nx; ++ix)
-+    {
-+        const float x = ox + ix * dx;
-+        for (int iz = 0; iz < nz; ++iz)
-+        {
-+            const float z = oz + iz * dz;
-+            const float sag = 180.0f * std::exp(-std::pow((x - xc) / (0.22f * (xmax - ox + dx)), 2.0f));
-+            const float h1 = oz + 0.28f * (nz - 1) * dz + 0.10f * (x - ox) + sag;
-+            const float h2 = oz + 0.58f * (nz - 1) * dz - 0.07f * (x - ox) - 0.45f * sag;
-+            float v = 1800.0f + 0.35f * z;
-+            if (z > h1) v += 350.0f;
-+            if (z > h2) v += 500.0f;
-+            vel[(size_t)ix * (size_t)nz + iz] = v;
-+        }
-+    }
-+
-+    const std::string data_f = std::string(out_f) + "@";
-+    FILE *fp = std::fopen(data_f.c_str(), "wb");
-+    if (!fp) ERROR(("Cannot open %s", data_f.c_str()));
-+    if (std::fwrite(vel.data(), sizeof(float), vel.size(), fp) != vel.size()) ERROR(("Failed writing velocity data"));
-+    std::fclose(fp);
-+
-+    std::ofstream h(out_f);
-+    h << "n1=" << nz << " o1=" << oz << " d1=" << dz << "\n";
-+    h << "n2=" << nx << " o2=" << ox << " d2=" << dx << "\n";
-+    h << "esize=4 data_format=native_float in=\"" << data_f << "\"\n";
-+    h << "label1=Depth label2=Distance unit1=m unit2=m\n";
-+    h.close();
-+    INFO(("Wrote layered/sag/dipping velocity model %s (%dx%d)", out_f, nz, nx));
-+    se_par_destroy();
-+    return 0;
-+}
+ 
+ std::vector<int> parse_int_list(const char* text) {
+     std::vector<int> values;
+     if (!text) return values;
+     std::stringstream ss(text);
+     std::string item;
+     while (std::getline(ss, item, ',')) {
+         if (!item.empty()) values.push_back(std::max(1, std::atoi(item.c_str())));
+     }
+     std::sort(values.begin(), values.end());
+     values.erase(std::unique(values.begin(), values.end()), values.end());
+     return values;
+ }
+ 
+ void check_stability(const sewave::Grid2D& vel, float dt, int type_laplace, const char* label) {
+     if (dt <= 0.0f || vel.v.empty() || vel.dx <= 0.0f || vel.dz <= 0.0f) return;
+     const float vmax = *std::max_element(vel.v.begin(), vel.v.end());
+     const double inv_h = std::sqrt(1.0 / (vel.dx * vel.dx) + 1.0 / (vel.dz * vel.dz));
+     const double cfl = vmax * dt * inv_h;
+     double dt_limit = 0.45 / (vmax * inv_h);
+     const char* method = "FD8";
+     if (type_laplace == 1) {
+         const double kmax = std::sqrt((M_PI / vel.dx) * (M_PI / vel.dx) + (M_PI / vel.dz) * (M_PI / vel.dz));
+         dt_limit = 2.0 / (vmax * kmax);
+         method = "PS";
+@@ -136,146 +141,188 @@ void resample_time(sewave::Data3D& d, float resample_dt) {
+                 const float a = pos - i0;
+                 trace[it] = (1.0f - a) * in[i0] + a * in[i1];
+             }
+         }
+     }
+     d.nt = new_nt;
+     d.dt = resample_dt;
+     d.d.swap(out);
+ }
+ }
+ 
+ int main(int argc, char** argv) {
+     if (argc <= 1 || (argc == 2 && (!std::strcmp(argv[1], "-h") || !std::strcmp(argv[1], "--help") || !std::strcmp(argv[1], "help")))) {
+         print_usage(argv[0]);
+         return 0;
+     }
+     se_par_init(argc, argv);
+     try {
+ #ifdef _OPENMP
+         INFO(("OpenMP enabled, max_threads=%d", omp_get_max_threads()));
+ #else
+         INFO(("OpenMP disabled at compile time"));
+ #endif
+         const char* mode = se_have_par("mode") ? se_get_par_str("mode") : "forward";
+         if (!se_have_par("velocity")) ERROR(("Need velocity= RSF velocity model"));
+-        sewave::Grid2D vel = sewave::read_rsf2d(se_get_par_str("velocity"));
++        const char* velocity_path = se_get_par_str("velocity");
++        sewave::Grid2D vel = sewave::read_rsf2d(velocity_path);
++        auto q_path = [&]() -> const char* {
++            if (se_have_par("qfile")) return se_get_par_str("qfile");
++            if (se_have_par("Qfile")) return se_get_par_str("Qfile");
++            return nullptr;
++        };
+         auto load_q = [&]() -> sewave::Grid2D {
+-            if (se_have_par("qfile")) return sewave::read_rsf2d(se_get_par_str("qfile"));
+-            if (se_have_par("Qfile")) return sewave::read_rsf2d(se_get_par_str("Qfile"));
++            const char* path = q_path();
++            if (path) return sewave::read_rsf2d(path);
+             ERROR(("visco=1 requires qfile= (or Qfile=) RSF Q model matching velocity="));
+             return sewave::Grid2D{};
+         };
+         if (mode[0]=='f') {
+             if (!se_have_par("output")) ERROR(("Need output= output seismic RSF"));
+             sewave::ForwardParams p;
+             p.nt = se_have_par("nt") ? se_get_par_int("nt") : 1000;
+             p.dt = se_have_par("dt") ? se_get_par_float("dt") : 0.001f;
+             p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
+             p.sx = se_have_par("sx") ? se_get_par_float("sx") : vel.x0 + 0.5f*(vel.nx-1)*vel.dx;
+             p.sz = se_have_par("sz") ? se_get_par_float("sz") : vel.z0;
+             p.rz = se_have_par("rz") ? se_get_par_float("rz") : p.sz;
+             p.nr = se_have_par("nr") ? se_get_par_int("nr") : vel.nx;
+             p.r0 = se_have_par("r0") ? se_get_par_float("r0") : vel.x0;
+             p.dr = se_have_par("dr") ? se_get_par_float("dr") : vel.dx;
+             p.ns = se_have_par("ns") ? se_get_par_int("ns") : 1;
+             p.ds = se_have_par("ds") ? se_get_par_float("ds") : 0.0f;
+             p.nbc = se_have_par("nbc") ? se_get_par_int("nbc") : 100;
+             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
+             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
+             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
+-            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
+-            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
++            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
++            p.type = p.visco ? 1 : 0;
++            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
+             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
+             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
+             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
+             p.flag_smooth = se_have_par("flag_smooth") ? se_get_par_int("flag_smooth") != 0 : true;
+             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
+-            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
+-            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
++            p.q = 1000.0f;
+             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, p.nt/10));
+             sewave::Grid2D qmodel;
+             sewave::Grid2D* qptr = nullptr;
+-            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
++            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
++            const char* output_path = se_get_par_str("output");
++            INFO(("forward wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
++            INFO(("forward velocity model: %s", velocity_path));
++            INFO(("forward Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
++            INFO(("forward seismic output: %s", output_path));
++            INFO(("forward Q compensation/imaging compensation: not applicable in forward mode"));
++            INFO(("forward wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
++                  p.nt, p.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
++            INFO(("forward geometry: sx0=%g sz=%g rz=%g ns=%d ds=%g nr=%d r0=%g dr=%g",
++                  p.sx, p.sz, p.rz, p.ns, p.ds, p.nr, p.r0, p.dr));
++            INFO(("forward boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
++                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
++            INFO(("forward visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
++                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
++            INFO(("forward progress_interval=%d", p.progress_interval));
+             INFO(("forward shots: total=%d, calculating shot index range 0-%d", p.ns, std::max(0, p.ns - 1)));
+             check_stability(vel, p.dt, p.type_compute_laplace, "forward");
+             sewave::Data3D d = sewave::forward(vel, p, qptr);
+-            sewave::write_rsf3d(se_get_par_str("output"), d);
++            sewave::write_rsf3d(output_path, d);
+         } else if (mode[0]=='i') {
+             if (!se_have_par("seismic_data")) ERROR(("Need seismic_data= input seismic RSF"));
+             if (!se_have_par("migration")) ERROR(("Need migration= output image RSF"));
+-            sewave::Data3D d = sewave::read_rsf3d(se_get_par_str("seismic_data"));
++            const char* seismic_data_path = se_get_par_str("seismic_data");
++            const char* migration_path = se_get_par_str("migration");
++            sewave::Data3D d = sewave::read_rsf3d(seismic_data_path);
+             int max_nt = se_have_par("max_nt") ? se_get_par_int("max_nt") : -1;
+             float resample_dt = se_have_par("resample_dt") ? se_get_par_float("resample_dt") : -1.0f;
+             const int input_nt = d.nt;
+             const float input_dt = d.dt;
+             truncate_nt(d, max_nt);
+             resample_time(d, resample_dt);
+             if (d.nt != input_nt || d.dt != input_dt) {
+                 INFO(("seismic_data time preprocessing: nt %d -> %d, dt %.9g -> %.9g", input_nt, d.nt, input_dt, d.dt));
+             }
+             sewave::ImageParams p;
+             p.cmp = se_have_par("cmp") ? se_get_par_int("cmp") != 0 : true;
+             p.compensate = se_have_par("compensate") ? se_get_par_int("compensate") != 0 : false;
+-            p.amp_compensation_sign = se_have_par("amp_compensation_sign") ? se_get_par_int("amp_compensation_sign") : (p.compensate ? -1 : 1);
+-            if (p.amp_compensation_sign != -1 && p.amp_compensation_sign != 1) ERROR(("amp_compensation_sign must be -1 (Q compensation) or 1 (Q attenuation)"));
+-            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
+-            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
++            p.amp_compensation_sign = p.compensate ? -1 : 1;
++            p.q = 1000.0f;
+             p.nbc = se_have_par("nbc") ? se_get_par_int("nbc") : 100;
+             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
+             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
+             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
+-            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
+-            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
++            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
++            p.type = p.visco ? 1 : 0;
++            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
++            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
+             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
+             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
+             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
+             p.flag_smooth = se_have_par("flag_smooth") ? se_get_par_int("flag_smooth") != 0 : true;
+             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
+             p.sz = se_have_par("sz") ? se_get_par_float("sz") : vel.z0;
+             p.rz = se_have_par("rz") ? se_get_par_float("rz") : p.sz;
+-            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
+             p.shot_begin = se_have_par("shot_begin") ? se_get_par_int("shot_begin") : (se_have_par("first_shot") ? se_get_par_int("first_shot") : 0);
+             p.shot_end = se_have_par("shot_end") ? se_get_par_int("shot_end") : (se_have_par("last_shot") ? se_get_par_int("last_shot") : -1);
+             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, d.nt/10));
+             p.max_parallel_shots = se_have_par("max_parallel_shots") ? se_get_par_int("max_parallel_shots") : (se_have_par("parallel_shots") ? se_get_par_int("parallel_shots") : (se_have_par("omp_shots") ? se_get_par_int("omp_shots") : 1));
+             p.in_memory_snapshots = se_have_par("in_memory_snapshots") ? se_get_par_int("in_memory_snapshots") != 0 : false;
+             p.snapshot_interval = se_have_par("snapshot_interval") ? se_get_par_int("snapshot_interval") : (se_have_par("snapshot_stride") ? se_get_par_int("snapshot_stride") : 1);
+             if (p.snapshot_interval < 1) ERROR(("snapshot_interval must be >= 1"));
+             if (se_have_par("debug_wavefield_prefix")) p.debug_wavefield_prefix = se_get_par_str("debug_wavefield_prefix");
+             else if (se_have_par("wavefield_snapshot_prefix")) p.debug_wavefield_prefix = se_get_par_str("wavefield_snapshot_prefix");
+             if (se_have_par("debug_snapshot_steps")) {
+                 int nsteps = 0;
+                 int* steps = se_get_pararray_int("debug_snapshot_steps", &nsteps);
+                 if (steps && nsteps > 0) p.debug_snapshot_steps.assign(steps, steps + nsteps);
+                 else p.debug_snapshot_steps = parse_int_list(se_get_par_str("debug_snapshot_steps"));
+             } else if (se_have_par("wavefield_snapshot_steps")) {
+                 int nsteps = 0;
+                 int* steps = se_get_pararray_int("wavefield_snapshot_steps", &nsteps);
+                 if (steps && nsteps > 0) p.debug_snapshot_steps.assign(steps, steps + nsteps);
+                 else p.debug_snapshot_steps = parse_int_list(se_get_par_str("wavefield_snapshot_steps"));
+             }
+             for (int& step : p.debug_snapshot_steps) step = std::max(1, step);
+             std::sort(p.debug_snapshot_steps.begin(), p.debug_snapshot_steps.end());
+             p.debug_snapshot_steps.erase(std::unique(p.debug_snapshot_steps.begin(), p.debug_snapshot_steps.end()), p.debug_snapshot_steps.end());
+             if (!p.debug_wavefield_prefix.empty() && p.debug_snapshot_steps.empty()) INFO(("debug_wavefield_prefix is set but debug_snapshot_steps is empty; no wavefield snapshots will be written"));
+             sewave::Grid2D qmodel;
+             sewave::Grid2D* qptr = nullptr;
+-            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
++            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
++            INFO(("image wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
++            INFO(("image velocity model: %s", velocity_path));
++            INFO(("image Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
++            INFO(("image seismic data: %s", seismic_data_path));
++            INFO(("image migration output: %s", migration_path));
++            INFO(("image compensation: compensate=%d (%s), internal amp_compensation_sign=%d",
++                  p.compensate ? 1 : 0,
++                  p.compensate ? "Q compensation" : "Q attenuation/no compensation",
++                  p.amp_compensation_sign));
++            INFO(("image wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
++                  d.nt, d.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
++            INFO(("image geometry/options: cmp=%d sz=%g rz=%g shot_begin=%d shot_end=%d",
++                  p.cmp ? 1 : 0, p.sz, p.rz, p.shot_begin, p.shot_end));
++            INFO(("image snapshot/parallel options: snapshot_interval=%d in_memory_snapshots=%d max_parallel_shots=%d",
++                  p.snapshot_interval, p.in_memory_snapshots ? 1 : 0, p.max_parallel_shots));
++            INFO(("image boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
++                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
++            INFO(("image visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
++                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
++            INFO(("image progress_interval=%d", p.progress_interval));
+             {
+                 int shot0 = std::max(0, p.shot_begin);
+                 int shot1 = (p.shot_end < 0) ? d.ns - 1 : std::min(d.ns - 1, p.shot_end);
+                 INFO(("image shots: total=%d, calculating shot index range %d-%d (%d shots)",
+                       d.ns, shot0, shot1, shot0 <= shot1 ? shot1 - shot0 + 1 : 0));
+             }
+             check_stability(vel, d.dt, p.type_compute_laplace, "image");
+             auto img = sewave::rtm_image(vel, d, p, qptr);
+-            sewave::write_rsf2d(se_get_par_str("migration"), vel, img, "RTM image");
++            sewave::write_rsf2d(migration_path, vel, img, "RTM image");
+         } else {
+             ERROR(("Unknown mode=%s (use forward or image)", mode));
+         }
+     } catch (const std::exception& e) {
+         ERROR(("sewave2d failed: %s", e.what()));
+     }
+     se_par_destroy();
+     return 0;
+ }
  
 EOF
 )

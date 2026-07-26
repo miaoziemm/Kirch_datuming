@@ -32,6 +32,7 @@ namespace sewave
         int xindex(const Grid2D &g, float x) { return clampi((int)std::lround((x - g.x0) / g.dx), 0, g.nx - 1); }
         int xindex_unclamped(const Grid2D &g, float x) { return (int)std::lround((x - g.x0) / g.dx); }
         int zindex(const Grid2D &g, float z) { return clampi((int)std::lround((z - g.z0) / g.dz), 0, g.nz - 1); }
+        int zindex_unclamped(const Grid2D &g, float z) { return (int)std::lround((z - g.z0) / g.dz); }
         void check_same_grid(const Grid2D &a, const Grid2D &b, const char *name)
         {
             if (a.nz != b.nz || a.nx != b.nx || a.dz != b.dz || a.dx != b.dx || a.z0 != b.z0 || a.x0 != b.x0)
@@ -93,15 +94,15 @@ namespace sewave
         {
             int nx = 0, nz = 0, nbc = 0, L = 30;
             float dx = 1, dz = 1, alpha = 1, Omega0 = 0, fc = 120;
-            int order = 2, type = 1;
+            int order = 2, type = 0;
             std::vector<float> vp, Q;
         };
 
         template <class P>
         ExtModel make_ext(const Grid2D &vel, const Grid2D *q, const P &p)
         {
-            if ((p.visco || p.type == 1) && !q)
-                throw std::runtime_error("visco/type=1 requires qfile= RSF Q model");
+            if (p.visco && !q)
+                throw std::runtime_error("visco=1 requires qfile= RSF Q model");
             if (q)
                 check_same_grid(vel, *q, "Q model");
             ExtModel e;
@@ -115,7 +116,7 @@ namespace sewave
             e.Omega0 = (p.Omega0 > 0 ? p.Omega0 : 2 * PI * p.f0);
             e.fc = p.fc;
             e.order = p.order;
-            e.type = p.visco ? 1 : p.type;
+            e.type = p.visco ? 1 : 0;
             e.vp.assign((size_t)e.nx * e.nz, 0);
             e.Q.assign((size_t)e.nx * e.nz, std::max(1.0f, p.q));
             for (int ix = 0; ix < e.nx; ++ix)
@@ -346,11 +347,47 @@ namespace sewave
             write_debug_snapshot(e, *g, wave, name);
             INFO(("Wrote debug wavefield snapshot %s", name));
         }
+        void ensure_directory(const char *dir, const char *purpose)
+        {
+            if (::mkdir(dir, 0777) != 0 && errno != EEXIST)
+                throw std::runtime_error(std::string("cannot create ") + dir + " directory for " + purpose);
+        }
+
+        std::string shot_image_path(int shot)
+        {
+            char name[256];
+            std::snprintf(name, sizeof(name), "temp_shot_img/shot_%06d.rsf", shot);
+            return name;
+        }
+
+        void write_shot_image_rsf(const std::string &path, const Grid2D &g, const std::vector<float> &data, int shot, float shot_x, float shot_z)
+        {
+            sep_t *s = sep_open(path.c_str(), SEP_WRITE, 0);
+            if (!s)
+                throw std::runtime_error("cannot create per-shot image " + path);
+            s->headers->ndim = 2;
+            s->headers->n[0] = g.nz;
+            s->headers->n[1] = g.nx;
+            s->headers->o[0] = g.z0;
+            s->headers->o[1] = g.x0;
+            s->headers->d[0] = g.dz;
+            s->headers->d[1] = g.dx;
+            sep_set_header(s, "label1", "Depth");
+            sep_set_header(s, "label2", "Lateral");
+            sep_set_header(s, "label", "Per-shot RTM Image");
+            sep_set_header_int(s, "shot_index", shot);
+            sep_set_header_float(s, "shot_x", shot_x);
+            sep_set_header_float(s, "shot_z", shot_z);
+            sep_set_header_float(s, "sx", shot_x);
+            sep_set_header_float(s, "sz", shot_z);
+            se_fsio_write_float(s->data->io, const_cast<float *>(data.data()), data.size());
+            sep_write_headers(s);
+            sep_close(s);
+        }
 
         FILE *open_snapshot_temp(int shot, std::string &path)
         {
-            if (::mkdir("temp_img", 0777) != 0 && errno != EEXIST)
-                throw std::runtime_error("cannot create temp_img directory for source snapshots");
+            ensure_directory("temp_img", "source snapshots");
             char name[256];
             std::snprintf(name, sizeof(name), "temp_img/sewave_snap_%ld_shot_%d_XXXXXX", (long)::getpid(), shot);
             int fd = ::mkstemp(name);
@@ -659,13 +696,27 @@ namespace sewave
         int src_snapshot_offset = (data.nt - 1) % snapshot_interval;
         int stored_snaps = count_stored_snapshots(data.nt, snapshot_interval, rec_snapshot_offset);
         size_t snap_bytes = (size_t)stored_snaps * ebase.nx * ebase.nz * sizeof(float);
+        int amp_sign = p.compensate ? -1 : 1;
         INFO(("RTM shot parallelism=%d, snapshot_interval=%d, stored snapshots per wavefield=%d/%d, source snapshots per active shot=%.3f GiB (%s)",
               shot_threads, snapshot_interval, stored_snaps, data.nt, snap_bytes / (1024.0 * 1024.0 * 1024.0), p.in_memory_snapshots ? "memory" : "disk temporary file"));
-        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
+        ensure_directory("temp_shot_img", "per-shot images");
+        std::vector<int> shot_imaged(data.ns, 0);
 #pragma omp parallel for schedule(dynamic) num_threads(shot_threads)
         for (int is = shot0; is <= shot1; ++is)
         {
             ExtModel e = ebase;
+            float sx = data.s0 + is * data.ds;
+            int six0 = xindex_unclamped(vel, sx);
+            int siz0 = zindex_unclamped(vel, p.sz);
+            if (six0 < 0 || six0 >= vel.nx || siz0 < 0 || siz0 >= vel.nz)
+            {
+#pragma omp critical(sewave_shot_skip_log)
+                {
+                    INFO(("image shot %d skipped: source position outside velocity model (shot_x=%g shot_z=%g, ix=%d iz=%d, valid ix=0-%d iz=0-%d)",
+                          is, sx, p.sz, six0, siz0, vel.nx - 1, vel.nz - 1));
+                }
+                continue;
+            }
             std::vector<float> local((size_t)vel.nx * vel.nz, 0.0f);
             std::vector<float> src(data.nt), shot((size_t)(e.nx - 2 * e.nbc) * data.nt, 0.0f), snaps;
             if (p.in_memory_snapshots)
@@ -678,11 +729,10 @@ namespace sewave
             std::snprintf(rec_label, sizeof(rec_label), "image receiver shot %d", is);
             for (int it = 0; it < data.nt; ++it)
                 src[it] = ricker(it * data.dt, p.fdom);
-            float sx = data.s0 + is * data.ds;
-            int six = xindex(vel, sx) + e.nbc, siz = zindex(vel, p.sz) + e.nbc;
+            int six = six0 + e.nbc, siz = siz0 + e.nbc;
             if (p.flag_homo)
                 apply_homo(e, six, siz);
-            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
+            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
                       snapshot_interval, src_snapshot_offset, snapshot_interval, src_snapshot_offset,
                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "src", is);
             int skipped_receivers = 0;
@@ -702,7 +752,7 @@ namespace sewave
                 INFO(("image shot %d: skipped %d receivers outside velocity model", is, skipped_receivers));
             if (!p.debug_wavefield_prefix.empty())
                 report_gather_energy(shot, e.nx - 2 * e.nbc, data.nt, is, p.debug_wavefield_prefix, vel.x0, vel.dx, data.dt);
-            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
+            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
                       snapshot_interval, rec_snapshot_offset, snapshot_interval, src_snapshot_offset,
                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "rec", is);
             correlate_snapshots(e, data.nt, snapshot_interval, src_snapshot_offset, rec_snapshot_offset, p.in_memory_snapshots ? &snaps : nullptr, snap_tmp, rec_snap_tmp, local);
@@ -718,12 +768,32 @@ namespace sewave
                 if (!snap_path.empty())
                     ::unlink(snap_path.c_str());
             }
-#pragma omp critical(sewave_image_stack)
+            std::string shot_img_path = shot_image_path(is);
+#pragma omp critical(sewave_shot_image_write)
             {
-                for (size_t i = 0; i < image.size(); ++i)
-                    image[i] += local[i];
+                write_shot_image_rsf(shot_img_path, vel, local, is, sx, p.sz);
+                shot_imaged[is] = 1;
+                INFO(("Wrote per-shot image %s with shot_x=%g shot_z=%g", shot_img_path.c_str(), sx, p.sz));
             }
         }
+        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
+        int stacked_shots = 0;
+        for (int is = shot0; is <= shot1; ++is)
+        {
+            if (!shot_imaged[is])
+                continue;
+            std::string shot_img_path = shot_image_path(is);
+            Grid2D shot_img = read_rsf2d(shot_img_path);
+            check_same_grid(vel, shot_img, shot_img_path.c_str());
+            for (size_t i = 0; i < image.size(); ++i)
+                image[i] += shot_img.v[i];
+            ++stacked_shots;
+        }
+        if (stacked_shots == 0)
+            INFO(("image shot stack: no shots were inside the velocity model; returning zero image"));
+        else if (stacked_shots < shot1 - shot0 + 1)
+            INFO(("image shot stack: stacked %d/%d shots; skipped %d shots outside the velocity model",
+                  stacked_shots, shot1 - shot0 + 1, shot1 - shot0 + 1 - stacked_shots));
         return image;
     }
 } // namespace sewave

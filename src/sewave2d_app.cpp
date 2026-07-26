@@ -37,10 +37,11 @@ void print_usage(const char* prog) {
         "  L=INT                      Absorbing boundary taper length. Default: 30.\n"
         "  alpha=FLOAT                Absorbing boundary strength. Default: 1.\n"
         "  type_compute_Laplace=0|1   Laplacian method: 0=FD8, 1=pseudospectral. Default: 1.\n"
-        "  type=INT                   Propagator type; type=1 uses Q/visco path. Default: 1.\n"
-        "  visco=0|1                  Enable visco-acoustic mode. Default: 0.\n"
-        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1 or type=1.\n"
-        "  q=FLOAT                    Constant Q fallback/default. Default: 1000.\n"
+        "  visco=0|1                  Wave mode: 0=acoustic, 1=visco-acoustic/Q path. Default: 0.\n"
+        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1.\n"
+        "  f0=FLOAT                   Reference frequency for visco mode. Default: fdom.\n"
+        "  Omega0=FLOAT               Reference angular frequency override. Default: 2*pi*f0.\n"
+        "  fc=FLOAT order=INT         Wavenumber filter cutoff/order. Defaults: 120, 2.\n"
         "  flag_smooth=0|1            Smooth extended velocity/Q model. Default: 1.\n"
         "  flag_homo=0|1              Use homogeneous model at source velocity. Default: 0.\n"
         "  progress_interval=INT      Print propagation progress every INT steps.\n"
@@ -60,8 +61,7 @@ void print_usage(const char* prog) {
         "  snapshot_interval=INT      Store and correlate one RTM wavefield snapshot every INT time steps. Alias: snapshot_stride. Default: 1.\n"
         "  max_nt=INT                 Truncate input data time samples before imaging.\n"
         "  resample_dt=FLOAT          Resample input data in time before imaging.\n"
-        "  compensate=0|1             Enable Q-compensation sign default. Default: 0.\n"
-        "  amp_compensation_sign=-1|1  -1=Q compensation, 1=Q attenuation.\n"
+        "  compensate=0|1             Enable RTM Q compensation: 0=attenuation/no compensation, 1=Q compensation. Default: 0.\n"
         "  debug_wavefield_prefix=STR Write selected debug wavefields/gathers with this prefix.\n"
         "  debug_snapshot_steps=LIST  Comma-separated or array time-step list for debug snapshots.\n"
         "\n"
@@ -81,8 +81,13 @@ void truncate_nt(sewave::Data3D& d, int max_nt) {
     d.nt = max_nt;
     d.d.swap(out);
 }
+const char* laplace_name(int type_laplace) {
+    return type_laplace == 1 ? "pseudospectral" : "FD8";
+}
 
-
+double effective_omega0(float f0, float Omega0) {
+    return Omega0 > 0.0f ? Omega0 : 2.0 * M_PI * f0;
+}
 
 std::vector<int> parse_int_list(const char* text) {
     std::vector<int> values;
@@ -158,10 +163,16 @@ int main(int argc, char** argv) {
 #endif
         const char* mode = se_have_par("mode") ? se_get_par_str("mode") : "forward";
         if (!se_have_par("velocity")) ERROR(("Need velocity= RSF velocity model"));
-        sewave::Grid2D vel = sewave::read_rsf2d(se_get_par_str("velocity"));
+        const char* velocity_path = se_get_par_str("velocity");
+        sewave::Grid2D vel = sewave::read_rsf2d(velocity_path);
+        auto q_path = [&]() -> const char* {
+            if (se_have_par("qfile")) return se_get_par_str("qfile");
+            if (se_have_par("Qfile")) return se_get_par_str("Qfile");
+            return nullptr;
+        };
         auto load_q = [&]() -> sewave::Grid2D {
-            if (se_have_par("qfile")) return sewave::read_rsf2d(se_get_par_str("qfile"));
-            if (se_have_par("Qfile")) return sewave::read_rsf2d(se_get_par_str("Qfile"));
+            const char* path = q_path();
+            if (path) return sewave::read_rsf2d(path);
             ERROR(("visco=1 requires qfile= (or Qfile=) RSF Q model matching velocity="));
             return sewave::Grid2D{};
         };
@@ -183,27 +194,44 @@ int main(int argc, char** argv) {
             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
-            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
-            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
+            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
+            p.type = p.visco ? 1 : 0;
+            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
             p.flag_smooth = se_have_par("flag_smooth") ? se_get_par_int("flag_smooth") != 0 : true;
             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
-            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
-            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
+            p.q = 1000.0f;
             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, p.nt/10));
             sewave::Grid2D qmodel;
             sewave::Grid2D* qptr = nullptr;
-            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
+            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
+            const char* output_path = se_get_par_str("output");
+            INFO(("forward wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
+            INFO(("forward velocity model: %s", velocity_path));
+            INFO(("forward Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
+            INFO(("forward seismic output: %s", output_path));
+            INFO(("forward Q compensation/imaging compensation: not applicable in forward mode"));
+            INFO(("forward wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
+                  p.nt, p.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
+            INFO(("forward geometry: sx0=%g sz=%g rz=%g ns=%d ds=%g nr=%d r0=%g dr=%g",
+                  p.sx, p.sz, p.rz, p.ns, p.ds, p.nr, p.r0, p.dr));
+            INFO(("forward boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
+                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
+            INFO(("forward visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
+                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
+            INFO(("forward progress_interval=%d", p.progress_interval));
             INFO(("forward shots: total=%d, calculating shot index range 0-%d", p.ns, std::max(0, p.ns - 1)));
             check_stability(vel, p.dt, p.type_compute_laplace, "forward");
             sewave::Data3D d = sewave::forward(vel, p, qptr);
-            sewave::write_rsf3d(se_get_par_str("output"), d);
+            sewave::write_rsf3d(output_path, d);
         } else if (mode[0]=='i') {
             if (!se_have_par("seismic_data")) ERROR(("Need seismic_data= input seismic RSF"));
             if (!se_have_par("migration")) ERROR(("Need migration= output image RSF"));
-            sewave::Data3D d = sewave::read_rsf3d(se_get_par_str("seismic_data"));
+            const char* seismic_data_path = se_get_par_str("seismic_data");
+            const char* migration_path = se_get_par_str("migration");
+            sewave::Data3D d = sewave::read_rsf3d(seismic_data_path);
             int max_nt = se_have_par("max_nt") ? se_get_par_int("max_nt") : -1;
             float resample_dt = se_have_par("resample_dt") ? se_get_par_float("resample_dt") : -1.0f;
             const int input_nt = d.nt;
@@ -216,16 +244,16 @@ int main(int argc, char** argv) {
             sewave::ImageParams p;
             p.cmp = se_have_par("cmp") ? se_get_par_int("cmp") != 0 : true;
             p.compensate = se_have_par("compensate") ? se_get_par_int("compensate") != 0 : false;
-            p.amp_compensation_sign = se_have_par("amp_compensation_sign") ? se_get_par_int("amp_compensation_sign") : (p.compensate ? -1 : 1);
-            if (p.amp_compensation_sign != -1 && p.amp_compensation_sign != 1) ERROR(("amp_compensation_sign must be -1 (Q compensation) or 1 (Q attenuation)"));
-            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
-            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
+            p.amp_compensation_sign = p.compensate ? -1 : 1;
+            p.q = 1000.0f;
             p.nbc = se_have_par("nbc") ? se_get_par_int("nbc") : 100;
             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
-            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
-            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
+            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
+            p.type = p.visco ? 1 : 0;
+            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
+            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
@@ -233,7 +261,6 @@ int main(int argc, char** argv) {
             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
             p.sz = se_have_par("sz") ? se_get_par_float("sz") : vel.z0;
             p.rz = se_have_par("rz") ? se_get_par_float("rz") : p.sz;
-            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
             p.shot_begin = se_have_par("shot_begin") ? se_get_par_int("shot_begin") : (se_have_par("first_shot") ? se_get_par_int("first_shot") : 0);
             p.shot_end = se_have_par("shot_end") ? se_get_par_int("shot_end") : (se_have_par("last_shot") ? se_get_par_int("last_shot") : -1);
             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, d.nt/10));
@@ -260,7 +287,27 @@ int main(int argc, char** argv) {
             if (!p.debug_wavefield_prefix.empty() && p.debug_snapshot_steps.empty()) INFO(("debug_wavefield_prefix is set but debug_snapshot_steps is empty; no wavefield snapshots will be written"));
             sewave::Grid2D qmodel;
             sewave::Grid2D* qptr = nullptr;
-            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
+            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
+            INFO(("image wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
+            INFO(("image velocity model: %s", velocity_path));
+            INFO(("image Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
+            INFO(("image seismic data: %s", seismic_data_path));
+            INFO(("image migration output: %s", migration_path));
+            INFO(("image compensation: compensate=%d (%s), internal amp_compensation_sign=%d",
+                  p.compensate ? 1 : 0,
+                  p.compensate ? "Q compensation" : "Q attenuation/no compensation",
+                  p.amp_compensation_sign));
+            INFO(("image wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
+                  d.nt, d.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
+            INFO(("image geometry/options: cmp=%d sz=%g rz=%g shot_begin=%d shot_end=%d",
+                  p.cmp ? 1 : 0, p.sz, p.rz, p.shot_begin, p.shot_end));
+            INFO(("image snapshot/parallel options: snapshot_interval=%d in_memory_snapshots=%d max_parallel_shots=%d",
+                  p.snapshot_interval, p.in_memory_snapshots ? 1 : 0, p.max_parallel_shots));
+            INFO(("image boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
+                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
+            INFO(("image visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
+                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
+            INFO(("image progress_interval=%d", p.progress_interval));
             {
                 int shot0 = std::max(0, p.shot_begin);
                 int shot1 = (p.shot_end < 0) ? d.ns - 1 : std::min(d.ns - 1, p.shot_end);
@@ -269,7 +316,7 @@ int main(int argc, char** argv) {
             }
             check_stability(vel, d.dt, p.type_compute_laplace, "image");
             auto img = sewave::rtm_image(vel, d, p, qptr);
-            sewave::write_rsf2d(se_get_par_str("migration"), vel, img, "RTM image");
+            sewave::write_rsf2d(migration_path, vel, img, "RTM image");
         } else {
             ERROR(("Unknown mode=%s (use forward or image)", mode));
         }
