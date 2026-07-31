@@ -166,6 +166,48 @@ namespace sewave
                 }
         }
 
+        void acoustic_fd8_step(
+            const ExtModel &e,
+            const std::vector<float> &cur,
+            const std::vector<float> &old,
+            const std::vector<float> &velocity_dt2,
+            std::vector<float> &next)
+        {
+            const int nx = e.nx;
+            const int nz = e.nz;
+            const int n = nx * nz;
+            const float dx2 = e.dx * e.dx;
+            const float dz2 = e.dz * e.dz;
+
+            // The FD8 stencil is not evaluated in the outer four samples.
+            // Preserve the original zero-Laplacian update there; absorb()
+            // subsequently replaces the absorbing-boundary samples.
+            for (int i = 0; i < n; ++i)
+                next[i] = 2.0f * cur[i] - old[i];
+
+            for (int ix = 4; ix < nx - 4; ++ix)
+            {
+                for (int iz = 4; iz < nz - 4; ++iz)
+                {
+                    const int i = idx(iz, ix, nz);
+                    const float lap =
+                        ((-1.f / 560 * (cur[idx(iz, ix - 4, nz)] + cur[idx(iz, ix + 4, nz)]) +
+                          8.f / 315 * (cur[idx(iz, ix - 3, nz)] + cur[idx(iz, ix + 3, nz)]) -
+                          1.f / 5 * (cur[idx(iz, ix - 2, nz)] + cur[idx(iz, ix + 2, nz)]) +
+                          8.f / 5 * (cur[idx(iz, ix - 1, nz)] + cur[idx(iz, ix + 1, nz)]) -
+                          205.f / 72 * cur[i]) /
+                         dx2) +
+                        ((-1.f / 560 * (cur[idx(iz - 4, ix, nz)] + cur[idx(iz + 4, ix, nz)]) +
+                          8.f / 315 * (cur[idx(iz - 3, ix, nz)] + cur[idx(iz + 3, ix, nz)]) -
+                          1.f / 5 * (cur[idx(iz - 2, ix, nz)] + cur[idx(iz + 2, ix, nz)]) +
+                          8.f / 5 * (cur[idx(iz - 1, ix, nz)] + cur[idx(iz + 1, ix, nz)]) -
+                          205.f / 72 * cur[i]) /
+                         dz2);
+                    next[i] = 2.0f * cur[i] - old[i] + velocity_dt2[i] * lap;
+                }
+            }
+        }
+
         void fft_ops(const ExtModel &e, const std::vector<float> &cur, const std::vector<float> &old, float dt, int type_lap, bool filt, const std::vector<float> &H, std::vector<float> &lap, std::vector<float> &amp, std::vector<float> &KP)
         {
             int nx = e.nx, nz = e.nz, nc = nz / 2 + 1, n = nx * nz;
@@ -451,17 +493,28 @@ namespace sewave
         {
             int n = e.nx * e.nz;
             std::vector<float> old(n, 0), cur(n, 0), nxt(n, 0), lap, amp, KP, H, snapbuf;
+            const bool acoustic_fd8 = (e.type == 0 && type_lap == 0);
+            std::vector<float> velocity_dt2;
+            if (acoustic_fd8)
+            {
+                velocity_dt2.resize(n);
+                for (int i = 0; i < n; ++i)
+                    velocity_dt2[i] = e.vp[i] * e.vp[i] * dt * dt;
+            }
             if (image && snap_read)
                 snapbuf.resize(n);
             std::vector<float> kx, kz;
-            wavenumbers(e, kx, kz);
-            if (filter)
-                butter(e, kx, kz, H);
+            if (!acoustic_fd8)
+            {
+                wavenumbers(e, kx, kz);
+                if (filter)
+                    butter(e, kx, kz, H);
+            }
+            const bool receiver_gather = inject && inject->size() != (size_t)nt;
             for (int it = 0; it < nt; ++it)
             {
                 if (progress_interval > 0 && (it == 0 || (it + 1) % progress_interval == 0 || it == nt - 1))
                     log_progress(progress_label, it + 1, nt);
-                bool receiver_gather = inject && inject->size() != (size_t)nt;
                 if (inject && !receiver_gather)
                 {
                     if (source_add)
@@ -475,8 +528,16 @@ namespace sewave
                     for (int ix = e.nbc; ix < e.nx - e.nbc; ++ix)
                         cur[idx(srcz, ix, e.nz)] = (*inject)[(size_t)(ix - e.nbc) * nt + rit];
                 }
-                fft_ops(e, cur, old, dt, type_lap, filter, H, lap, amp, KP);
-                for (int ix = 0; ix < e.nx; ++ix)
+                if (acoustic_fd8)
+                {
+                    acoustic_fd8_step(e, cur, old, velocity_dt2, nxt);
+                }
+                else
+                {
+                    fft_ops(e, cur, old, dt, type_lap, filter, H, lap, amp, KP);
+                }
+                const int general_update_x_begin = acoustic_fd8 ? e.nx : 0;
+                for (int ix = general_update_x_begin; ix < e.nx; ++ix)
                     for (int iz = 0; iz < e.nz; ++iz)
                     {
                         int i = idx(iz, ix, e.nz);

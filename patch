@@ -1,717 +1,1755 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/SEWAVE/sewave2d.cpp b/SEWAVE/sewave2d.cpp
-index 7b15c6b94fd69f5df9a4db840591c524ce6988ef..9fb6737adb8a48bd42c48abce5a75a5f6457c3ab 100644
---- a/SEWAVE/sewave2d.cpp
-+++ b/SEWAVE/sewave2d.cpp
-@@ -10,50 +10,51 @@
- #include <stdexcept>
- #include <fftw3.h>
- #include <sys/stat.h>
- #include <unistd.h>
- 
- #ifdef _OPENMP
- #include <omp.h>
- #endif
- 
- namespace sewave
- {
-     namespace
-     {
-         constexpr float PI = 3.14159265358979323846f;
-         inline int idx(int iz, int ix, int nz) { return ix * nz + iz; }
-         float ricker(float t, float f)
-         {
-             float tau = t - 1.5f / f;
-             float a = PI * f * tau;
-             return (1.0f - 2.0f * a * a) * std::exp(-a * a);
-         }
-         int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
-         int xindex(const Grid2D &g, float x) { return clampi((int)std::lround((x - g.x0) / g.dx), 0, g.nx - 1); }
-         int xindex_unclamped(const Grid2D &g, float x) { return (int)std::lround((x - g.x0) / g.dx); }
-         int zindex(const Grid2D &g, float z) { return clampi((int)std::lround((z - g.z0) / g.dz), 0, g.nz - 1); }
-+        int zindex_unclamped(const Grid2D &g, float z) { return (int)std::lround((z - g.z0) / g.dz); }
-         void check_same_grid(const Grid2D &a, const Grid2D &b, const char *name)
-         {
-             if (a.nz != b.nz || a.nx != b.nx || a.dz != b.dz || a.dx != b.dx || a.z0 != b.z0 || a.x0 != b.x0)
-                 throw std::runtime_error(std::string(name) + " grid must match velocity grid");
-         }
- 
-         void tripd(std::vector<float> &d, std::vector<float> &e, std::vector<float> &b, int n)
-         {
-             for (int k = 1; k < n; ++k)
-             {
-                 float temp = e[k - 1];
-                 e[k - 1] = temp / d[k - 1];
-                 d[k] -= temp * e[k - 1];
-             }
-             for (int k = 1; k < n; ++k)
-                 b[k] -= e[k - 1] * b[k - 1];
-             b[n - 1] /= d[n - 1];
-             for (int k = n - 1; k > 0; --k)
-                 b[k - 1] = b[k - 1] / d[k - 1] - e[k - 1] * b[k];
-         }
-         void smooth2d_flat(int n1, int n2, float r1, float r2, std::vector<float> &v)
-         {
-             int nmax = std::max(n1, n2);
-             std::vector<float> w((size_t)n1 * n2, 1.0f), d(nmax), e(nmax), f(nmax);
-             r1 = r1 * r1 * 0.25f;
-@@ -71,73 +72,73 @@ namespace sewave
-                 f[n2 - 1] = v[idx(iz, n2 - 1, n1)];
-                 tripd(d, e, f, n2);
-                 for (int ix = 0; ix < n2; ++ix)
-                     v[idx(iz, ix, n1)] = f[ix];
-             }
-             for (int ix = 0; ix < n2; ++ix)
-             {
-                 for (int iz = 0; iz < n1 - 2; ++iz)
-                 {
-                     d[iz] = 1.0f + r1 * (w[idx(iz + 1, ix, n1)] + w[idx(iz + 2, ix, n1)]);
-                     e[iz] = -r1 * w[idx(iz + 2, ix, n1)];
-                     f[iz] = v[idx(iz + 1, ix, n1)];
-                 }
-                 f[0] += r1 * w[idx(1, ix, n1)] * v[idx(0, ix, n1)];
-                 d[n1 - 2] = 1.0f + r1 * w[idx(n1 - 1, ix, n1)];
-                 f[n1 - 2] = v[idx(n1 - 1, ix, n1)];
-                 tripd(d, e, f, n1 - 1);
-                 for (int iz = 0; iz < n1 - 1; ++iz)
-                     v[idx(iz + 1, ix, n1)] = f[iz];
-             }
-         }
-         struct ExtModel
-         {
-             int nx = 0, nz = 0, nbc = 0, L = 30;
-             float dx = 1, dz = 1, alpha = 1, Omega0 = 0, fc = 120;
--            int order = 2, type = 1;
-+            int order = 2, type = 0;
-             std::vector<float> vp, Q;
-         };
- 
-         template <class P>
-         ExtModel make_ext(const Grid2D &vel, const Grid2D *q, const P &p)
-         {
--            if ((p.visco || p.type == 1) && !q)
--                throw std::runtime_error("visco/type=1 requires qfile= RSF Q model");
-+            if (p.visco && !q)
-+                throw std::runtime_error("visco=1 requires qfile= RSF Q model");
-             if (q)
-                 check_same_grid(vel, *q, "Q model");
-             ExtModel e;
-             e.nbc = p.nbc;
-             e.L = p.L;
-             e.nx = vel.nx + 2 * p.nbc;
-             e.nz = vel.nz + 2 * p.nbc;
-             e.dx = vel.dx;
-             e.dz = vel.dz;
-             e.alpha = p.alpha;
-             e.Omega0 = (p.Omega0 > 0 ? p.Omega0 : 2 * PI * p.f0);
-             e.fc = p.fc;
-             e.order = p.order;
--            e.type = p.visco ? 1 : p.type;
-+            e.type = p.visco ? 1 : 0;
-             e.vp.assign((size_t)e.nx * e.nz, 0);
-             e.Q.assign((size_t)e.nx * e.nz, std::max(1.0f, p.q));
-             for (int ix = 0; ix < e.nx; ++ix)
-             {
-                 int sx = clampi(ix - p.nbc, 0, vel.nx - 1);
-                 for (int iz = 0; iz < e.nz; ++iz)
-                 {
-                     int sz = clampi(iz - p.nbc, 0, vel.nz - 1);
-                     e.vp[idx(iz, ix, e.nz)] = vel.v[idx(sz, sx, vel.nz)];
-                     e.Q[idx(iz, ix, e.nz)] = q ? q->v[idx(sz, sx, vel.nz)] : p.q;
-                 }
-             }
-             if (p.flag_smooth)
-             {
-                 smooth2d_flat(e.nz, e.nx, 5, 5, e.vp);
-                 smooth2d_flat(e.nz, e.nx, 5, 5, e.Q);
-             }
-             return e;
-         }
- 
-         void apply_homo(ExtModel &e, int sx, int sz)
-         {
-             int is = idx(clampi(sz, 0, e.nz - 1), clampi(sx, 0, e.nx - 1), e.nz);
-             std::fill(e.vp.begin(), e.vp.end(), e.vp[is]);
-             std::fill(e.Q.begin(), e.Q.end(), e.Q[is]);
-@@ -324,55 +325,91 @@ namespace sewave
-             out->headers->n[0] = g.nz;
-             out->headers->n[1] = g.nx;
-             out->headers->o[0] = g.z0;
-             out->headers->o[1] = g.x0;
-             out->headers->d[0] = g.dz;
-             out->headers->d[1] = g.dx;
-             sep_set_header(out, "label1", "Depth");
-             sep_set_header(out, "label2", "Lateral");
-             sep_set_header(out, "label", "Wavefield");
-             se_fsio_write_float(out->data->io, crop.data(), crop.size());
-             sep_write_headers(out);
-             sep_close(out);
-         }
- 
-         void maybe_write_debug_snapshot(const ExtModel &e, const Grid2D *g, const std::vector<float> &wave, int step, const std::vector<int> *steps, const std::string *prefix, const char *kind, int shot)
-         {
-             if (!g || !steps || !prefix || prefix->empty() || !kind)
-                 return;
-             if (std::find(steps->begin(), steps->end(), step) == steps->end())
-                 return;
-             char name[512];
-             std::snprintf(name, sizeof(name), "%s_shot%d_%s_it%d.rsf", prefix->c_str(), shot, kind, step);
-             write_debug_snapshot(e, *g, wave, name);
-             INFO(("Wrote debug wavefield snapshot %s", name));
-         }
-+        void ensure_directory(const char *dir, const char *purpose)
-+        {
-+            if (::mkdir(dir, 0777) != 0 && errno != EEXIST)
-+                throw std::runtime_error(std::string("cannot create ") + dir + " directory for " + purpose);
-+        }
+diff --git a/docs/block_iterative_forward.md b/docs/block_iterative_forward.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a4e0dff71ee7eedef045f739da199c734b51981
+--- /dev/null
++++ b/docs/block_iterative_forward.md
+@@ -0,0 +1,86 @@
++# FMM 初场分块迭代正演
 +
-+        std::string shot_image_path(int shot)
-+        {
-+            char name[256];
-+            std::snprintf(name, sizeof(name), "temp_shot_img/shot_%06d.rsf", shot);
-+            return name;
-+        }
++`block_iterative_forward` 是一个串行二维声学正演程序。程序沿深度方向建立等厚核心区和等宽重叠区，调用 `reckirch` 中已有的 `efmm_*` 接口计算首波走时，以 FMM 射线场初始化下部区域，再用 FD8 局部求解和 Robin 特征条件执行乘法型向下—向上扫描。
 +
-+        void write_shot_image_rsf(const std::string &path, const Grid2D &g, const std::vector<float> &data, int shot, float shot_x, float shot_z)
-+        {
-+            sep_t *s = sep_open(path.c_str(), SEP_WRITE, 0);
-+            if (!s)
-+                throw std::runtime_error("cannot create per-shot image " + path);
-+            s->headers->ndim = 2;
-+            s->headers->n[0] = g.nz;
-+            s->headers->n[1] = g.nx;
-+            s->headers->o[0] = g.z0;
-+            s->headers->o[1] = g.x0;
-+            s->headers->d[0] = g.dz;
-+            s->headers->d[1] = g.dx;
-+            sep_set_header(s, "label1", "Depth");
-+            sep_set_header(s, "label2", "Lateral");
-+            sep_set_header(s, "label", "Per-shot RTM Image");
-+            sep_set_header_int(s, "shot_index", shot);
-+            sep_set_header_float(s, "shot_x", shot_x);
-+            sep_set_header_float(s, "shot_z", shot_z);
-+            sep_set_header_float(s, "sx", shot_x);
-+            sep_set_header_float(s, "sz", shot_z);
-+            se_fsio_write_float(s->data->io, const_cast<float *>(data.data()), data.size());
-+            sep_write_headers(s);
-+            sep_close(s);
-+        }
++## 算法流程
++
++1. 使用 `sewave::read_rsf2d` 读取 RSF 速度模型。
++2. 将深度网格等分为 `blocks` 个核心区，各区域上下分别扩展 `overlap` 个网格。`overlap` 是单侧宽度。
++3. 对每炮调用 `efmm_init`、`efmm_set_vel` 和 `efmm_solver`，获得全模型首波走时 \(T(\boldsymbol{x})\)。
++4. 采用二维几何扩散近似构造初始射线场：
++
++   \[
++   u^{\mathrm{ray}}(\boldsymbol{x},t)
++   =
++   a_{\mathrm{ray}}
++   \sqrt{\frac{h}{\max(v_sT(\boldsymbol{x}),h)}}
++   w\!\left(t-T(\boldsymbol{x})\right),
++   \]
++
++   其中 \(h=\min(\Delta x,\Delta z)\)，\(v_s\) 为震源点速度，默认 `ray_scale=1`。
++5. 第一区域用真实震源进行一次局部 FD8 正演；下部区域保留 FMM 射线界面历史作为迭代初值。
++6. 向下扫描使用
++
++   \[
++   \mathcal{B}^-u=u_t-\beta c u_z
++   \]
++
++   的相邻区域差值驱动下部区域。每个下部区域只读取已经更新的上部区域，因此此阶段不会提前引入深部反射。
++7. 向上扫描使用
++
++   \[
++   \mathcal{B}^+u=u_t+\beta c u_z
++   \]
++
++   的相邻区域差值，将深部反射和散射逐块返回到地表区域。
++8. 从第一区域的检波深度提取地震记录，使用 `sewave::write_rsf3d` 输出。
++
++局部区域内部采用时间二阶、空间八阶有限差分。人工界面附近的三个网格使用空间二阶模板，使单行 Robin 数据能够进入 FD8 内部；区域核心区仍采用 FD8。左右边界以及物理顶、底边界的吸收公式与 `sewave2d` 保持一致。基准脚本固定 `flag_smooth=0` 和 `type_compute_Laplace=0`，以避免速度光滑或伪谱核造成不一致。
++
++## 构建
++
++```bash
++cmake -S . -B build -DSE_USE_MPI=OFF
++cmake --build build --target block_iterative_forward sewave2d rsf_l2cmp -j
++```
++
++## 单次运行
++
++```bash
++build/bin/block_iterative_forward \
++  velocity=vel.rsf output=block_record.rsf \
++  nt=3210 dt=0.0005 fdom=15 \
++  sx=2500 sz=190 rz=190 \
++  blocks=4 overlap=22 cycles=1 \
++  beta=1.0 gate=0.003 \
++  nbc=40 L=30 alpha=1 \
++  ray_output=fmm_ray_record.rsf \
++  traveltime=fmm_time.rsf
++```
++
++`traveltime=` 当前只支持 `ns=1`；多炮正演可以省略该参数。多炮在炮循环中串行执行。
++
++## 与 sewave2d 串行比较
++
++```bash
++NT=3210 DT=0.0005 FDOM=15 \
++SX=2500 SZ=190 RZ=190 \
++REPEATS=3 \
++scripts/benchmark_block_iterative.sh vel.rsf
++```
++
++脚本执行以下控制：
++
++- `OMP_NUM_THREADS=1`，并将常见数学库线程数固定为 1；
++- `sewave2d` 使用声学 FD8、`flag_smooth=0`；
++- 两个程序采用相同的震源、时间采样、吸收边界和检波几何；
++- 使用现有 `rsf_l2cmp` 输出 `rel_l2` 与 `max_abs`；
++- GNU `time` 可用时，同时记录最大 RSS；否则 RSS 写为 `-1`。
++
++输出目录中包含 `benchmark_summary.txt`、`benchmark_metrics.csv`、两种地震记录、FMM 射线初始记录和逐次运行日志。
++
++## 已验证配置
++
++独立 C++ 同核测试采用 174×500 Marmousi 模型、\(\Delta x=\Delta z=10\) m、`nt=3210`、`dt=0.0005` s、`fdom=15` Hz、单炮 500 道记录。默认四块配置的相对 L2 记录误差为 0.947%，串行时间约为同核全域 FD8 的 2.15 倍。
++
++一次四块双扫包含第一区域震源传播、3 次向下校正和 3 次向上校正，共 7 次局部传播。因此该方法当前用于验证分块射线—波动校正和后续并行/多级算法研究；在串行条件下，不应预期它快于一次全域显式 FD8 正演。
+diff --git a/scripts/benchmark_block_iterative.sh b/scripts/benchmark_block_iterative.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..5fc11e9652a44608a411fbfee841cc4934bb1b13
+--- /dev/null
++++ b/scripts/benchmark_block_iterative.sh
+@@ -0,0 +1,221 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++usage() {
++    cat <<'EOF'
++Usage:
++  scripts/benchmark_block_iterative.sh VELOCITY_RSF [OUTPUT_DIR] [BIN_DIR]
++
++The script compares serial sewave2d FD8 modeling with the FMM-initialized
++equal-block Robin down/up solver. It reports median wall time, maximum RSS,
++and the relative L2/max-absolute record difference through rsf_l2cmp.
++
++Important environment overrides:
++  NT=2000 DT=0.0005 FDOM=15
++  SX=... SZ=... RZ=... NS=1 DS=0
++  BLOCKS=4 OVERLAP=22 CYCLES=1 BETA=1.0 GATE=0.003
++  NBC=40 L=30 ALPHA=1
++  REPEATS=3 WARMUP=1
++
++BIN_DIR must contain sewave2d, block_iterative_forward, and rsf_l2cmp.
++EOF
++}
++
++if [[ $# -lt 1 || $# -gt 3 ]]; then
++    usage
++    exit 2
++fi
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
++VELOCITY=$1
++OUTPUT_DIR=${2:-"${REPO_ROOT}/benchmark_block_iterative"}
++BIN_DIR=${3:-"${REPO_ROOT}/build/bin"}
++
++SEWAVE="${BIN_DIR}/sewave2d"
++BLOCK_FORWARD="${BIN_DIR}/block_iterative_forward"
++RSF_COMPARE="${BIN_DIR}/rsf_l2cmp"
++
++for executable in "${SEWAVE}" "${BLOCK_FORWARD}" "${RSF_COMPARE}"; do
++    if [[ ! -x "${executable}" ]]; then
++        echo "Missing executable: ${executable}" >&2
++        echo "Build targets sewave2d, block_iterative_forward, and rsf_l2cmp first." >&2
++        exit 2
++    fi
++done
++if [[ ! -f "${VELOCITY}" ]]; then
++    echo "Velocity RSF header not found: ${VELOCITY}" >&2
++    exit 2
++fi
++TIME_BIN=${TIME_BIN:-/usr/bin/time}
++if [[ -x "${TIME_BIN}" ]]; then
++    HAVE_GNU_TIME=1
++else
++    HAVE_GNU_TIME=0
++    echo "GNU time not found; wall time will be measured, max_rss_kib will be -1." >&2
++fi
++
++mkdir -p "${OUTPUT_DIR}"
++
++NT=${NT:-2000}
++DT=${DT:-0.0005}
++FDOM=${FDOM:-15}
++NS=${NS:-1}
++DS=${DS:-0}
++BLOCKS=${BLOCKS:-4}
++OVERLAP=${OVERLAP:-22}
++CYCLES=${CYCLES:-1}
++BETA=${BETA:-1.0}
++GATE=${GATE:-0.003}
++NBC=${NBC:-40}
++L=${L:-30}
++ALPHA=${ALPHA:-1}
++REPEATS=${REPEATS:-3}
++WARMUP=${WARMUP:-1}
++
++export OMP_NUM_THREADS=1
++export OMP_DYNAMIC=FALSE
++export OPENBLAS_NUM_THREADS=1
++export MKL_NUM_THREADS=1
++export VECLIB_MAXIMUM_THREADS=1
++export NUMEXPR_NUM_THREADS=1
++
++REFERENCE_RECORD="${OUTPUT_DIR}/sewave_fd8.rsf"
++BLOCK_RECORD="${OUTPUT_DIR}/block_iterative_fd8.rsf"
++RAY_RECORD="${OUTPUT_DIR}/fmm_ray_initial.rsf"
++TRAVEL_TIME="${OUTPUT_DIR}/fmm_traveltime.rsf"
++
++common_args=(
++    "velocity=${VELOCITY}"
++    "nt=${NT}"
++    "dt=${DT}"
++    "fdom=${FDOM}"
++    "ns=${NS}"
++    "ds=${DS}"
++    "nbc=${NBC}"
++    "L=${L}"
++    "alpha=${ALPHA}"
++    "progress_interval=0"
++)
++if [[ -n "${SX:-}" ]]; then common_args+=("sx=${SX}"); fi
++if [[ -n "${SZ:-}" ]]; then common_args+=("sz=${SZ}"); fi
++if [[ -n "${RZ:-}" ]]; then common_args+=("rz=${RZ}"); fi
++
++sewave_args=(
++    "mode=forward"
++    "output=${REFERENCE_RECORD}"
++    "type_compute_Laplace=0"
++    "visco=0"
++    "flag_smooth=0"
++    "${common_args[@]}"
++)
++block_args=(
++    "output=${BLOCK_RECORD}"
++    "ray_output=${RAY_RECORD}"
++    "blocks=${BLOCKS}"
++    "overlap=${OVERLAP}"
++    "cycles=${CYCLES}"
++    "beta=${BETA}"
++    "gate=${GATE}"
++    "${common_args[@]}"
++)
++if [[ "${NS}" -eq 1 ]]; then
++    block_args+=("traveltime=${TRAVEL_TIME}")
++fi
++if [[ -n "${RAY_SCALE:-}" ]]; then
++    block_args+=("ray_scale=${RAY_SCALE}")
++fi
++
++run_once() {
++    local label=$1
++    local timing_file=$2
++    shift 2
++    if [[ "${HAVE_GNU_TIME}" -eq 1 ]]; then
++        "${TIME_BIN}" -f '%e,%M' -o "${timing_file}" "$@" \
++            >"${OUTPUT_DIR}/${label}.log" 2>&1
++    else
++        local begin_ns
++        local end_ns
++        local elapsed
++        begin_ns=$(date +%s%N)
++        "$@" >"${OUTPUT_DIR}/${label}.log" 2>&1
++        end_ns=$(date +%s%N)
++        elapsed=$(awk -v begin="${begin_ns}" -v end="${end_ns}" \
++            'BEGIN { printf "%.9f", (end - begin) / 1.0e9 }')
++        printf '%s,-1\n' "${elapsed}" >"${timing_file}"
++    fi
++}
++
++if [[ "${WARMUP}" -ne 0 ]]; then
++    run_once warmup_sewave "${OUTPUT_DIR}/warmup_sewave.time" \
++        "${SEWAVE}" "${sewave_args[@]}"
++    run_once warmup_block "${OUTPUT_DIR}/warmup_block.time" \
++        "${BLOCK_FORWARD}" "${block_args[@]}"
++fi
++
++: >"${OUTPUT_DIR}/sewave_times.csv"
++: >"${OUTPUT_DIR}/block_times.csv"
++for ((run = 1; run <= REPEATS; ++run)); do
++    run_once "sewave_run_${run}" "${OUTPUT_DIR}/sewave_run_${run}.time" \
++        "${SEWAVE}" "${sewave_args[@]}"
++    cat "${OUTPUT_DIR}/sewave_run_${run}.time" \
++        >>"${OUTPUT_DIR}/sewave_times.csv"
++
++    run_once "block_run_${run}" "${OUTPUT_DIR}/block_run_${run}.time" \
++        "${BLOCK_FORWARD}" "${block_args[@]}"
++    cat "${OUTPUT_DIR}/block_run_${run}.time" \
++        >>"${OUTPUT_DIR}/block_times.csv"
++done
++
++median_column() {
++    local file=$1
++    local column=$2
++    awk -F, -v column="${column}" '{print $column}' "${file}" |
++        sort -n |
++        awk '
++            { value[NR] = $1 }
++            END {
++                if (NR % 2 == 1) print value[(NR + 1) / 2];
++                else print 0.5 * (value[NR / 2] + value[NR / 2 + 1]);
++            }'
++}
++
++maximum_column() {
++    local file=$1
++    local column=$2
++    awk -F, -v column="${column}" '
++        NR == 1 || $column > maximum { maximum = $column }
++        END { print maximum }' "${file}"
++}
++
++SEWAVE_SECONDS=$(median_column "${OUTPUT_DIR}/sewave_times.csv" 1)
++BLOCK_SECONDS=$(median_column "${OUTPUT_DIR}/block_times.csv" 1)
++SEWAVE_RSS_KIB=$(maximum_column "${OUTPUT_DIR}/sewave_times.csv" 2)
++BLOCK_RSS_KIB=$(maximum_column "${OUTPUT_DIR}/block_times.csv" 2)
++RATIO=$(awk -v block="${BLOCK_SECONDS}" -v reference="${SEWAVE_SECONDS}" \
++    'BEGIN { if (reference > 0) printf "%.6f", block / reference; else print "nan" }')
++
++COMPARE_OUTPUT=$("${RSF_COMPARE}" "a=${BLOCK_RECORD}" "b=${REFERENCE_RECORD}")
++printf '%s\n' "${COMPARE_OUTPUT}" >"${OUTPUT_DIR}/record_difference.txt"
++
++{
++    echo "method,median_wall_seconds,max_rss_kib"
++    echo "sewave_fd8,${SEWAVE_SECONDS},${SEWAVE_RSS_KIB}"
++    echo "fmm_block_robin_fd8,${BLOCK_SECONDS},${BLOCK_RSS_KIB}"
++} >"${OUTPUT_DIR}/benchmark_metrics.csv"
++
++{
++    echo "Serial forward-modeling benchmark"
++    echo "velocity=${VELOCITY}"
++    echo "nt=${NT} dt=${DT} fdom=${FDOM} ns=${NS} ds=${DS}"
++    echo "blocks=${BLOCKS} overlap=${OVERLAP} cycles=${CYCLES} beta=${BETA} gate=${GATE}"
++    echo "nbc=${NBC} L=${L} alpha=${ALPHA} repeats=${REPEATS}"
++    echo "sewave_median_seconds=${SEWAVE_SECONDS}"
++    echo "block_median_seconds=${BLOCK_SECONDS}"
++    echo "block_over_sewave_time_ratio=${RATIO}"
++    echo "sewave_max_rss_kib=${SEWAVE_RSS_KIB}"
++    echo "block_max_rss_kib=${BLOCK_RSS_KIB}"
++    echo "${COMPARE_OUTPUT}"
++} >"${OUTPUT_DIR}/benchmark_summary.txt"
++
++cat "${OUTPUT_DIR}/benchmark_summary.txt"
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index e18928025289910dd1a5a7772af2a74c8d5d1d5a..949d113f9d4f27e6938888bd355d3ad21c9e609c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -74,6 +74,7 @@ add_executable(rsf_l2cmp rsf_l2cmp.cpp)
+ add_executable(kirchmig2d_cig kirchmig2d_cig.cpp)
+ add_executable(sewave2d sewave2d_app.cpp ../SEWAVE/sewave2d.cpp)
+ add_executable(sewave2d_synth sewave2d_synth.cpp ../SEWAVE/sewave2d.cpp)
++add_executable(block_iterative_forward block_iterative_forward.cpp ../SEWAVE/sewave2d.cpp)
  
-         FILE *open_snapshot_temp(int shot, std::string &path)
-         {
--            if (::mkdir("temp_img", 0777) != 0 && errno != EEXIST)
--                throw std::runtime_error("cannot create temp_img directory for source snapshots");
-+            ensure_directory("temp_img", "source snapshots");
-             char name[256];
-             std::snprintf(name, sizeof(name), "temp_img/sewave_snap_%ld_shot_%d_XXXXXX", (long)::getpid(), shot);
-             int fd = ::mkstemp(name);
-             if (fd < 0)
-                 throw std::runtime_error("cannot create source snapshot temporary file in temp_img");
-             FILE *fp = ::fdopen(fd, "w+b");
-             if (!fp)
-             {
-                 ::close(fd);
-                 ::unlink(name);
-                 throw std::runtime_error("cannot open source snapshot temporary file stream");
-             }
-             path = name;
-             return fp;
-         }
+ # 查找系统库（SQLite3 依赖）
+ find_library(DL_LIBRARY dl)
+@@ -103,15 +104,18 @@ target_link_libraries(rsf_l2cmp ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_
+ target_link_libraries(kirchmig2d_cig ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} ${DL_LIBRARY} Threads::Threads)
+ target_link_libraries(sewave2d ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+ target_link_libraries(sewave2d_synth ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
++target_link_libraries(block_iterative_forward ${SEFILESYSTEM_LIB} ${SEBASIC_LIB} ${SERECKIRCH_LIB} fftw3f ${DL_LIBRARY} Threads::Threads)
+ if(OpenMP_CXX_FOUND)
+     target_link_libraries(sewave2d OpenMP::OpenMP_CXX)
+     target_link_libraries(sewave2d_synth OpenMP::OpenMP_CXX)
++    target_link_libraries(block_iterative_forward OpenMP::OpenMP_CXX)
+ endif()
+ target_include_directories(kirchdat2d_freq PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+ target_include_directories(layer_kirchhoff_test PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+ target_include_directories(layered_frequency_wavefield PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+ target_include_directories(sewave2d PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
+ target_include_directories(sewave2d_synth PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
++target_include_directories(block_iterative_forward PRIVATE ${CMAKE_SOURCE_DIR}/fftw/api)
  
-         int count_stored_snapshots(int nt, int interval, int offset)
-         {
-             if (interval <= 1)
-                 return nt;
-             if (offset < 0)
-                 offset = 0;
-             if (offset >= interval)
-                 offset %= interval;
-             if (offset >= nt)
-@@ -637,93 +674,126 @@ namespace sewave
-             int sx = xindex(vel, p.sx + is * p.ds) + e.nbc, sz = zindex(vel, p.sz) + e.nbc, rz = zindex(vel, p.rz) + e.nbc;
-             if (p.flag_homo)
-                 apply_homo(e, sx, sz);
-             propagate(e, out.nt, out.dt, p.type_compute_laplace, false, 1, sx, sz, rz, true, p.progress_interval, label, &src, &rec, nullptr, nullptr, nullptr);
-             std::memcpy(&out.d[(size_t)is * out.nr * out.nt], rec.data(), rec.size() * sizeof(float));
-         }
-         return out;
-     }
+ # 安装所有可执行文件到 bin 目录
+ install(TARGETS
+@@ -137,6 +141,7 @@ install(TARGETS
+     kirchmig2d_cig
+     sewave2d
+     sewave2d_synth
++    block_iterative_forward
+ )
  
-     std::vector<float> rtm_image(const Grid2D &vel, const Data3D &data, const ImageParams &p, const Grid2D *qmodel)
-     {
-         ExtModel ebase = make_ext(vel, qmodel, p);
-         int shot0 = std::max(0, p.shot_begin);
-         int shot1 = (p.shot_end < 0) ? data.ns - 1 : std::min(data.ns - 1, p.shot_end);
-         if (shot0 > shot1)
-             throw std::runtime_error("empty shot range for imaging");
-         int shot_threads = std::max(1, p.max_parallel_shots);
- #ifdef _OPENMP
-         shot_threads = std::min(shot_threads, omp_get_max_threads());
- #endif
-         int snapshot_interval = std::max(1, p.snapshot_interval);
-         int rec_snapshot_offset = 0;
-         int src_snapshot_offset = (data.nt - 1) % snapshot_interval;
-         int stored_snaps = count_stored_snapshots(data.nt, snapshot_interval, rec_snapshot_offset);
-         size_t snap_bytes = (size_t)stored_snaps * ebase.nx * ebase.nz * sizeof(float);
-+        int amp_sign = p.compensate ? -1 : 1;
-         INFO(("RTM shot parallelism=%d, snapshot_interval=%d, stored snapshots per wavefield=%d/%d, source snapshots per active shot=%.3f GiB (%s)",
-               shot_threads, snapshot_interval, stored_snaps, data.nt, snap_bytes / (1024.0 * 1024.0 * 1024.0), p.in_memory_snapshots ? "memory" : "disk temporary file"));
--        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
-+        ensure_directory("temp_shot_img", "per-shot images");
-+        std::vector<int> shot_imaged(data.ns, 0);
- #pragma omp parallel for schedule(dynamic) num_threads(shot_threads)
-         for (int is = shot0; is <= shot1; ++is)
-         {
-             ExtModel e = ebase;
-+            float sx = data.s0 + is * data.ds;
-+            int six0 = xindex_unclamped(vel, sx);
-+            int siz0 = zindex_unclamped(vel, p.sz);
-+            if (six0 < 0 || six0 >= vel.nx || siz0 < 0 || siz0 >= vel.nz)
+ # 确保依赖的库先编译完成
+@@ -162,3 +167,4 @@ add_dependencies(rsf_l2cmp sebasic sefs reckirch)
+ add_dependencies(kirchmig2d_cig sebasic sefs reckirch)
+ add_dependencies(sewave2d sebasic sefs fftw3f)
+ add_dependencies(sewave2d_synth sebasic sefs fftw3f)
++add_dependencies(block_iterative_forward sebasic sefs reckirch fftw3f)
+diff --git a/src/block_iterative_forward.cpp b/src/block_iterative_forward.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fcad43bd710f522645c522624a20dfa48872beb4
+--- /dev/null
++++ b/src/block_iterative_forward.cpp
+@@ -0,0 +1,1386 @@
++#include <SEBASIC/include/se_basic.h>
++#include <SEFILESYSTEM/include/se_par_sep.h>
++#include <SERECKIRCH/include/efmm.h>
++
++#include "../SEWAVE/sewave2d.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace
++{
++constexpr float PI = 3.14159265358979323846f;
++
++inline size_t index2(int iz, int ix, int nz)
++{
++    return static_cast<size_t>(ix) * static_cast<size_t>(nz) +
++           static_cast<size_t>(iz);
++}
++
++inline size_t trace_index(int it, int ix, int nx)
++{
++    return static_cast<size_t>(it) * static_cast<size_t>(nx) +
++           static_cast<size_t>(ix);
++}
++
++int clamp_int(int value, int lower, int upper)
++{
++    return std::max(lower, std::min(upper, value));
++}
++
++float ricker(float time, float frequency)
++{
++    const float tau = time - 1.5f / frequency;
++    const float value = PI * frequency * tau;
++    return (1.0f - 2.0f * value * value) * std::exp(-value * value);
++}
++
++struct Block
++{
++    int index = 0;
++    int core_start = 0;
++    int core_end = 0;
++    int local_start = 0;
++    int local_end = 0;
++};
++
++struct Domain
++{
++    Block block;
++    int physical_nx = 0;
++    int nx = 0;
++    int nz = 0;
++    int nbc = 0;
++    int top_pad = 0;
++    int bottom_pad = 0;
++    bool physical_top = false;
++    bool physical_bottom = false;
++    float dx = 1.0f;
++    float dz = 1.0f;
++    float dt = 0.001f;
++    int absorb_length = 30;
++    float absorb_alpha = 1.0f;
++    std::vector<float> velocity;
++    std::vector<float> v2dt2;
++};
++
++struct State
++{
++    std::map<int, std::vector<float>> traces;
++    std::vector<float> receiver;
++};
++
++struct SolveStats
++{
++    long long updated_points = 0;
++    int active_steps = 0;
++};
++
++struct ShotStats
++{
++    double fmm_seconds = 0.0;
++    double initial_seconds = 0.0;
++    double sweep_seconds = 0.0;
++    double ray_scale = 1.0;
++    double final_interface_residual = 0.0;
++    long long updated_points = 0;
++    int local_solves = 0;
++};
++
++struct Parameters
++{
++    int nt = 1000;
++    float dt = 0.001f;
++    float fdom = 20.0f;
++    float sx = 0.0f;
++    float sz = 0.0f;
++    float rz = 0.0f;
++    int ns = 1;
++    float ds = 0.0f;
++    int blocks = 4;
++    int overlap = 22;
++    int cycles = 1;
++    float beta = 1.0f;
++    float gate = 0.003f;
++    int nbc = 40;
++    int absorb_length = 30;
++    float absorb_alpha = 1.0f;
++    float ray_scale = 1.0f;
++    int progress_interval = 0;
++};
++
++void print_usage(const char *program)
++{
++    const char *name =
++        (program != nullptr && program[0] != '\0')
++            ? program
++            : "block_iterative_forward";
++    std::printf(
++        "Usage:\n"
++        "  %s velocity=vel.rsf output=data.rsf [parameters]\n\n"
++        "Wave and geometry parameters:\n"
++        "  nt=INT dt=FLOAT fdom=FLOAT  Time samples, step, and Ricker dominant frequency.\n"
++        "  sx=FLOAT sz=FLOAT rz=FLOAT  First source x, source depth, and receiver depth.\n"
++        "  ns=INT ds=FLOAT             Number of shots and shot spacing.\n\n"
++        "Block-iteration parameters:\n"
++        "  blocks=INT                  Number of equal-depth core blocks. Default: 4.\n"
++        "  overlap=INT                 Per-side overlap in grid rows. Default: 22.\n"
++        "  cycles=INT                  Down/up Robin sweep cycles. Default: 1.\n"
++        "  beta=FLOAT                  Characteristic/Robin coefficient. Default: 1.0.\n"
++        "  gate=FLOAT                  Relative causal activation gate. Default: 0.003.\n"
++        "  ray_scale=FLOAT             FMM geometrical-spreading amplitude scale. Default: 1.0.\n\n"
++        "Boundary and diagnostic parameters:\n"
++        "  nbc=INT L=INT alpha=FLOAT   Side/physical-boundary padding and absorber settings.\n"
++        "  ray_output=FILE             Optional initial FMM ray record in RSF format.\n"
++        "  traveltime=FILE             Optional FMM travel-time field (one shot only).\n"
++        "  progress_interval=INT       Print local time-step progress every INT samples.\n\n"
++        "The program is serial. It uses the existing efmm implementation for the\n"
++        "first-arrival field and the repository RSF readers/writers for I/O.\n",
++        name);
++}
++
++std::vector<Block> make_blocks(int nz, int count, int overlap)
++{
++    std::vector<int> edges(static_cast<size_t>(count) + 1);
++    for (int ib = 0; ib <= count; ++ib)
++    {
++        const double position =
++            static_cast<double>(ib) * static_cast<double>(nz) /
++            static_cast<double>(count);
++        edges[ib] = static_cast<int>(std::floor(position + 0.5));
++    }
++    edges.front() = 0;
++    edges.back() = nz;
++
++    std::vector<Block> blocks;
++    blocks.reserve(count);
++    for (int ib = 0; ib < count; ++ib)
++    {
++        Block block;
++        block.index = ib;
++        block.core_start = edges[ib];
++        block.core_end = edges[ib + 1];
++        block.local_start = std::max(0, block.core_start - overlap);
++        block.local_end = std::min(nz, block.core_end + overlap);
++        blocks.push_back(block);
++    }
++    return blocks;
++}
++
++std::vector<int> robin_query_rows(
++    const std::vector<Block> &blocks,
++    int block_index)
++{
++    std::vector<int> rows;
++    auto append_three = [&rows](int row)
++    {
++        rows.push_back(row - 1);
++        rows.push_back(row);
++        rows.push_back(row + 1);
++    };
++
++    if (block_index > 0)
++    {
++        append_three(blocks[block_index].local_start);
++        append_three(blocks[block_index - 1].local_end - 1);
++    }
++    if (block_index + 1 < static_cast<int>(blocks.size()))
++    {
++        append_three(blocks[block_index + 1].local_start);
++        append_three(blocks[block_index].local_end - 1);
++    }
++
++    const Block &block = blocks[block_index];
++    rows.erase(
++        std::remove_if(
++            rows.begin(),
++            rows.end(),
++            [&block](int row)
 +            {
-+#pragma omp critical(sewave_shot_skip_log)
-+                {
-+                    INFO(("image shot %d skipped: source position outside velocity model (shot_x=%g shot_z=%g, ix=%d iz=%d, valid ix=0-%d iz=0-%d)",
-+                          is, sx, p.sz, six0, siz0, vel.nx - 1, vel.nz - 1));
-+                }
-+                continue;
-+            }
-             std::vector<float> local((size_t)vel.nx * vel.nz, 0.0f);
-             std::vector<float> src(data.nt), shot((size_t)(e.nx - 2 * e.nbc) * data.nt, 0.0f), snaps;
-             if (p.in_memory_snapshots)
-                 snaps.resize((size_t)stored_snaps * e.nx * e.nz);
-             std::string snap_path, rec_snap_path;
-             FILE *snap_tmp = p.in_memory_snapshots ? nullptr : open_snapshot_temp(is, snap_path);
-             FILE *rec_snap_tmp = open_snapshot_temp(is, rec_snap_path);
-             char src_label[80], rec_label[80];
-             std::snprintf(src_label, sizeof(src_label), "image source shot %d", is);
-             std::snprintf(rec_label, sizeof(rec_label), "image receiver shot %d", is);
-             for (int it = 0; it < data.nt; ++it)
-                 src[it] = ricker(it * data.dt, p.fdom);
--            float sx = data.s0 + is * data.ds;
--            int six = xindex(vel, sx) + e.nbc, siz = zindex(vel, p.sz) + e.nbc;
-+            int six = six0 + e.nbc, siz = siz0 + e.nbc;
-             if (p.flag_homo)
-                 apply_homo(e, six, siz);
--            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
-+            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
-                       snapshot_interval, src_snapshot_offset, snapshot_interval, src_snapshot_offset,
-                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "src", is);
-             int skipped_receivers = 0;
-             for (int ir = 0; ir < data.nr; ++ir)
-             {
-                 float rx = p.cmp ? sx + data.r0 + ir * data.dr : data.r0 + ir * data.dr;
-                 int ix = xindex_unclamped(vel, rx);
-                 if (ix < 0 || ix >= vel.nx)
-                 {
-                     ++skipped_receivers;
-                     continue;
-                 }
-                 for (int it = 0; it < data.nt; ++it)
-                     shot[(size_t)ix * data.nt + it] += data.d[((size_t)is * data.nr + ir) * data.nt + it];
-             }
-             if (skipped_receivers > 0)
-                 INFO(("image shot %d: skipped %d receivers outside velocity model", is, skipped_receivers));
-             if (!p.debug_wavefield_prefix.empty())
-                 report_gather_energy(shot, e.nx - 2 * e.nbc, data.nt, is, p.debug_wavefield_prefix, vel.x0, vel.dx, data.dt);
--            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, p.amp_compensation_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
-+            propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, 0, zindex(vel, p.rz) + e.nbc, zindex(vel, p.rz) + e.nbc, false, p.progress_interval, rec_label, &shot, nullptr, nullptr, nullptr, nullptr, rec_snap_tmp, nullptr,
-                       snapshot_interval, rec_snapshot_offset, snapshot_interval, src_snapshot_offset,
-                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "rec", is);
-             correlate_snapshots(e, data.nt, snapshot_interval, src_snapshot_offset, rec_snapshot_offset, p.in_memory_snapshots ? &snaps : nullptr, snap_tmp, rec_snap_tmp, local);
-             if (rec_snap_tmp)
-             {
-                 std::fclose(rec_snap_tmp);
-                 if (!rec_snap_path.empty())
-                     ::unlink(rec_snap_path.c_str());
-             }
-             if (snap_tmp)
-             {
-                 std::fclose(snap_tmp);
-                 if (!snap_path.empty())
-                     ::unlink(snap_path.c_str());
-             }
--#pragma omp critical(sewave_image_stack)
-+            std::string shot_img_path = shot_image_path(is);
-+#pragma omp critical(sewave_shot_image_write)
-             {
--                for (size_t i = 0; i < image.size(); ++i)
--                    image[i] += local[i];
-+                write_shot_image_rsf(shot_img_path, vel, local, is, sx, p.sz);
-+                shot_imaged[is] = 1;
-+                INFO(("Wrote per-shot image %s with shot_x=%g shot_z=%g", shot_img_path.c_str(), sx, p.sz));
-             }
-         }
-+        std::vector<float> image((size_t)vel.nx * vel.nz, 0.0f);
-+        int stacked_shots = 0;
-+        for (int is = shot0; is <= shot1; ++is)
++                return row < block.local_start || row >= block.local_end;
++            }),
++        rows.end());
++    std::sort(rows.begin(), rows.end());
++    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
++    return rows;
++}
++
++Domain make_domain(
++    const sewave::Grid2D &grid,
++    const Block &block,
++    const Parameters &parameters)
++{
++    Domain domain;
++    domain.block = block;
++    domain.physical_nx = grid.nx;
++    domain.nbc = parameters.nbc;
++    domain.physical_top = block.local_start == 0;
++    domain.physical_bottom = block.local_end == grid.nz;
++    domain.top_pad = domain.physical_top ? parameters.nbc : 0;
++    domain.bottom_pad = domain.physical_bottom ? parameters.nbc : 0;
++    domain.nx = grid.nx + 2 * parameters.nbc;
++    domain.nz =
++        block.local_end - block.local_start +
++        domain.top_pad + domain.bottom_pad;
++    domain.dx = grid.dx;
++    domain.dz = grid.dz;
++    domain.dt = parameters.dt;
++    domain.absorb_length = parameters.absorb_length;
++    domain.absorb_alpha = parameters.absorb_alpha;
++    domain.velocity.resize(
++        static_cast<size_t>(domain.nx) * static_cast<size_t>(domain.nz));
++    domain.v2dt2.resize(domain.velocity.size());
++
++    for (int ix = 0; ix < domain.nx; ++ix)
++    {
++        const int global_x =
++            clamp_int(ix - parameters.nbc, 0, grid.nx - 1);
++        for (int iz = 0; iz < domain.nz; ++iz)
 +        {
-+            if (!shot_imaged[is])
-+                continue;
-+            std::string shot_img_path = shot_image_path(is);
-+            Grid2D shot_img = read_rsf2d(shot_img_path);
-+            check_same_grid(vel, shot_img, shot_img_path.c_str());
-+            for (size_t i = 0; i < image.size(); ++i)
-+                image[i] += shot_img.v[i];
-+            ++stacked_shots;
++            const int global_z = clamp_int(
++                block.local_start + iz - domain.top_pad,
++                0,
++                grid.nz - 1);
++            const float velocity =
++                grid.v[index2(global_z, global_x, grid.nz)];
++            const size_t id = index2(iz, ix, domain.nz);
++            domain.velocity[id] = velocity;
++            domain.v2dt2[id] =
++                velocity * velocity * parameters.dt * parameters.dt;
 +        }
-+        if (stacked_shots == 0)
-+            INFO(("image shot stack: no shots were inside the velocity model; returning zero image"));
-+        else if (stacked_shots < shot1 - shot0 + 1)
-+            INFO(("image shot stack: stacked %d/%d shots; skipped %d shots outside the velocity model",
-+                  stacked_shots, shot1 - shot0 + 1, shot1 - shot0 + 1 - stacked_shots));
-         return image;
-     }
- } // namespace sewave
-diff --git a/SEWAVE/sewave2d.h b/SEWAVE/sewave2d.h
-index 07ffb8caa959af7276344798cbcdc94ea0950f27..c4b28ea7468d63890e7aeb891a5c0903e5edcf3d 100644
---- a/SEWAVE/sewave2d.h
-+++ b/SEWAVE/sewave2d.h
-@@ -1,22 +1,22 @@
- #ifndef SEWAVE2D_H
- #define SEWAVE2D_H
- 
- #include <string>
- #include <vector>
- 
- namespace sewave {
- 
- struct Grid2D { int nz=0,nx=0; float dz=1,dx=1,z0=0,x0=0; std::vector<float> v; };
- struct Data3D { int nt=0,nr=0,ns=0; float dt=0.001f,dr=1,ds=1,t0=0,r0=0,s0=0; std::vector<float> d; };
--struct ForwardParams { float dt=0.001f; int nt=1000; float fdom=20; float sx=0, sz=0; float rz=0; int nr=0; float r0=0, dr=1; int ns=1; float ds=0; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; int type=1; bool visco=false; float q=1000; float f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; };
--struct ImageParams { bool cmp=true; bool compensate=false; int type=1; bool visco=false; float q=1000; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; float sz=0, rz=0; int shot_begin=0, shot_end=-1; int amp_compensation_sign=-1; float fdom=20, f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; int max_parallel_shots=1; bool in_memory_snapshots=false; int snapshot_interval=1; std::vector<int> debug_snapshot_steps; std::string debug_wavefield_prefix; };
-+struct ForwardParams { float dt=0.001f; int nt=1000; float fdom=20; float sx=0, sz=0; float rz=0; int nr=0; float r0=0, dr=1; int ns=1; float ds=0; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; int type=0; bool visco=false; float q=1000; float f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; };
-+struct ImageParams { bool cmp=true; bool compensate=false; int type=0; bool visco=false; float q=1000; int nbc=100,L=30; float alpha=1.0f; int type_compute_laplace=1; float sz=0, rz=0; int shot_begin=0, shot_end=-1; int amp_compensation_sign=1; float fdom=20, f0=20,Omega0=0,fc=120; int order=2; bool flag_smooth=true, flag_homo=false; int progress_interval=0; int max_parallel_shots=1; bool in_memory_snapshots=false; int snapshot_interval=1; std::vector<int> debug_snapshot_steps; std::string debug_wavefield_prefix; };
- 
- Grid2D read_rsf2d(const std::string& path);
- Data3D read_rsf3d(const std::string& path);
- void write_rsf2d(const std::string& path, const Grid2D& g, const std::vector<float>& data, const char* label="Amplitude");
- void write_rsf3d(const std::string& path, const Data3D& d);
- Data3D forward(const Grid2D& vel, const ForwardParams& p, const Grid2D* qmodel=nullptr);
- std::vector<float> rtm_image(const Grid2D& vel, const Data3D& data, const ImageParams& p, const Grid2D* qmodel=nullptr);
- 
- } // namespace sewave
- #endif
-diff --git a/src/sewave2d_app.cpp b/src/sewave2d_app.cpp
-index 32ab6e8acc70f9bb7dda24369072c6f7bbbf151d..c90e57acda58b3ab6dbfba1fa04fe95b864086cc 100644
---- a/src/sewave2d_app.cpp
-+++ b/src/sewave2d_app.cpp
-@@ -15,96 +15,101 @@
- namespace {
- void print_usage(const char* prog) {
-     const char* name = (prog && prog[0]) ? prog : "sewave2d";
-     std::printf(
-         "Usage:\n"
-         "  %s mode=forward velocity=vel.rsf output=data.rsf [forward parameters]\n"
-         "  %s mode=image velocity=vel.rsf seismic_data=data.rsf migration=image.rsf [imaging parameters]\n"
-         "\n"
-         "Required parameters:\n"
-         "  mode=forward|image          Run synthetic modeling or RTM imaging. Default: forward.\n"
-         "  velocity=FILE              2D RSF velocity model.\n"
-         "  output=FILE                Forward-mode output seismic RSF.\n"
-         "  seismic_data=FILE          Image-mode input seismic RSF.\n"
-         "  migration=FILE             Image-mode output RTM image RSF.\n"
-         "\n"
-         "Common wave-equation parameters:\n"
-         "  dt=FLOAT                   Time step for forward modeling. Default: 0.001.\n"
-         "  nt=INT                     Number of time samples for forward modeling. Default: 1000.\n"
-         "  fdom=FLOAT                 Ricker dominant frequency. Default: 20.\n"
-         "  sz=FLOAT                   Source depth. Default: velocity z origin.\n"
-         "  rz=FLOAT                   Receiver depth. Default: sz.\n"
-         "  nbc=INT                    Absorbing boundary cells. Default: 100.\n"
-         "  L=INT                      Absorbing boundary taper length. Default: 30.\n"
-         "  alpha=FLOAT                Absorbing boundary strength. Default: 1.\n"
-         "  type_compute_Laplace=0|1   Laplacian method: 0=FD8, 1=pseudospectral. Default: 1.\n"
--        "  type=INT                   Propagator type; type=1 uses Q/visco path. Default: 1.\n"
--        "  visco=0|1                  Enable visco-acoustic mode. Default: 0.\n"
--        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1 or type=1.\n"
--        "  q=FLOAT                    Constant Q fallback/default. Default: 1000.\n"
-+        "  visco=0|1                  Wave mode: 0=acoustic, 1=visco-acoustic/Q path. Default: 0.\n"
-+        "  qfile=FILE or Qfile=FILE   RSF Q model required when visco=1.\n"
-+        "  f0=FLOAT                   Reference frequency for visco mode. Default: fdom.\n"
-+        "  Omega0=FLOAT               Reference angular frequency override. Default: 2*pi*f0.\n"
-+        "  fc=FLOAT order=INT         Wavenumber filter cutoff/order. Defaults: 120, 2.\n"
-         "  flag_smooth=0|1            Smooth extended velocity/Q model. Default: 1.\n"
-         "  flag_homo=0|1              Use homogeneous model at source velocity. Default: 0.\n"
-         "  progress_interval=INT      Print propagation progress every INT steps.\n"
-         "\n"
-         "Forward parameters:\n"
-         "  sx=FLOAT                   First shot x coordinate. Default: model center.\n"
-         "  ns=INT                     Number of shots. Default: 1.\n"
-         "  ds=FLOAT                   Shot x spacing. Default: 0.\n"
-         "  nr=INT r0=FLOAT dr=FLOAT   Receiver count/origin/spacing; receiver output uses model x grid.\n"
-         "\n"
-         "Image parameters:\n"
-         "  cmp=0|1                    Treat receiver axis as offset from shot when 1. Default: 1.\n"
-         "  shot_begin=INT             First shot index to image, zero-based. Alias: first_shot. Default: 0.\n"
-         "  shot_end=INT               Last shot index to image, zero-based. Alias: last_shot. Default: last input shot.\n"
-         "  max_parallel_shots=INT     Maximum shots imaged concurrently. Aliases: parallel_shots, omp_shots. Default: 1.\n"
-         "  in_memory_snapshots=0|1    Store source snapshots in memory instead of temp_img files. Default: 0.\n"
-         "  snapshot_interval=INT      Store and correlate one RTM wavefield snapshot every INT time steps. Alias: snapshot_stride. Default: 1.\n"
-         "  max_nt=INT                 Truncate input data time samples before imaging.\n"
-         "  resample_dt=FLOAT          Resample input data in time before imaging.\n"
--        "  compensate=0|1             Enable Q-compensation sign default. Default: 0.\n"
--        "  amp_compensation_sign=-1|1  -1=Q compensation, 1=Q attenuation.\n"
-+        "  compensate=0|1             Enable RTM Q compensation: 0=attenuation/no compensation, 1=Q compensation. Default: 0.\n"
-         "  debug_wavefield_prefix=STR Write selected debug wavefields/gathers with this prefix.\n"
-         "  debug_snapshot_steps=LIST  Comma-separated or array time-step list for debug snapshots.\n"
-         "\n"
-         "Examples:\n"
-         "  %s mode=forward velocity=vel.rsf qfile=q.rsf output=data.rsf nt=2000 dt=0.001 sx=0 ns=10 ds=25\n"
-         "  %s mode=image velocity=vel.rsf qfile=q.rsf seismic_data=data.rsf migration=img.rsf shot_begin=0 shot_end=9 snapshot_interval=5\n",
-         name, name, name, name);
- }
- 
- void truncate_nt(sewave::Data3D& d, int max_nt) {
-     if (max_nt <= 0 || max_nt >= d.nt) return;
-     std::vector<float> out((size_t)d.ns * d.nr * max_nt, 0.0f);
-     for (int is = 0; is < d.ns; ++is)
-         for (int ir = 0; ir < d.nr; ++ir)
-             std::copy_n(&d.d[((size_t)is * d.nr + ir) * d.nt], max_nt,
-                         &out[((size_t)is * d.nr + ir) * max_nt]);
-     d.nt = max_nt;
-     d.d.swap(out);
- }
-+const char* laplace_name(int type_laplace) {
-+    return type_laplace == 1 ? "pseudospectral" : "FD8";
++    }
++    return domain;
 +}
- 
--
-+double effective_omega0(float f0, float Omega0) {
-+    return Omega0 > 0.0f ? Omega0 : 2.0 * M_PI * f0;
++
++void apply_laplacian(
++    const Domain &domain,
++    const std::vector<float> &current,
++    std::vector<float> &laplacian)
++{
++    std::fill(laplacian.begin(), laplacian.end(), 0.0f);
++    const float dx2 = domain.dx * domain.dx;
++    const float dz2 = domain.dz * domain.dz;
++
++    // The three rows adjacent to an artificial boundary use FD2 so that a
++    // one-row Robin condition can enter the FD8 interior.
++    for (int ix = 4; ix < domain.nx - 4; ++ix)
++    {
++        for (int iz = 1; iz < domain.nz - 1; ++iz)
++        {
++            if ((domain.physical_top && iz < 4) ||
++                (domain.physical_bottom && iz >= domain.nz - 4))
++                continue;
++            const size_t id = index2(iz, ix, domain.nz);
++            laplacian[id] =
++                (current[index2(iz, ix - 1, domain.nz)] -
++                 2.0f * current[id] +
++                 current[index2(iz, ix + 1, domain.nz)]) /
++                    dx2 +
++                (current[index2(iz - 1, ix, domain.nz)] -
++                 2.0f * current[id] +
++                 current[index2(iz + 1, ix, domain.nz)]) /
++                    dz2;
++        }
++    }
++
++    for (int ix = 4; ix < domain.nx - 4; ++ix)
++    {
++        for (int iz = 4; iz < domain.nz - 4; ++iz)
++        {
++            const size_t id = index2(iz, ix, domain.nz);
++            const float d2x =
++                (-1.0f / 560.0f) *
++                    (current[index2(iz, ix - 4, domain.nz)] +
++                     current[index2(iz, ix + 4, domain.nz)]) +
++                (8.0f / 315.0f) *
++                    (current[index2(iz, ix - 3, domain.nz)] +
++                     current[index2(iz, ix + 3, domain.nz)]) -
++                (1.0f / 5.0f) *
++                    (current[index2(iz, ix - 2, domain.nz)] +
++                     current[index2(iz, ix + 2, domain.nz)]) +
++                (8.0f / 5.0f) *
++                    (current[index2(iz, ix - 1, domain.nz)] +
++                     current[index2(iz, ix + 1, domain.nz)]) -
++                (205.0f / 72.0f) * current[id];
++            const float d2z =
++                (-1.0f / 560.0f) *
++                    (current[index2(iz - 4, ix, domain.nz)] +
++                     current[index2(iz + 4, ix, domain.nz)]) +
++                (8.0f / 315.0f) *
++                    (current[index2(iz - 3, ix, domain.nz)] +
++                     current[index2(iz + 3, ix, domain.nz)]) -
++                (1.0f / 5.0f) *
++                    (current[index2(iz - 2, ix, domain.nz)] +
++                     current[index2(iz + 2, ix, domain.nz)]) +
++                (8.0f / 5.0f) *
++                    (current[index2(iz - 1, ix, domain.nz)] +
++                     current[index2(iz + 1, ix, domain.nz)]) -
++                (205.0f / 72.0f) * current[id];
++            laplacian[id] = d2x / dx2 + d2z / dz2;
++        }
++    }
 +}
- 
- std::vector<int> parse_int_list(const char* text) {
-     std::vector<int> values;
-     if (!text) return values;
-     std::stringstream ss(text);
-     std::string item;
-     while (std::getline(ss, item, ',')) {
-         if (!item.empty()) values.push_back(std::max(1, std::atoi(item.c_str())));
-     }
-     std::sort(values.begin(), values.end());
-     values.erase(std::unique(values.begin(), values.end()), values.end());
-     return values;
- }
- 
- void check_stability(const sewave::Grid2D& vel, float dt, int type_laplace, const char* label) {
-     if (dt <= 0.0f || vel.v.empty() || vel.dx <= 0.0f || vel.dz <= 0.0f) return;
-     const float vmax = *std::max_element(vel.v.begin(), vel.v.end());
-     const double inv_h = std::sqrt(1.0 / (vel.dx * vel.dx) + 1.0 / (vel.dz * vel.dz));
-     const double cfl = vmax * dt * inv_h;
-     double dt_limit = 0.45 / (vmax * inv_h);
-     const char* method = "FD8";
-     if (type_laplace == 1) {
-         const double kmax = std::sqrt((M_PI / vel.dx) * (M_PI / vel.dx) + (M_PI / vel.dz) * (M_PI / vel.dz));
-         dt_limit = 2.0 / (vmax * kmax);
-         method = "PS";
-@@ -136,146 +141,188 @@ void resample_time(sewave::Data3D& d, float resample_dt) {
-                 const float a = pos - i0;
-                 trace[it] = (1.0f - a) * in[i0] + a * in[i1];
-             }
-         }
-     }
-     d.nt = new_nt;
-     d.dt = resample_dt;
-     d.d.swap(out);
- }
- }
- 
- int main(int argc, char** argv) {
-     if (argc <= 1 || (argc == 2 && (!std::strcmp(argv[1], "-h") || !std::strcmp(argv[1], "--help") || !std::strcmp(argv[1], "help")))) {
-         print_usage(argv[0]);
-         return 0;
-     }
-     se_par_init(argc, argv);
-     try {
- #ifdef _OPENMP
-         INFO(("OpenMP enabled, max_threads=%d", omp_get_max_threads()));
- #else
-         INFO(("OpenMP disabled at compile time"));
- #endif
-         const char* mode = se_have_par("mode") ? se_get_par_str("mode") : "forward";
-         if (!se_have_par("velocity")) ERROR(("Need velocity= RSF velocity model"));
--        sewave::Grid2D vel = sewave::read_rsf2d(se_get_par_str("velocity"));
-+        const char* velocity_path = se_get_par_str("velocity");
-+        sewave::Grid2D vel = sewave::read_rsf2d(velocity_path);
-+        auto q_path = [&]() -> const char* {
-+            if (se_have_par("qfile")) return se_get_par_str("qfile");
-+            if (se_have_par("Qfile")) return se_get_par_str("Qfile");
-+            return nullptr;
-+        };
-         auto load_q = [&]() -> sewave::Grid2D {
--            if (se_have_par("qfile")) return sewave::read_rsf2d(se_get_par_str("qfile"));
--            if (se_have_par("Qfile")) return sewave::read_rsf2d(se_get_par_str("Qfile"));
-+            const char* path = q_path();
-+            if (path) return sewave::read_rsf2d(path);
-             ERROR(("visco=1 requires qfile= (or Qfile=) RSF Q model matching velocity="));
-             return sewave::Grid2D{};
-         };
-         if (mode[0]=='f') {
-             if (!se_have_par("output")) ERROR(("Need output= output seismic RSF"));
-             sewave::ForwardParams p;
-             p.nt = se_have_par("nt") ? se_get_par_int("nt") : 1000;
-             p.dt = se_have_par("dt") ? se_get_par_float("dt") : 0.001f;
-             p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
-             p.sx = se_have_par("sx") ? se_get_par_float("sx") : vel.x0 + 0.5f*(vel.nx-1)*vel.dx;
-             p.sz = se_have_par("sz") ? se_get_par_float("sz") : vel.z0;
-             p.rz = se_have_par("rz") ? se_get_par_float("rz") : p.sz;
-             p.nr = se_have_par("nr") ? se_get_par_int("nr") : vel.nx;
-             p.r0 = se_have_par("r0") ? se_get_par_float("r0") : vel.x0;
-             p.dr = se_have_par("dr") ? se_get_par_float("dr") : vel.dx;
-             p.ns = se_have_par("ns") ? se_get_par_int("ns") : 1;
-             p.ds = se_have_par("ds") ? se_get_par_float("ds") : 0.0f;
-             p.nbc = se_have_par("nbc") ? se_get_par_int("nbc") : 100;
-             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
-             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
-             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
--            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
--            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
-+            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
-+            p.type = p.visco ? 1 : 0;
-+            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
-             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
-             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
-             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
-             p.flag_smooth = se_have_par("flag_smooth") ? se_get_par_int("flag_smooth") != 0 : true;
-             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
--            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
--            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
-+            p.q = 1000.0f;
-             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, p.nt/10));
-             sewave::Grid2D qmodel;
-             sewave::Grid2D* qptr = nullptr;
--            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
-+            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
-+            const char* output_path = se_get_par_str("output");
-+            INFO(("forward wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
-+            INFO(("forward velocity model: %s", velocity_path));
-+            INFO(("forward Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
-+            INFO(("forward seismic output: %s", output_path));
-+            INFO(("forward Q compensation/imaging compensation: not applicable in forward mode"));
-+            INFO(("forward wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
-+                  p.nt, p.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
-+            INFO(("forward geometry: sx0=%g sz=%g rz=%g ns=%d ds=%g nr=%d r0=%g dr=%g",
-+                  p.sx, p.sz, p.rz, p.ns, p.ds, p.nr, p.r0, p.dr));
-+            INFO(("forward boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
-+                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
-+            INFO(("forward visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
-+                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
-+            INFO(("forward progress_interval=%d", p.progress_interval));
-             INFO(("forward shots: total=%d, calculating shot index range 0-%d", p.ns, std::max(0, p.ns - 1)));
-             check_stability(vel, p.dt, p.type_compute_laplace, "forward");
-             sewave::Data3D d = sewave::forward(vel, p, qptr);
--            sewave::write_rsf3d(se_get_par_str("output"), d);
-+            sewave::write_rsf3d(output_path, d);
-         } else if (mode[0]=='i') {
-             if (!se_have_par("seismic_data")) ERROR(("Need seismic_data= input seismic RSF"));
-             if (!se_have_par("migration")) ERROR(("Need migration= output image RSF"));
--            sewave::Data3D d = sewave::read_rsf3d(se_get_par_str("seismic_data"));
-+            const char* seismic_data_path = se_get_par_str("seismic_data");
-+            const char* migration_path = se_get_par_str("migration");
-+            sewave::Data3D d = sewave::read_rsf3d(seismic_data_path);
-             int max_nt = se_have_par("max_nt") ? se_get_par_int("max_nt") : -1;
-             float resample_dt = se_have_par("resample_dt") ? se_get_par_float("resample_dt") : -1.0f;
-             const int input_nt = d.nt;
-             const float input_dt = d.dt;
-             truncate_nt(d, max_nt);
-             resample_time(d, resample_dt);
-             if (d.nt != input_nt || d.dt != input_dt) {
-                 INFO(("seismic_data time preprocessing: nt %d -> %d, dt %.9g -> %.9g", input_nt, d.nt, input_dt, d.dt));
-             }
-             sewave::ImageParams p;
-             p.cmp = se_have_par("cmp") ? se_get_par_int("cmp") != 0 : true;
-             p.compensate = se_have_par("compensate") ? se_get_par_int("compensate") != 0 : false;
--            p.amp_compensation_sign = se_have_par("amp_compensation_sign") ? se_get_par_int("amp_compensation_sign") : (p.compensate ? -1 : 1);
--            if (p.amp_compensation_sign != -1 && p.amp_compensation_sign != 1) ERROR(("amp_compensation_sign must be -1 (Q compensation) or 1 (Q attenuation)"));
--            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
--            p.q = se_have_par("q") ? se_get_par_float("q") : 1000.0f;
-+            p.amp_compensation_sign = p.compensate ? -1 : 1;
-+            p.q = 1000.0f;
-             p.nbc = se_have_par("nbc") ? se_get_par_int("nbc") : 100;
-             p.alpha = se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
-             p.type_compute_laplace = se_have_par("type_compute_Laplace") ? se_get_par_int("type_compute_Laplace") : (se_have_par("type_compute_laplace") ? se_get_par_int("type_compute_laplace") : 1);
-             p.L = se_have_par("L") ? se_get_par_int("L") : 30;
--            p.type = se_have_par("type") ? se_get_par_int("type") : 1;
--            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : 20.0f;
-+            p.visco = se_have_par("visco") ? se_get_par_int("visco") != 0 : false;
-+            p.type = p.visco ? 1 : 0;
-+            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
-+            p.f0 = se_have_par("f0") ? se_get_par_float("f0") : p.fdom;
-             p.Omega0 = se_have_par("Omega0") ? se_get_par_float("Omega0") : 0.0f;
-             p.fc = se_have_par("fc") ? se_get_par_float("fc") : 120.0f;
-             p.order = se_have_par("order") ? se_get_par_int("order") : 2;
-             p.flag_smooth = se_have_par("flag_smooth") ? se_get_par_int("flag_smooth") != 0 : true;
-             p.flag_homo = se_have_par("flag_homo") ? se_get_par_int("flag_homo") != 0 : false;
-             p.sz = se_have_par("sz") ? se_get_par_float("sz") : vel.z0;
-             p.rz = se_have_par("rz") ? se_get_par_float("rz") : p.sz;
--            p.fdom = se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
-             p.shot_begin = se_have_par("shot_begin") ? se_get_par_int("shot_begin") : (se_have_par("first_shot") ? se_get_par_int("first_shot") : 0);
-             p.shot_end = se_have_par("shot_end") ? se_get_par_int("shot_end") : (se_have_par("last_shot") ? se_get_par_int("last_shot") : -1);
-             p.progress_interval = se_have_par("progress_interval") ? se_get_par_int("progress_interval") : (se_have_par("log_interval") ? se_get_par_int("log_interval") : std::max(1, d.nt/10));
-             p.max_parallel_shots = se_have_par("max_parallel_shots") ? se_get_par_int("max_parallel_shots") : (se_have_par("parallel_shots") ? se_get_par_int("parallel_shots") : (se_have_par("omp_shots") ? se_get_par_int("omp_shots") : 1));
-             p.in_memory_snapshots = se_have_par("in_memory_snapshots") ? se_get_par_int("in_memory_snapshots") != 0 : false;
-             p.snapshot_interval = se_have_par("snapshot_interval") ? se_get_par_int("snapshot_interval") : (se_have_par("snapshot_stride") ? se_get_par_int("snapshot_stride") : 1);
-             if (p.snapshot_interval < 1) ERROR(("snapshot_interval must be >= 1"));
-             if (se_have_par("debug_wavefield_prefix")) p.debug_wavefield_prefix = se_get_par_str("debug_wavefield_prefix");
-             else if (se_have_par("wavefield_snapshot_prefix")) p.debug_wavefield_prefix = se_get_par_str("wavefield_snapshot_prefix");
-             if (se_have_par("debug_snapshot_steps")) {
-                 int nsteps = 0;
-                 int* steps = se_get_pararray_int("debug_snapshot_steps", &nsteps);
-                 if (steps && nsteps > 0) p.debug_snapshot_steps.assign(steps, steps + nsteps);
-                 else p.debug_snapshot_steps = parse_int_list(se_get_par_str("debug_snapshot_steps"));
-             } else if (se_have_par("wavefield_snapshot_steps")) {
-                 int nsteps = 0;
-                 int* steps = se_get_pararray_int("wavefield_snapshot_steps", &nsteps);
-                 if (steps && nsteps > 0) p.debug_snapshot_steps.assign(steps, steps + nsteps);
-                 else p.debug_snapshot_steps = parse_int_list(se_get_par_str("wavefield_snapshot_steps"));
-             }
-             for (int& step : p.debug_snapshot_steps) step = std::max(1, step);
-             std::sort(p.debug_snapshot_steps.begin(), p.debug_snapshot_steps.end());
-             p.debug_snapshot_steps.erase(std::unique(p.debug_snapshot_steps.begin(), p.debug_snapshot_steps.end()), p.debug_snapshot_steps.end());
-             if (!p.debug_wavefield_prefix.empty() && p.debug_snapshot_steps.empty()) INFO(("debug_wavefield_prefix is set but debug_snapshot_steps is empty; no wavefield snapshots will be written"));
-             sewave::Grid2D qmodel;
-             sewave::Grid2D* qptr = nullptr;
--            if (p.visco || p.type == 1) { qmodel = load_q(); qptr = &qmodel; }
-+            if (p.visco) { qmodel = load_q(); qptr = &qmodel; }
-+            INFO(("image wave mode: %s (visco=%d)", p.visco ? "visco-acoustic/Q" : "acoustic", p.visco ? 1 : 0));
-+            INFO(("image velocity model: %s", velocity_path));
-+            INFO(("image Q model: %s", p.visco ? q_path() : "not used (acoustic mode)"));
-+            INFO(("image seismic data: %s", seismic_data_path));
-+            INFO(("image migration output: %s", migration_path));
-+            INFO(("image compensation: compensate=%d (%s), internal amp_compensation_sign=%d",
-+                  p.compensate ? 1 : 0,
-+                  p.compensate ? "Q compensation" : "Q attenuation/no compensation",
-+                  p.amp_compensation_sign));
-+            INFO(("image wave-equation parameters: nt=%d dt=%g fdom=%g type_compute_Laplace=%d (%s)",
-+                  d.nt, d.dt, p.fdom, p.type_compute_laplace, laplace_name(p.type_compute_laplace)));
-+            INFO(("image geometry/options: cmp=%d sz=%g rz=%g shot_begin=%d shot_end=%d",
-+                  p.cmp ? 1 : 0, p.sz, p.rz, p.shot_begin, p.shot_end));
-+            INFO(("image snapshot/parallel options: snapshot_interval=%d in_memory_snapshots=%d max_parallel_shots=%d",
-+                  p.snapshot_interval, p.in_memory_snapshots ? 1 : 0, p.max_parallel_shots));
-+            INFO(("image boundary/model options: nbc=%d L=%d alpha=%g flag_smooth=%d flag_homo=%d",
-+                  p.nbc, p.L, p.alpha, p.flag_smooth ? 1 : 0, p.flag_homo ? 1 : 0));
-+            INFO(("image visco/filter parameters: f0=%g Omega0_input=%g Omega0_effective=%g fc=%g order=%d",
-+                  p.f0, p.Omega0, effective_omega0(p.f0, p.Omega0), p.fc, p.order));
-+            INFO(("image progress_interval=%d", p.progress_interval));
-             {
-                 int shot0 = std::max(0, p.shot_begin);
-                 int shot1 = (p.shot_end < 0) ? d.ns - 1 : std::min(d.ns - 1, p.shot_end);
-                 INFO(("image shots: total=%d, calculating shot index range %d-%d (%d shots)",
-                       d.ns, shot0, shot1, shot0 <= shot1 ? shot1 - shot0 + 1 : 0));
-             }
-             check_stability(vel, d.dt, p.type_compute_laplace, "image");
-             auto img = sewave::rtm_image(vel, d, p, qptr);
--            sewave::write_rsf2d(se_get_par_str("migration"), vel, img, "RTM image");
-+            sewave::write_rsf2d(migration_path, vel, img, "RTM image");
-         } else {
-             ERROR(("Unknown mode=%s (use forward or image)", mode));
-         }
-     } catch (const std::exception& e) {
-         ERROR(("sewave2d failed: %s", e.what()));
-     }
-     se_par_destroy();
-     return 0;
- }
- 
-EOF
-)
++
++void apply_absorber(
++    const Domain &domain,
++    std::vector<float> &following,
++    const std::vector<float> &current,
++    const std::vector<float> &previous)
++{
++    const int length = std::min(
++        domain.absorb_length,
++        std::min(domain.nx, domain.nz) / 2);
++    if (length < 5)
++        return;
++
++    auto update = [&](int ix, int iz, int step_x, int step_z, float weight)
++    {
++        const size_t id = index2(iz, ix, domain.nz);
++        const float sigma =
++            domain.absorb_alpha * domain.velocity[id] * domain.dt /
++            std::max(domain.dx, domain.dz);
++        const float t1 = (2.0f - sigma) * (1.0f - sigma) / 2.0f;
++        const float t2 = sigma * (2.0f - sigma);
++        const float t3 = sigma * (sigma - 1.0f) / 2.0f;
++        const size_t id1 =
++            index2(iz + step_z, ix + step_x, domain.nz);
++        const size_t id2 =
++            index2(iz + 2 * step_z, ix + 2 * step_x, domain.nz);
++        const size_t id3 =
++            index2(iz + 3 * step_z, ix + 3 * step_x, domain.nz);
++        const size_t id4 =
++            index2(iz + 4 * step_z, ix + 4 * step_x, domain.nz);
++        const float outgoing =
++            2.0f *
++                (t1 * current[id] +
++                 t2 * current[id1] +
++                 t3 * current[id2]) -
++            (t1 * t1 * previous[id] +
++             2.0f * t1 * t2 * previous[id1] +
++             (2.0f * t1 * t3 + t2 * t2) * previous[id2] +
++             2.0f * t2 * t3 * previous[id3] +
++             t3 * t3 * previous[id4]);
++        following[id] =
++            weight * outgoing + (1.0f - weight) * following[id];
++    };
++
++    for (int ix = 0; ix < domain.nx; ++ix)
++    {
++        for (int iz = 0; iz < domain.nz; ++iz)
++        {
++            if (ix < length - 4)
++                update(ix, iz, 1, 0, 1.0f - ix / static_cast<float>(length));
++            if (ix > domain.nx - length + 3)
++                update(
++                    ix,
++                    iz,
++                    -1,
++                    0,
++                    1.0f -
++                        (domain.nx - ix - 1) /
++                            static_cast<float>(length));
++            if (domain.physical_top && iz < length - 4)
++                update(ix, iz, 0, 1, 1.0f - iz / static_cast<float>(length));
++            if (domain.physical_bottom &&
++                iz > domain.nz - length + 3)
++                update(
++                    ix,
++                    iz,
++                    0,
++                    -1,
++                    1.0f -
++                        (domain.nz - iz - 1) /
++                            static_cast<float>(length));
++        }
++    }
++}
++
++void apply_mur_top(
++    const Domain &domain,
++    std::vector<float> &following,
++    const std::vector<float> &current)
++{
++    for (int ix = 1; ix < domain.nx - 1; ++ix)
++    {
++        const size_t top = index2(0, ix, domain.nz);
++        const size_t inner = index2(1, ix, domain.nz);
++        const float coefficient =
++            (domain.velocity[top] * domain.dt - domain.dz) /
++            (domain.velocity[top] * domain.dt + domain.dz);
++        following[top] =
++            current[inner] +
++            coefficient * (following[inner] - current[top]);
++    }
++}
++
++void apply_mur_bottom(
++    const Domain &domain,
++    std::vector<float> &following,
++    const std::vector<float> &current)
++{
++    const int bottom_z = domain.nz - 1;
++    for (int ix = 1; ix < domain.nx - 1; ++ix)
++    {
++        const size_t bottom = index2(bottom_z, ix, domain.nz);
++        const size_t inner = index2(bottom_z - 1, ix, domain.nz);
++        const float coefficient =
++            (domain.velocity[bottom] * domain.dt - domain.dz) /
++            (domain.velocity[bottom] * domain.dt + domain.dz);
++        following[bottom] =
++            current[inner] +
++            coefficient * (following[inner] - current[bottom]);
++    }
++}
++
++int first_effective_sample(
++    const std::vector<float> *source,
++    const std::vector<float> *top_robin,
++    const std::vector<float> *bottom_robin,
++    int nt,
++    int nx,
++    float gate)
++{
++    int first = nt;
++    auto inspect = [&](const std::vector<float> *values, bool time_by_x)
++    {
++        if (values == nullptr || values->empty())
++            return;
++        float scale = 0.0f;
++        for (float value : *values)
++            scale = std::max(scale, std::fabs(value));
++        if (!(scale > 0.0f))
++            return;
++        const float threshold =
++            std::max(gate * scale, std::numeric_limits<float>::min());
++        for (int it = 0; it < nt; ++it)
++        {
++            float amplitude = 0.0f;
++            if (time_by_x)
++            {
++                for (int ix = 0; ix < nx; ++ix)
++                    amplitude = std::max(
++                        amplitude,
++                        std::fabs((*values)[trace_index(it, ix, nx)]));
++            }
++            else
++            {
++                amplitude = std::fabs((*values)[it]);
++            }
++            if (amplitude >= threshold)
++            {
++                first = std::min(first, it);
++                break;
++            }
++        }
++    };
++    inspect(source, false);
++    inspect(top_robin, true);
++    inspect(bottom_robin, true);
++    return first;
++}
++
++State solve_local(
++    const Domain &domain,
++    const std::vector<int> &query_rows,
++    int nt,
++    const std::vector<float> *source,
++    int source_global_z,
++    int source_x,
++    const std::vector<float> *top_robin,
++    const std::vector<float> *bottom_robin,
++    int receiver_global_z,
++    bool record_receiver,
++    float beta,
++    float gate,
++    int progress_interval,
++    SolveStats &stats)
++{
++    State state;
++    for (int row : query_rows)
++        state.traces[row].assign(
++            static_cast<size_t>(nt) * static_cast<size_t>(domain.nx),
++            0.0f);
++    if (record_receiver)
++        state.receiver.assign(
++            static_cast<size_t>(nt) *
++                static_cast<size_t>(domain.physical_nx),
++            0.0f);
++
++    const int start = first_effective_sample(
++        source,
++        top_robin,
++        bottom_robin,
++        nt,
++        domain.nx,
++        gate);
++    if (start >= nt)
++        return state;
++
++    std::vector<float> previous(domain.velocity.size(), 0.0f);
++    std::vector<float> current(domain.velocity.size(), 0.0f);
++    std::vector<float> following(domain.velocity.size(), 0.0f);
++    std::vector<float> laplacian(domain.velocity.size(), 0.0f);
++    const int source_local_z =
++        domain.top_pad + source_global_z - domain.block.local_start;
++    const int source_local_x = domain.nbc + source_x;
++    const int receiver_local_z =
++        domain.top_pad + receiver_global_z - domain.block.local_start;
++
++    for (int it = start; it < nt; ++it)
++    {
++        if (source != nullptr &&
++            source_local_z >= 0 && source_local_z < domain.nz &&
++            source_local_x >= 0 && source_local_x < domain.nx)
++        {
++            current[index2(
++                source_local_z,
++                source_local_x,
++                domain.nz)] += (*source)[it];
++        }
++
++        apply_laplacian(domain, current, laplacian);
++        for (size_t id = 0; id < following.size(); ++id)
++        {
++            following[id] =
++                2.0f * current[id] -
++                previous[id] +
++                domain.v2dt2[id] * laplacian[id];
++        }
++
++        apply_absorber(domain, following, current, previous);
++
++        if (!domain.physical_top)
++        {
++            if (top_robin == nullptr)
++            {
++                apply_mur_top(domain, following, current);
++            }
++            else
++            {
++                for (int ix = 1; ix < domain.nx - 1; ++ix)
++                {
++                    const size_t boundary = index2(0, ix, domain.nz);
++                    const size_t inner = index2(1, ix, domain.nz);
++                    following[boundary] =
++                        current[boundary] +
++                        domain.dt *
++                            ((*top_robin)[trace_index(it, ix, domain.nx)] +
++                             beta * domain.velocity[boundary] *
++                                 (current[inner] - current[boundary]) /
++                                 domain.dz);
++                }
++                following[index2(0, 0, domain.nz)] =
++                    following[index2(0, 1, domain.nz)];
++                following[index2(0, domain.nx - 1, domain.nz)] =
++                    following[index2(0, domain.nx - 2, domain.nz)];
++            }
++        }
++
++        if (!domain.physical_bottom)
++        {
++            const int bottom_z = domain.nz - 1;
++            if (bottom_robin == nullptr)
++            {
++                apply_mur_bottom(domain, following, current);
++            }
++            else
++            {
++                for (int ix = 1; ix < domain.nx - 1; ++ix)
++                {
++                    const size_t boundary =
++                        index2(bottom_z, ix, domain.nz);
++                    const size_t inner =
++                        index2(bottom_z - 1, ix, domain.nz);
++                    following[boundary] =
++                        current[boundary] +
++                        domain.dt *
++                            ((*bottom_robin)[
++                                 trace_index(it, ix, domain.nx)] -
++                             beta * domain.velocity[boundary] *
++                                 (current[boundary] - current[inner]) /
++                                 domain.dz);
++                }
++                following[index2(bottom_z, 0, domain.nz)] =
++                    following[index2(bottom_z, 1, domain.nz)];
++                following[index2(
++                    bottom_z,
++                    domain.nx - 1,
++                    domain.nz)] =
++                    following[index2(
++                        bottom_z,
++                        domain.nx - 2,
++                        domain.nz)];
++            }
++        }
++
++        previous.swap(current);
++        current.swap(following);
++
++        for (auto &entry : state.traces)
++        {
++            const int local_z =
++                domain.top_pad +
++                entry.first -
++                domain.block.local_start;
++            for (int ix = 0; ix < domain.nx; ++ix)
++            {
++                entry.second[trace_index(it, ix, domain.nx)] =
++                    current[index2(local_z, ix, domain.nz)];
++            }
++        }
++        if (record_receiver)
++        {
++            for (int ix = 0; ix < domain.physical_nx; ++ix)
++            {
++                state.receiver[trace_index(
++                    it,
++                    ix,
++                    domain.physical_nx)] =
++                    current[index2(
++                        receiver_local_z,
++                        ix + domain.nbc,
++                        domain.nz)];
++            }
++        }
++        if (progress_interval > 0 &&
++            (it == start ||
++             (it + 1) % progress_interval == 0 ||
++             it == nt - 1))
++        {
++            INFO((
++                "local block %d: step %d/%d",
++                domain.block.index + 1,
++                it + 1,
++                nt));
++        }
++    }
++
++    stats.active_steps = nt - start;
++    stats.updated_points =
++        static_cast<long long>(stats.active_steps) *
++        static_cast<long long>(domain.nx) *
++        static_cast<long long>(domain.nz);
++    return state;
++}
++
++void add_state(State &target, const State &increment)
++{
++    for (const auto &entry : increment.traces)
++    {
++        std::vector<float> &values = target.traces.at(entry.first);
++        for (size_t index = 0; index < values.size(); ++index)
++            values[index] += entry.second[index];
++    }
++    if (!increment.receiver.empty())
++    {
++        if (target.receiver.empty())
++            target.receiver.assign(increment.receiver.size(), 0.0f);
++        for (size_t index = 0; index < target.receiver.size(); ++index)
++            target.receiver[index] += increment.receiver[index];
++    }
++}
++
++std::vector<float> extended_velocity_row(
++    const sewave::Grid2D &grid,
++    int row,
++    int nbc)
++{
++    std::vector<float> velocity(
++        static_cast<size_t>(grid.nx + 2 * nbc));
++    for (int ix = 0; ix < static_cast<int>(velocity.size()); ++ix)
++    {
++        const int global_x = clamp_int(ix - nbc, 0, grid.nx - 1);
++        velocity[ix] = grid.v[index2(row, global_x, grid.nz)];
++    }
++    return velocity;
++}
++
++std::vector<float> robin_operator(
++    const State &state,
++    int row,
++    const std::vector<float> &velocity,
++    int nt,
++    int nx,
++    float dt,
++    float dz,
++    float sign,
++    float beta)
++{
++    const std::vector<float> &center = state.traces.at(row);
++    const std::vector<float> &neighbor =
++        state.traces.at(sign < 0.0f ? row + 1 : row - 1);
++    std::vector<float> output(
++        static_cast<size_t>(nt) * static_cast<size_t>(nx),
++        0.0f);
++
++    for (int it = 1; it < nt; ++it)
++    {
++        for (int ix = 0; ix < nx; ++ix)
++        {
++            const size_t now = trace_index(it, ix, nx);
++            const size_t before = trace_index(it - 1, ix, nx);
++            float derivative = 0.0f;
++            if (sign < 0.0f)
++                derivative = (neighbor[before] - center[before]) / dz;
++            else
++                derivative = (center[before] - neighbor[before]) / dz;
++            output[now] =
++                (center[now] - center[before]) / dt +
++                sign * beta * velocity[ix] * derivative;
++        }
++    }
++    return output;
++}
++
++std::vector<float> subtract(
++    const std::vector<float> &left,
++    const std::vector<float> &right)
++{
++    if (left.size() != right.size())
++        throw std::runtime_error("interface vectors have different sizes");
++    std::vector<float> output(left.size());
++    for (size_t index = 0; index < output.size(); ++index)
++        output[index] = left[index] - right[index];
++    return output;
++}
++
++std::vector<float> fmm_travel_time(
++    const sewave::Grid2D &grid,
++    float source_x,
++    float source_z)
++{
++    efmm_t context;
++    std::memset(&context, 0, sizeof(context));
++
++    // efmm's first array index is contiguous. RSF/sewave stores depth as
++    // the contiguous n1 axis, so depth is passed as efmm's x-like axis.
++    const int status = efmm_init(
++        &context,
++        grid.nz,
++        grid.nx,
++        grid.dz,
++        grid.dx,
++        source_z - grid.z0,
++        source_x - grid.x0);
++    if (status != 0)
++        throw std::runtime_error("efmm_init failed");
++    if (efmm_set_vel(&context, const_cast<float *>(grid.v.data())) != 0)
++    {
++        efmm_free(&context);
++        throw std::runtime_error("efmm_set_vel failed");
++    }
++    if (efmm_solver(&context) != 0)
++    {
++        efmm_free(&context);
++        throw std::runtime_error("efmm_solver failed");
++    }
++    std::vector<float> travel_time(
++        context.tt,
++        context.tt +
++            static_cast<size_t>(grid.nz) *
++                static_cast<size_t>(grid.nx));
++    efmm_free(&context);
++    return travel_time;
++}
++
++State ray_state(
++    const sewave::Grid2D &grid,
++    const Domain &domain,
++    const std::vector<int> &query_rows,
++    const std::vector<float> &travel_time,
++    int nt,
++    float dt,
++    float frequency,
++    float source_velocity,
++    float scale)
++{
++    State state;
++    const float spacing = std::min(grid.dx, grid.dz);
++    for (int row : query_rows)
++    {
++        std::vector<float> &trace = state.traces[row];
++        trace.assign(
++            static_cast<size_t>(nt) * static_cast<size_t>(domain.nx),
++            0.0f);
++        for (int ix = 0; ix < domain.nx; ++ix)
++        {
++            const int global_x =
++                clamp_int(ix - domain.nbc, 0, grid.nx - 1);
++            const int outside_cells =
++                std::abs(ix - domain.nbc - global_x);
++            const float local_velocity =
++                grid.v[index2(row, global_x, grid.nz)];
++            const float time =
++                travel_time[index2(row, global_x, grid.nz)] +
++                outside_cells * grid.dx /
++                    std::max(local_velocity, 1.0f);
++            const float distance =
++                std::max(source_velocity * time, spacing);
++            const float amplitude =
++                scale * std::sqrt(spacing / distance);
++            for (int it = 0; it < nt; ++it)
++            {
++                trace[trace_index(it, ix, domain.nx)] =
++                    amplitude *
++                    ricker(it * dt - time, frequency);
++            }
++        }
++    }
++    return state;
++}
++
++std::vector<float> ray_receiver(
++    const sewave::Grid2D &grid,
++    const std::vector<float> &travel_time,
++    int receiver_row,
++    int nt,
++    float dt,
++    float frequency,
++    float source_velocity,
++    float scale)
++{
++    std::vector<float> output(
++        static_cast<size_t>(nt) * static_cast<size_t>(grid.nx),
++        0.0f);
++    const float spacing = std::min(grid.dx, grid.dz);
++    for (int ix = 0; ix < grid.nx; ++ix)
++    {
++        const float time =
++            travel_time[index2(receiver_row, ix, grid.nz)];
++        const float distance =
++            std::max(source_velocity * time, spacing);
++        const float amplitude =
++            scale * std::sqrt(spacing / distance);
++        for (int it = 0; it < nt; ++it)
++        {
++            output[trace_index(it, ix, grid.nx)] =
++                amplitude * ricker(it * dt - time, frequency);
++        }
++    }
++    return output;
++}
++
++std::vector<float> run_shot(
++    const sewave::Grid2D &grid,
++    const std::vector<Block> &blocks,
++    const std::vector<Domain> &domains,
++    const std::vector<std::vector<int>> &queries,
++    const Parameters &parameters,
++    float source_x,
++    int source_z,
++    int source_x_index,
++    int receiver_z,
++    std::vector<float> &initial_ray_record,
++    std::vector<float> &travel_time,
++    ShotStats &shot_stats)
++{
++    const auto fmm_begin = std::chrono::steady_clock::now();
++    travel_time = fmm_travel_time(
++        grid,
++        source_x,
++        grid.z0 + source_z * grid.dz);
++    shot_stats.fmm_seconds =
++        std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - fmm_begin)
++            .count();
++
++    std::vector<float> source(static_cast<size_t>(parameters.nt));
++    for (int it = 0; it < parameters.nt; ++it)
++        source[it] = ricker(it * parameters.dt, parameters.fdom);
++
++    const float source_velocity =
++        grid.v[index2(source_z, source_x_index, grid.nz)];
++    const auto initial_begin = std::chrono::steady_clock::now();
++    std::vector<State> states(static_cast<size_t>(parameters.blocks));
++    SolveStats source_solve;
++    states[0] = solve_local(
++        domains[0],
++        queries[0],
++        parameters.nt,
++        &source,
++        source_z,
++        source_x_index,
++        nullptr,
++        nullptr,
++        receiver_z,
++        true,
++        parameters.beta,
++        parameters.gate,
++        parameters.progress_interval,
++        source_solve);
++    shot_stats.updated_points += source_solve.updated_points;
++    ++shot_stats.local_solves;
++
++    shot_stats.ray_scale = parameters.ray_scale;
++
++    for (int ib = 1; ib < parameters.blocks; ++ib)
++    {
++        states[ib] = ray_state(
++            grid,
++            domains[ib],
++            queries[ib],
++            travel_time,
++            parameters.nt,
++            parameters.dt,
++            parameters.fdom,
++            source_velocity,
++            static_cast<float>(shot_stats.ray_scale));
++    }
++    initial_ray_record = ray_receiver(
++        grid,
++        travel_time,
++        receiver_z,
++        parameters.nt,
++        parameters.dt,
++        parameters.fdom,
++        source_velocity,
++        static_cast<float>(shot_stats.ray_scale));
++    shot_stats.initial_seconds =
++        std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - initial_begin)
++            .count();
++
++    const auto sweep_begin = std::chrono::steady_clock::now();
++    double final_residual_numerator = 0.0;
++    double final_residual_denominator = 0.0;
++    for (int cycle = 0; cycle < parameters.cycles; ++cycle)
++    {
++        final_residual_numerator = 0.0;
++        final_residual_denominator = 0.0;
++
++        // Multiplicative downward sweep: each block reads only the already
++        // updated block above it. No lower-block reflection can enter here.
++        for (int ib = 1; ib < parameters.blocks; ++ib)
++        {
++            const int row = blocks[ib].local_start;
++            const std::vector<float> velocity =
++                extended_velocity_row(grid, row, parameters.nbc);
++            const std::vector<float> neighbor = robin_operator(
++                states[ib - 1],
++                row,
++                velocity,
++                parameters.nt,
++                domains[ib].nx,
++                parameters.dt,
++                grid.dz,
++                -1.0f,
++                parameters.beta);
++            const std::vector<float> own = robin_operator(
++                states[ib],
++                row,
++                velocity,
++                parameters.nt,
++                domains[ib].nx,
++                parameters.dt,
++                grid.dz,
++                -1.0f,
++                parameters.beta);
++            const std::vector<float> forcing = subtract(neighbor, own);
++            for (size_t index = 0; index < forcing.size(); ++index)
++            {
++                final_residual_numerator +=
++                    static_cast<double>(forcing[index]) *
++                    static_cast<double>(forcing[index]);
++                final_residual_denominator +=
++                    static_cast<double>(neighbor[index]) *
++                    static_cast<double>(neighbor[index]);
++            }
++
++            SolveStats solve_stats;
++            State increment = solve_local(
++                domains[ib],
++                queries[ib],
++                parameters.nt,
++                nullptr,
++                -100000,
++                source_x_index,
++                &forcing,
++                nullptr,
++                receiver_z,
++                false,
++                parameters.beta,
++                parameters.gate,
++                parameters.progress_interval,
++                solve_stats);
++            add_state(states[ib], increment);
++            shot_stats.updated_points += solve_stats.updated_points;
++            ++shot_stats.local_solves;
++        }
++
++        // Multiplicative upward sweep returns reflections/scattering created
++        // in deeper blocks to the surface block.
++        for (int ib = parameters.blocks - 2; ib >= 0; --ib)
++        {
++            const int row = blocks[ib].local_end - 1;
++            const std::vector<float> velocity =
++                extended_velocity_row(grid, row, parameters.nbc);
++            const std::vector<float> neighbor = robin_operator(
++                states[ib + 1],
++                row,
++                velocity,
++                parameters.nt,
++                domains[ib].nx,
++                parameters.dt,
++                grid.dz,
++                +1.0f,
++                parameters.beta);
++            const std::vector<float> own = robin_operator(
++                states[ib],
++                row,
++                velocity,
++                parameters.nt,
++                domains[ib].nx,
++                parameters.dt,
++                grid.dz,
++                +1.0f,
++                parameters.beta);
++            const std::vector<float> forcing = subtract(neighbor, own);
++            for (size_t index = 0; index < forcing.size(); ++index)
++            {
++                final_residual_numerator +=
++                    static_cast<double>(forcing[index]) *
++                    static_cast<double>(forcing[index]);
++                final_residual_denominator +=
++                    static_cast<double>(neighbor[index]) *
++                    static_cast<double>(neighbor[index]);
++            }
++
++            SolveStats solve_stats;
++            State increment = solve_local(
++                domains[ib],
++                queries[ib],
++                parameters.nt,
++                nullptr,
++                -100000,
++                source_x_index,
++                nullptr,
++                &forcing,
++                receiver_z,
++                ib == 0,
++                parameters.beta,
++                parameters.gate,
++                parameters.progress_interval,
++                solve_stats);
++            add_state(states[ib], increment);
++            shot_stats.updated_points += solve_stats.updated_points;
++            ++shot_stats.local_solves;
++        }
++        shot_stats.final_interface_residual =
++            std::sqrt(
++                final_residual_numerator /
++                std::max(
++                    final_residual_denominator,
++                    std::numeric_limits<double>::min()));
++        INFO((
++            "shot x=%g cycle %d/%d: Robin residual=%e",
++            source_x,
++            cycle + 1,
++            parameters.cycles,
++            shot_stats.final_interface_residual));
++    }
++    shot_stats.sweep_seconds =
++        std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - sweep_begin)
++            .count();
++    return states[0].receiver;
++}
++
++int coordinate_index(float coordinate, float origin, float spacing)
++{
++    return static_cast<int>(
++        std::lround((coordinate - origin) / spacing));
++}
++
++void validate(
++    const sewave::Grid2D &grid,
++    const Parameters &parameters,
++    int source_z,
++    int receiver_z,
++    const std::vector<Block> &blocks)
++{
++    if (grid.nz < 16 || grid.nx < 16)
++        throw std::runtime_error("velocity grid is too small for FD8");
++    if (parameters.nt <= 0 || parameters.dt <= 0.0f ||
++        parameters.fdom <= 0.0f)
++        throw std::runtime_error("nt, dt, and fdom must be positive");
++    if (parameters.blocks < 4)
++        throw std::runtime_error("blocks must be at least 4");
++    if (parameters.blocks > grid.nz / 4)
++        throw std::runtime_error("too many blocks for the depth grid");
++    if (parameters.overlap < 4)
++        throw std::runtime_error("overlap must be at least 4 for FD8");
++    if (parameters.cycles < 1)
++        throw std::runtime_error("cycles must be at least 1");
++    if (parameters.beta <= 0.0f)
++        throw std::runtime_error("beta must be positive");
++    if (parameters.ray_scale <= 0.0f)
++        throw std::runtime_error("ray_scale must be positive");
++    if (parameters.gate < 0.0f || parameters.gate >= 1.0f)
++        throw std::runtime_error("gate must satisfy 0 <= gate < 1");
++    if (parameters.nbc < parameters.absorb_length ||
++        parameters.absorb_length < 5)
++        throw std::runtime_error("require nbc >= L >= 5");
++    if (source_z < 0 || source_z >= grid.nz ||
++        receiver_z < 0 || receiver_z >= grid.nz)
++        throw std::runtime_error("source or receiver depth is outside the model");
++    if (source_z >= blocks.front().core_end)
++        throw std::runtime_error(
++            "source must lie in the first core block");
++    if (receiver_z >= blocks.front().core_end)
++        throw std::runtime_error(
++            "receiver row must lie in the first core block");
++
++    const float maximum_velocity =
++        *std::max_element(grid.v.begin(), grid.v.end());
++    const double cfl =
++        maximum_velocity * parameters.dt *
++        std::sqrt(
++            1.0 / (grid.dx * grid.dx) +
++            1.0 / (grid.dz * grid.dz));
++    if (cfl > 0.45)
++    {
++        INFO((
++            "WARNING: FD8 CFL=%g exceeds the conservative 0.45 limit",
++            cfl));
++    }
++}
++} // namespace
++
++int main(int argc, char **argv)
++{
++    if (argc <= 1 ||
++        (argc == 2 &&
++         (!std::strcmp(argv[1], "-h") ||
++          !std::strcmp(argv[1], "--help") ||
++          !std::strcmp(argv[1], "help"))))
++    {
++        print_usage(argv[0]);
++        return 0;
++    }
++
++    se_par_init(argc, argv);
++    try
++    {
++        if (!se_have_par("velocity"))
++            throw std::runtime_error("Need velocity= RSF velocity model");
++        if (!se_have_par("output"))
++            throw std::runtime_error("Need output= output seismic RSF");
++
++        const char *velocity_path = se_get_par_str("velocity");
++        const char *output_path = se_get_par_str("output");
++        sewave::Grid2D grid = sewave::read_rsf2d(velocity_path);
++
++        Parameters parameters;
++        parameters.nt =
++            se_have_par("nt") ? se_get_par_int("nt") : 1000;
++        parameters.dt =
++            se_have_par("dt") ? se_get_par_float("dt") : 0.001f;
++        parameters.fdom =
++            se_have_par("fdom") ? se_get_par_float("fdom") : 20.0f;
++        parameters.sx =
++            se_have_par("sx")
++                ? se_get_par_float("sx")
++                : grid.x0 + 0.5f * (grid.nx - 1) * grid.dx;
++        parameters.sz =
++            se_have_par("sz") ? se_get_par_float("sz") : grid.z0;
++        parameters.rz =
++            se_have_par("rz") ? se_get_par_float("rz") : parameters.sz;
++        parameters.ns =
++            se_have_par("ns") ? se_get_par_int("ns") : 1;
++        parameters.ds =
++            se_have_par("ds") ? se_get_par_float("ds") : 0.0f;
++        parameters.blocks =
++            se_have_par("blocks") ? se_get_par_int("blocks") : 4;
++        parameters.overlap =
++            se_have_par("overlap") ? se_get_par_int("overlap") : 22;
++        parameters.cycles =
++            se_have_par("cycles") ? se_get_par_int("cycles") : 1;
++        parameters.beta =
++            se_have_par("beta") ? se_get_par_float("beta") : 1.0f;
++        parameters.gate =
++            se_have_par("gate") ? se_get_par_float("gate") : 0.003f;
++        parameters.nbc =
++            se_have_par("nbc") ? se_get_par_int("nbc") : 40;
++        parameters.absorb_length =
++            se_have_par("L") ? se_get_par_int("L") : 30;
++        parameters.absorb_alpha =
++            se_have_par("alpha") ? se_get_par_float("alpha") : 1.0f;
++        parameters.ray_scale =
++            se_have_par("ray_scale")
++                ? se_get_par_float("ray_scale")
++                : 1.0f;
++        parameters.progress_interval =
++            se_have_par("progress_interval")
++                ? se_get_par_int("progress_interval")
++                : 0;
++
++        const int source_z =
++            coordinate_index(parameters.sz, grid.z0, grid.dz);
++        const int receiver_z =
++            coordinate_index(parameters.rz, grid.z0, grid.dz);
++        const std::vector<Block> blocks = make_blocks(
++            grid.nz,
++            parameters.blocks,
++            parameters.overlap);
++        validate(grid, parameters, source_z, receiver_z, blocks);
++
++        std::vector<Domain> domains;
++        std::vector<std::vector<int>> queries;
++        domains.reserve(parameters.blocks);
++        queries.reserve(parameters.blocks);
++        for (int ib = 0; ib < parameters.blocks; ++ib)
++        {
++            domains.push_back(
++                make_domain(grid, blocks[ib], parameters));
++            queries.push_back(robin_query_rows(blocks, ib));
++            INFO((
++                "block %d/%d: core=[%d,%d) local=[%d,%d) overlap=%d",
++                ib + 1,
++                parameters.blocks,
++                blocks[ib].core_start,
++                blocks[ib].core_end,
++                blocks[ib].local_start,
++                blocks[ib].local_end,
++                parameters.overlap));
++        }
++
++        sewave::Data3D output;
++        output.nt = parameters.nt;
++        output.nr = grid.nx;
++        output.ns = parameters.ns;
++        output.dt = parameters.dt;
++        output.dr = grid.dx;
++        output.ds = parameters.ds;
++        output.t0 = 0.0f;
++        output.r0 = grid.x0;
++        output.s0 = parameters.sx;
++        output.d.assign(
++            static_cast<size_t>(output.nt) *
++                static_cast<size_t>(output.nr) *
++                static_cast<size_t>(output.ns),
++            0.0f);
++        sewave::Data3D ray_output = output;
++
++        std::vector<float> first_travel_time;
++        const auto total_begin = std::chrono::steady_clock::now();
++        double fmm_total = 0.0;
++        double initial_total = 0.0;
++        double sweep_total = 0.0;
++        long long update_total = 0;
++        int solve_total = 0;
++
++        for (int is = 0; is < parameters.ns; ++is)
++        {
++            const float shot_x = parameters.sx + is * parameters.ds;
++            const int shot_x_index =
++                coordinate_index(shot_x, grid.x0, grid.dx);
++            if (shot_x_index < 0 || shot_x_index >= grid.nx)
++                throw std::runtime_error("shot is outside the velocity model");
++
++            std::vector<float> ray_record;
++            std::vector<float> travel_time;
++            ShotStats shot_stats;
++            const std::vector<float> record = run_shot(
++                grid,
++                blocks,
++                domains,
++                queries,
++                parameters,
++                shot_x,
++                source_z,
++                shot_x_index,
++                receiver_z,
++                ray_record,
++                travel_time,
++                shot_stats);
++            if (is == 0)
++                first_travel_time = travel_time;
++
++            for (int ix = 0; ix < grid.nx; ++ix)
++            {
++                for (int it = 0; it < parameters.nt; ++it)
++                {
++                    output.d[
++                        (static_cast<size_t>(is) * grid.nx + ix) *
++                            parameters.nt +
++                        it] =
++                        record[trace_index(it, ix, grid.nx)];
++                    ray_output.d[
++                        (static_cast<size_t>(is) * grid.nx + ix) *
++                            parameters.nt +
++                        it] =
++                        ray_record[trace_index(it, ix, grid.nx)];
++                }
++            }
++
++            fmm_total += shot_stats.fmm_seconds;
++            initial_total += shot_stats.initial_seconds;
++            sweep_total += shot_stats.sweep_seconds;
++            update_total += shot_stats.updated_points;
++            solve_total += shot_stats.local_solves;
++            INFO((
++                "shot %d/%d: ray_scale=%g fmm=%.6f s initial=%.6f s "
++                "sweeps=%.6f s solves=%d updated_points=%lld "
++                "final_robin_residual=%e",
++                is + 1,
++                parameters.ns,
++                shot_stats.ray_scale,
++                shot_stats.fmm_seconds,
++                shot_stats.initial_seconds,
++                shot_stats.sweep_seconds,
++                shot_stats.local_solves,
++                shot_stats.updated_points,
++                shot_stats.final_interface_residual));
++        }
++
++        sewave::write_rsf3d(output_path, output);
++        if (se_have_par("ray_output"))
++            sewave::write_rsf3d(
++                se_get_par_str("ray_output"),
++                ray_output);
++        if (se_have_par("traveltime"))
++        {
++            if (parameters.ns != 1)
++                throw std::runtime_error(
++                    "traveltime= currently requires ns=1");
++            sewave::write_rsf2d(
++                se_get_par_str("traveltime"),
++                grid,
++                first_travel_time,
++                "FMM first-arrival time");
++        }
++
++        const double total_seconds =
++            std::chrono::duration<double>(
++                std::chrono::steady_clock::now() - total_begin)
++                .count();
++        INFO((
++            "block forward summary: total=%.6f s fmm=%.6f s "
++            "initial=%.6f s sweeps=%.6f s local_solves=%d "
++            "updated_points=%lld",
++            total_seconds,
++            fmm_total,
++            initial_total,
++            sweep_total,
++            solve_total,
++            update_total));
++        se_par_destroy();
++        return 0;
++    }
++    catch (const std::exception &error)
++    {
++        std::fprintf(stderr, "block_iterative_forward: %s\n", error.what());
++        se_par_destroy();
++        return 1;
++    }
++}
