@@ -54,6 +54,19 @@ struct Block
     int local_end = 0;
 };
 
+struct AbsorbPoint
+{
+    size_t id = 0;
+    size_t id1 = 0;
+    size_t id2 = 0;
+    size_t id3 = 0;
+    size_t id4 = 0;
+    float weight = 0.0f;
+    float t1 = 0.0f;
+    float t2 = 0.0f;
+    float t3 = 0.0f;
+};
+
 struct Domain
 {
     Block block;
@@ -72,6 +85,7 @@ struct Domain
     float absorb_alpha = 1.0f;
     std::vector<float> velocity;
     std::vector<float> v2dt2;
+    std::vector<AbsorbPoint> absorb_points;
 };
 
 struct State
@@ -259,39 +273,119 @@ Domain make_domain(
                 velocity * velocity * parameters.dt * parameters.dt;
         }
     }
+
+    const int length = std::min(
+        domain.absorb_length,
+        std::min(domain.nx, domain.nz) / 2);
+    if (length >= 5)
+    {
+        auto append = [&](int ix, int iz, int step_x, int step_z, float weight)
+        {
+            AbsorbPoint point;
+            point.id = index2(iz, ix, domain.nz);
+            point.id1 = index2(
+                iz + step_z,
+                ix + step_x,
+                domain.nz);
+            point.id2 = index2(
+                iz + 2 * step_z,
+                ix + 2 * step_x,
+                domain.nz);
+            point.id3 = index2(
+                iz + 3 * step_z,
+                ix + 3 * step_x,
+                domain.nz);
+            point.id4 = index2(
+                iz + 4 * step_z,
+                ix + 4 * step_x,
+                domain.nz);
+            point.weight = weight;
+            const float sigma =
+                domain.absorb_alpha *
+                domain.velocity[point.id] *
+                domain.dt /
+                std::max(domain.dx, domain.dz);
+            point.t1 = (2.0f - sigma) * (1.0f - sigma) / 2.0f;
+            point.t2 = sigma * (2.0f - sigma);
+            point.t3 = sigma * (sigma - 1.0f) / 2.0f;
+            domain.absorb_points.push_back(point);
+        };
+
+        domain.absorb_points.reserve(
+            static_cast<size_t>(2 * (length - 4)) *
+            static_cast<size_t>(domain.nx + domain.nz));
+        for (int ix = 0; ix < length - 4; ++ix)
+        {
+            const float weight =
+                1.0f - ix / static_cast<float>(length);
+            for (int iz = 0; iz < domain.nz; ++iz)
+                append(ix, iz, 1, 0, weight);
+        }
+        for (int ix = domain.nx - length + 4;
+             ix < domain.nx;
+             ++ix)
+        {
+            const float weight =
+                1.0f -
+                (domain.nx - ix - 1) /
+                    static_cast<float>(length);
+            for (int iz = 0; iz < domain.nz; ++iz)
+                append(ix, iz, -1, 0, weight);
+        }
+        if (domain.physical_top)
+        {
+            for (int ix = 0; ix < domain.nx; ++ix)
+            {
+                for (int iz = 0; iz < length - 4; ++iz)
+                {
+                    append(
+                        ix,
+                        iz,
+                        0,
+                        1,
+                        1.0f -
+                            iz / static_cast<float>(length));
+                }
+            }
+        }
+        if (domain.physical_bottom)
+        {
+            for (int ix = 0; ix < domain.nx; ++ix)
+            {
+                for (int iz = domain.nz - length + 4;
+                     iz < domain.nz;
+                     ++iz)
+                {
+                    append(
+                        ix,
+                        iz,
+                        0,
+                        -1,
+                        1.0f -
+                            (domain.nz - iz - 1) /
+                                static_cast<float>(length));
+                }
+            }
+        }
+    }
     return domain;
 }
 
-void apply_laplacian(
+void advance_wavefield(
     const Domain &domain,
+    const std::vector<float> &previous,
     const std::vector<float> &current,
-    std::vector<float> &laplacian)
+    std::vector<float> &following)
 {
-    std::fill(laplacian.begin(), laplacian.end(), 0.0f);
     const float dx2 = domain.dx * domain.dx;
     const float dz2 = domain.dz * domain.dz;
 
-    // The three rows adjacent to an artificial boundary use FD2 so that a
-    // one-row Robin condition can enter the FD8 interior.
-    for (int ix = 4; ix < domain.nx - 4; ++ix)
-    {
-        for (int iz = 1; iz < domain.nz - 1; ++iz)
-        {
-            if ((domain.physical_top && iz < 4) ||
-                (domain.physical_bottom && iz >= domain.nz - 4))
-                continue;
-            const size_t id = index2(iz, ix, domain.nz);
-            laplacian[id] =
-                (current[index2(iz, ix - 1, domain.nz)] -
-                 2.0f * current[id] +
-                 current[index2(iz, ix + 1, domain.nz)]) /
-                    dx2 +
-                (current[index2(iz - 1, ix, domain.nz)] -
-                 2.0f * current[id] +
-                 current[index2(iz + 1, ix, domain.nz)]) /
-                    dz2;
-        }
-    }
+    // The old implementation first evaluated FD2 over almost the complete
+    // domain, overwrote it with FD8 in the interior, and then made a third
+    // pass to advance the wavefield.  Initialize the zero-Laplacian boundary
+    // values once and directly overwrite only the points that need FD8/FD2.
+    for (size_t id = 0; id < following.size(); ++id)
+        following[id] = 2.0f * current[id] - previous[id];
 
     for (int ix = 4; ix < domain.nx - 4; ++ix)
     {
@@ -326,8 +420,39 @@ void apply_laplacian(
                     (current[index2(iz - 1, ix, domain.nz)] +
                      current[index2(iz + 1, ix, domain.nz)]) -
                 (205.0f / 72.0f) * current[id];
-            laplacian[id] = d2x / dx2 + d2z / dz2;
+            const float laplacian = d2x / dx2 + d2z / dz2;
+            following[id] += domain.v2dt2[id] * laplacian;
         }
+    }
+
+    // Only the three rows adjacent to an artificial boundary use FD2 so
+    // that a one-row Robin condition can enter the FD8 interior.
+    auto advance_fd2_row = [&](int iz)
+    {
+        for (int ix = 4; ix < domain.nx - 4; ++ix)
+        {
+            const size_t id = index2(iz, ix, domain.nz);
+            const float laplacian =
+                (current[index2(iz, ix - 1, domain.nz)] -
+                 2.0f * current[id] +
+                 current[index2(iz, ix + 1, domain.nz)]) /
+                    dx2 +
+                (current[index2(iz - 1, ix, domain.nz)] -
+                 2.0f * current[id] +
+                 current[index2(iz + 1, ix, domain.nz)]) /
+                    dz2;
+            following[id] += domain.v2dt2[id] * laplacian;
+        }
+    };
+    if (!domain.physical_top)
+    {
+        for (int iz = 1; iz < 4; ++iz)
+            advance_fd2_row(iz);
+    }
+    if (!domain.physical_bottom)
+    {
+        for (int iz = domain.nz - 4; iz < domain.nz - 1; ++iz)
+            advance_fd2_row(iz);
     }
 }
 
@@ -337,71 +462,23 @@ void apply_absorber(
     const std::vector<float> &current,
     const std::vector<float> &previous)
 {
-    const int length = std::min(
-        domain.absorb_length,
-        std::min(domain.nx, domain.nz) / 2);
-    if (length < 5)
-        return;
-
-    auto update = [&](int ix, int iz, int step_x, int step_z, float weight)
+    for (const AbsorbPoint &point : domain.absorb_points)
     {
-        const size_t id = index2(iz, ix, domain.nz);
-        const float sigma =
-            domain.absorb_alpha * domain.velocity[id] * domain.dt /
-            std::max(domain.dx, domain.dz);
-        const float t1 = (2.0f - sigma) * (1.0f - sigma) / 2.0f;
-        const float t2 = sigma * (2.0f - sigma);
-        const float t3 = sigma * (sigma - 1.0f) / 2.0f;
-        const size_t id1 =
-            index2(iz + step_z, ix + step_x, domain.nz);
-        const size_t id2 =
-            index2(iz + 2 * step_z, ix + 2 * step_x, domain.nz);
-        const size_t id3 =
-            index2(iz + 3 * step_z, ix + 3 * step_x, domain.nz);
-        const size_t id4 =
-            index2(iz + 4 * step_z, ix + 4 * step_x, domain.nz);
         const float outgoing =
             2.0f *
-                (t1 * current[id] +
-                 t2 * current[id1] +
-                 t3 * current[id2]) -
-            (t1 * t1 * previous[id] +
-             2.0f * t1 * t2 * previous[id1] +
-             (2.0f * t1 * t3 + t2 * t2) * previous[id2] +
-             2.0f * t2 * t3 * previous[id3] +
-             t3 * t3 * previous[id4]);
-        following[id] =
-            weight * outgoing + (1.0f - weight) * following[id];
-    };
-
-    for (int ix = 0; ix < domain.nx; ++ix)
-    {
-        for (int iz = 0; iz < domain.nz; ++iz)
-        {
-            if (ix < length - 4)
-                update(ix, iz, 1, 0, 1.0f - ix / static_cast<float>(length));
-            if (ix > domain.nx - length + 3)
-                update(
-                    ix,
-                    iz,
-                    -1,
-                    0,
-                    1.0f -
-                        (domain.nx - ix - 1) /
-                            static_cast<float>(length));
-            if (domain.physical_top && iz < length - 4)
-                update(ix, iz, 0, 1, 1.0f - iz / static_cast<float>(length));
-            if (domain.physical_bottom &&
-                iz > domain.nz - length + 3)
-                update(
-                    ix,
-                    iz,
-                    0,
-                    -1,
-                    1.0f -
-                        (domain.nz - iz - 1) /
-                            static_cast<float>(length));
-        }
+                (point.t1 * current[point.id] +
+                 point.t2 * current[point.id1] +
+                 point.t3 * current[point.id2]) -
+            (point.t1 * point.t1 * previous[point.id] +
+             2.0f * point.t1 * point.t2 * previous[point.id1] +
+             (2.0f * point.t1 * point.t3 +
+              point.t2 * point.t2) *
+                 previous[point.id2] +
+             2.0f * point.t2 * point.t3 * previous[point.id3] +
+             point.t3 * point.t3 * previous[point.id4]);
+        following[point.id] =
+            point.weight * outgoing +
+            (1.0f - point.weight) * following[point.id];
     }
 }
 
@@ -529,7 +606,6 @@ State solve_local(
     std::vector<float> previous(domain.velocity.size(), 0.0f);
     std::vector<float> current(domain.velocity.size(), 0.0f);
     std::vector<float> following(domain.velocity.size(), 0.0f);
-    std::vector<float> laplacian(domain.velocity.size(), 0.0f);
     const int source_local_z =
         domain.top_pad + source_global_z - domain.block.local_start;
     const int source_local_x = domain.nbc + source_x;
@@ -548,14 +624,7 @@ State solve_local(
                 domain.nz)] += (*source)[it];
         }
 
-        apply_laplacian(domain, current, laplacian);
-        for (size_t id = 0; id < following.size(); ++id)
-        {
-            following[id] =
-                2.0f * current[id] -
-                previous[id] +
-                domain.v2dt2[id] * laplacian[id];
-        }
+        advance_wavefield(domain, previous, current, following);
 
         apply_absorber(domain, following, current, previous);
 
@@ -1113,8 +1182,8 @@ void validate(
     if (parameters.nt <= 0 || parameters.dt <= 0.0f ||
         parameters.fdom <= 0.0f)
         throw std::runtime_error("nt, dt, and fdom must be positive");
-    if (parameters.blocks < 4)
-        throw std::runtime_error("blocks must be at least 4");
+    if (parameters.blocks < 2)
+        throw std::runtime_error("blocks must be at least 2");
     if (parameters.blocks > grid.nz / 4)
         throw std::runtime_error("too many blocks for the depth grid");
     if (parameters.overlap < 4)
