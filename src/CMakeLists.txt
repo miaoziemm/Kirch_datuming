@@ -143,6 +143,17 @@ add_executable(
 )
 
 add_executable(
+    layercom_cig
+    layercom_cig.cpp
+)
+
+add_executable(
+    extract_adcig
+    extract_adcig.cpp
+)
+
+
+add_executable(
     window
     window.cpp
 )
@@ -315,6 +326,24 @@ target_link_libraries(
 
 target_link_libraries(
     layercom
+    ${SERECKIRCH_LIB}
+    ${SEFILESYSTEM_LIB}
+    ${SEBASIC_LIB}
+    ${DL_LIBRARY}
+    Threads::Threads
+)
+
+target_link_libraries(
+    layercom_cig
+    ${SERECKIRCH_LIB}
+    ${SEFILESYSTEM_LIB}
+    ${SEBASIC_LIB}
+    ${DL_LIBRARY}
+    Threads::Threads
+)
+
+target_link_libraries(
+    extract_adcig
     ${SERECKIRCH_LIB}
     ${SEFILESYSTEM_LIB}
     ${SEBASIC_LIB}
@@ -508,6 +537,8 @@ install(
     greensol
     greensol_auto
     layercom
+    layercom_cig
+    extract_adcig
     window
     layervel
     kirchdat2d_auto_cs
@@ -611,6 +642,20 @@ add_dependencies(
 
 add_dependencies(
     layercom
+    sebasic
+    sefs
+    reckirch
+)
+
+add_dependencies(
+    layercom_cig
+    sebasic
+    sefs
+    reckirch
+)
+
+add_dependencies(
+    extract_adcig
     sebasic
     sefs
     reckirch
