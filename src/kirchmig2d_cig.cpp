@@ -110,6 +110,40 @@ static float angle_taper_weight(float angle, float start, float end)
     return 0.5f * (1.0f + cosf((float)M_PI * x));
 }
 
+/*
+ * Mute the early-time fan that opens to both sides of a shot.
+ *
+ * The mute boundary for a receiver at xr is
+ *
+ *     t_boundary = intercept + slope * |xr - xs|.
+ *
+ * Samples before the boundary are removed.  A raised-cosine ramp after the
+ * boundary avoids the high-frequency noise caused by a hard time cut.  The
+ * routine operates on the input trace before the integrations used by the
+ * Kirchhoff kernel, so muted energy cannot leak back into the angle gather.
+ */
+static void apply_direct_wave_mute(float *trace, int nt, float t0, float dt,
+                                   float source_x, float receiver_x,
+                                   float slope, float intercept,
+                                   float taper_length)
+{
+    const float boundary = intercept + slope * fabsf(receiver_x - source_x);
+
+    for (int it = 0; it < nt; it++) {
+        const float time = t0 + (float)it * dt;
+        float weight = 0.0f;
+
+        if (time >= boundary + taper_length) {
+            weight = 1.0f;
+        } else if (time > boundary) {
+            const float u = (time - boundary) / taper_length;
+            weight = 0.5f * (1.0f - cosf((float)M_PI * u));
+        }
+
+        trace[it] *= weight;
+    }
+}
+
 static float finite_diff_x_radius(const float *tab, int nz, int nx,
                                   int iz, int ix, float dx, int radius)
 {
@@ -189,32 +223,43 @@ static void copy_n(float *dst, const float *src, off_t n)
     for (off_t i = 0; i < n; i++) dst[i] = src[i];
 }
 
-static void interp_volume_linear(float *out, float **tbl, int npos, off_t nxy,
-                                 float coord, float o, float d)
+static void load_table_slice(sep_t *fp, int index, float *buf, off_t nxy,
+                             int *cached_index, const char *name)
 {
-    if (npos <= 1 || d == 0.0f) {
-        copy_n(out, tbl[0], nxy);
-        return;
+    if (cached_index != NULL && *cached_index == index) return;
+    const off_t byte_off = (off_t)index * nxy * (off_t)sizeof(float);
+    if (se_fsio_seek(fp->data->io, byte_off) != CODE_SUCCESS)
+        ERROR(("Failed to seek %s slice %d", name, index));
+    if (se_fsio_read_float(fp->data->io, buf, (size_t)nxy) != CODE_SUCCESS)
+        ERROR(("Failed to read %s slice %d", name, index));
+    if (cached_index != NULL) *cached_index = index;
+}
+
+/* Preserve the original volume interpolation exactly while streaming slices. */
+static void interp_volume_linear_stream(float *out, sep_t *fp, int npos,
+                                        off_t nxy, float coord, float o,
+                                        float d, float *slice0, float *slice1,
+                                        const char *name)
+{
+    int i0 = 0;
+
+    if (npos > 1 && d != 0.0f) {
+        const float f = (coord - o) / d;
+        i0 = (int)floorf(f);
+
+        if (i0 > 0 && i0 < npos - 1) {
+            const float w = f - (float)i0;
+            load_table_slice(fp, i0, slice0, nxy, NULL, name);
+            load_table_slice(fp, i0 + 1, slice1, nxy, NULL, name);
+            for (off_t i = 0; i < nxy; i++)
+                out[i] = (1.0f - w) * slice0[i] + w * slice1[i];
+            return;
+        }
     }
 
-    float f = (coord - o) / d;
-    int i0 = (int)floorf(f);
-
-    if (i0 <= 0) {
-        copy_n(out, tbl[0], nxy);
-        return;
-    }
-    if (i0 >= npos - 1) {
-        copy_n(out, tbl[npos - 1], nxy);
-        return;
-    }
-
-    float w = f - (float)i0;
-    const float *a = tbl[i0];
-    const float *b = tbl[i0 + 1];
-    for (off_t i = 0; i < nxy; i++) {
-        out[i] = (1.0f - w) * a[i] + w * b[i];
-    }
+    const int index = i0 >= npos - 1 ? npos - 1 : 0;
+    load_table_slice(fp, index, slice0, nxy, NULL, name);
+    copy_n(out, slice0, nxy);
 }
 
 static int parse_output_axis(int is_angle, int nh,
@@ -267,8 +312,8 @@ static int parse_output_axis(int is_angle, int nh,
     return 0;
 }
 
-static void read_grad_volume(const char *name, char *file, int nz, int nx, int n3,
-                             off_t nzx, float ***tbl_out)
+static sep_t *open_grad_volume(const char *name, char *file,
+                               int nz, int nx, int n3)
 {
     sep_t *fp = sep_open(file, SEP_READ, 0);
     if (fp->headers->ndim < 3) {
@@ -277,9 +322,7 @@ static void read_grad_volume(const char *name, char *file, int nz, int nx, int n
     if (fp->headers->n[0] != nz || fp->headers->n[1] != nx || fp->headers->n[2] != n3) {
         ERROR(("Dimension mismatch in %s=. Expected n1=%d n2=%d n3=%d", name, nz, nx, n3));
     }
-    *tbl_out = alloc2float(nzx, n3);
-    se_fsio_read_float(fp->data->io, (*tbl_out)[0], nzx * n3);
-    sep_close(fp);
+    return fp;
 }
 
 void diff2(float *trace, int n, float d)
@@ -314,9 +357,12 @@ int main(int argc, char *argv[])
     int i = 0, ix = 0, iz = 0, ih = 0, is = 0, ist = 0, iht = 0, ng = 0, ithr = 0, nthr = 0;
     int ig = 0, ig_offset = 0;
     float *trace = NULL, **traces = NULL, **out = NULL;
-    float **stbl = NULL, **rtbl = NULL, *stable = NULL, *rtable = NULL;
-    float **stblx = NULL, **rtblx = NULL, *stablex = NULL, *rtablex = NULL;
-    float **sgradx_tbl = NULL, **sgradz_tbl = NULL, **rgradx_tbl = NULL, **rgradz_tbl = NULL;
+    float *stable = NULL, *rtable = NULL, *stablex = NULL, *rtablex = NULL;
+    float *stbl0 = NULL, *stbl1 = NULL, *stblx0 = NULL, *stblx1 = NULL;
+    float *rtbl0 = NULL, *rtbl1 = NULL, *rtblx0 = NULL, *rtblx1 = NULL;
+    float *grad_slice0 = NULL, *grad_slice1 = NULL;
+    int stbl0_idx = -1, stbl1_idx = -1, stblx0_idx = -1, stblx1_idx = -1;
+    int rtbl0_idx = -1, rtbl1_idx = -1, rtblx0_idx = -1, rtblx1_idx = -1;
     float *sgradx = NULL, *sgradz = NULL, *rgradx = NULL, *rgradz = NULL;
     float ds = 0.0f, s0 = 0.0f, x0 = 0.0f, sy0 = 0.0f, sdy = 0.0f, ry0 = 0.0f, rdy = 0.0f;
     float s = 0.0f, h = 0.0f, h0 = 0.0f, dh = 0.0f, dx = 0.0f;
@@ -327,7 +373,12 @@ int main(int argc, char *argv[])
     int angle_interp = 1;
     int angle_grad_radius = 2;
     int aperture_trace_taper = 20;
+    int direct_mute = 0;
+    float direct_mute_slope = 0.0f;
+    float direct_mute_intercept = 0.0f;
+    float direct_mute_taper = 0.05f;
     sep_t *dat = NULL, *mig = NULL, *stim = NULL, *sder = NULL, *rtim = NULL, *rder = NULL;
+    sep_t *sgradx_fp = NULL, *sgradz_fp = NULL, *rgradx_fp = NULL, *rgradz_fp = NULL;
     char *dat_f = NULL, *mig_f = NULL, *stim_f = NULL, *sder_f = NULL, *rtim_f = NULL, *rder_f = NULL;
     char *sgradx_f = NULL, *sgradz_f = NULL, *rgradx_f = NULL, *rgradz_f = NULL;
 
@@ -479,6 +530,34 @@ int main(int argc, char *argv[])
     if (1 == nh) dh = 0.0f;
     if (1 == ns) ds = 0.0f;
 
+    /*
+     * Optional smooth direct-wave/side-noise mute for input shot gathers.
+     * Receiver position is s+h for CMP/offset input and h for receiver input.
+     * direct_mute_slope has units of seconds per lateral-coordinate unit.
+     */
+    if (se_have_par("direct_mute"))
+        direct_mute = se_get_par_int("direct_mute");
+    if (se_have_par("direct_mute_slope"))
+        direct_mute_slope = se_get_par_float("direct_mute_slope");
+    if (se_have_par("direct_mute_intercept"))
+        direct_mute_intercept = se_get_par_float("direct_mute_intercept");
+    if (se_have_par("direct_mute_taper"))
+        direct_mute_taper = se_get_par_float("direct_mute_taper");
+
+    if (direct_mute) {
+        if (!adj)
+            ERROR(("direct_mute=1 is an input-data preprocessing option and requires adj=1."));
+        if (!isfinite(direct_mute_slope) || direct_mute_slope < 0.0f)
+            ERROR(("direct_mute_slope must be finite and non-negative."));
+        if (!isfinite(direct_mute_intercept))
+            ERROR(("direct_mute_intercept must be finite."));
+        if (!isfinite(direct_mute_taper) || direct_mute_taper <= 0.0f)
+            ERROR(("direct_mute_taper must be finite and positive to avoid a hard cutoff."));
+
+        INFO(("direct mute enabled: boundary = %g + %g*abs(receiver-source) s, cosine taper = %g s\n",
+              direct_mute_intercept, direct_mute_slope, direct_mute_taper));
+    }
+
     stim = sep_open(stim_f, SEP_READ, 0);
     sder = sep_open(sder_f, SEP_READ, 0);
 
@@ -500,14 +579,6 @@ int main(int argc, char *argv[])
 
     nzx = (off_t)nz * (off_t)nx;
 
-    stbl = alloc2float(nzx, sny);
-    se_fsio_read_float(stim->data->io, stbl[0], nzx * sny);
-    sep_close(stim);
-
-    stblx = alloc2float(nzx, sny);
-    se_fsio_read_float(sder->data->io, stblx[0], nzx * sny);
-    sep_close(sder);
-
     rtim = sep_open(rtim_f, SEP_READ, 0);
     rder = sep_open(rder_f, SEP_READ, 0);
 
@@ -520,24 +591,16 @@ int main(int argc, char *argv[])
     ry0 = (float)rtim->headers->o[2];
     rdy = (float)rtim->headers->d[2];
 
-    rtbl = alloc2float(nzx, rny);
-    se_fsio_read_float(rtim->data->io, rtbl[0], nzx * rny);
-    sep_close(rtim);
-
-    rtblx = alloc2float(nzx, rny);
-    se_fsio_read_float(rder->data->io, rtblx[0], nzx * rny);
-    sep_close(rder);
-
     if (use_input_angle_grad) {
-        read_grad_volume("sgradx", sgradx_f, nz, nx, sny, nzx, &sgradx_tbl);
-        read_grad_volume("sgradz", sgradz_f, nz, nx, sny, nzx, &sgradz_tbl);
-        read_grad_volume("rgradx", rgradx_f, nz, nx, rny, nzx, &rgradx_tbl);
-        read_grad_volume("rgradz", rgradz_f, nz, nx, rny, nzx, &rgradz_tbl);
+        sgradx_fp = open_grad_volume("sgradx", sgradx_f, nz, nx, sny);
+        sgradz_fp = open_grad_volume("sgradz", sgradz_f, nz, nx, sny);
+        rgradx_fp = open_grad_volume("rgradx", rgradx_f, nz, nx, rny);
+        rgradz_fp = open_grad_volume("rgradz", rgradz_f, nz, nx, rny);
         sgradx = alloc1float(nzx);
         sgradz = alloc1float(nzx);
         rgradx = alloc1float(nzx);
         rgradz = alloc1float(nzx);
-        INFO(("mode=angle: use input spatial traveltime gradients sgradx/sgradz/rgradx/rgradz.\n"));
+        INFO(("mode=angle: stream input spatial traveltime gradients sgradx/sgradz/rgradx/rgradz.\n"));
     } else if (cig && cig_is_angle) {
         INFO(("mode=angle: no spatial gradient files are provided; compute dT/dx and dT/dz by finite differences of traveltime tables.\n"));
     }
@@ -661,6 +724,18 @@ int main(int argc, char *argv[])
     stablex = alloc1float(nzx);
     rtable = alloc1float(nzx);
     rtablex = alloc1float(nzx);
+    stbl0 = alloc1float(nzx);
+    stbl1 = alloc1float(nzx);
+    stblx0 = alloc1float(nzx);
+    stblx1 = alloc1float(nzx);
+    rtbl0 = alloc1float(nzx);
+    rtbl1 = alloc1float(nzx);
+    rtblx0 = alloc1float(nzx);
+    rtblx1 = alloc1float(nzx);
+    if (use_input_angle_grad) {
+        grad_slice0 = alloc1float(nzx);
+        grad_slice1 = alloc1float(nzx);
+    }
 
     /* type of interpolation, default Hermite */
     if (!se_have_par("type"))
@@ -706,37 +781,43 @@ int main(int argc, char *argv[])
         /* cubic Hermite spline interpolation of source traveltime */
         ist = (int)((s - sy0) / sdy);
         if (ist <= 0) {
-            for (i = 0; i < nzx; i++) {
-                stable[i] = stbl[0][i];
-                stablex[i] = stblx[0][i];
-            }
+            load_table_slice(stim, 0, stbl0, nzx, &stbl0_idx, "stable");
+            load_table_slice(sder, 0, stblx0, nzx, &stblx0_idx, "sderiv");
+            copy_n(stable, stbl0, nzx);
+            copy_n(stablex, stblx0, nzx);
         } else if (ist >= sny - 1) {
-            for (i = 0; i < nzx; i++) {
-                stable[i] = stbl[sny - 1][i];
-                stablex[i] = stblx[sny - 1][i];
-            }
+            load_table_slice(stim, sny - 1, stbl0, nzx, &stbl0_idx, "stable");
+            load_table_slice(sder, sny - 1, stblx0, nzx, &stblx0_idx, "sderiv");
+            copy_n(stable, stbl0, nzx);
+            copy_n(stablex, stblx0, nzx);
         } else {
+            load_table_slice(stim, ist, stbl0, nzx, &stbl0_idx, "stable");
+            load_table_slice(stim, ist + 1, stbl1, nzx, &stbl1_idx, "stable");
+            load_table_slice(sder, ist, stblx0, nzx, &stblx0_idx, "sderiv");
+            load_table_slice(sder, ist + 1, stblx1, nzx, &stblx1_idx, "sderiv");
             switch (type[0]) {
             case 'l': /* linear */
-                tinterp_linear(true, stable, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1]);
-                dinterp_linear(true, stablex, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1]);
+                tinterp_linear(true, stable, s - ist * sdy - sy0, stbl0, stbl1);
+                dinterp_linear(true, stablex, s - ist * sdy - sy0, stbl0, stbl1);
                 break;
 
             case 'p': /* partial */
-                tinterp_partial(true, stable, s - ist * sdy - sy0, nz, nx, dx, stbl[ist], stbl[ist + 1]);
-                dinterp_partial(true, stablex, s - ist * sdy - sy0, nz, nx, dx, stbl[ist], stbl[ist + 1]);
+                tinterp_partial(true, stable, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
+                dinterp_partial(true, stablex, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
                 break;
 
             case 'h': /* Hermite */
-                tinterp_hermite(true, stable, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1], stblx[ist], stblx[ist + 1]);
-                dinterp_hermite(true, stablex, s - ist * sdy - sy0, stbl[ist], stbl[ist + 1], stblx[ist], stblx[ist + 1]);
+                tinterp_hermite(true, stable, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
+                dinterp_hermite(true, stablex, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
                 break;
             }
         }
 
         if (use_input_angle_grad) {
-            interp_volume_linear(sgradx, sgradx_tbl, sny, nzx, s, sy0, sdy);
-            interp_volume_linear(sgradz, sgradz_tbl, sny, nzx, s, sy0, sdy);
+            interp_volume_linear_stream(sgradx, sgradx_fp, sny, nzx, s, sy0, sdy,
+                                        grad_slice0, grad_slice1, "sgradx");
+            interp_volume_linear_stream(sgradz, sgradz_fp, sny, nzx, s, sy0, sdy,
+                                        grad_slice0, grad_slice1, "sgradz");
         }
 
         for (ih = 0; ih < nh; ih++) { /* offset or receiver */
@@ -750,6 +831,14 @@ int main(int argc, char *argv[])
             if (adj) {
                 /* read trace first to keep the input I/O position correct */
                 se_fsio_read_float(dat->data->io, trace, nt);
+
+                if (direct_mute) {
+                    const float receiver_x = cmp ? (s + h) : h;
+                    apply_direct_wave_mute(
+                        trace, nt, t0, dt, s, receiver_x,
+                        direct_mute_slope, direct_mute_intercept,
+                        direct_mute_taper);
+                }
 
                 trace_ap_weight = 1.0f;
                 if (aperture_trace != -1) {
@@ -832,39 +921,45 @@ int main(int argc, char *argv[])
             }
 
             if (iht <= 0) {
-                for (i = 0; i < nzx; i++) {
-                    rtable[i] = rtbl[0][i];
-                    rtablex[i] = rtblx[0][i];
-                }
+                load_table_slice(rtim, 0, rtbl0, nzx, &rtbl0_idx, "rtable");
+                load_table_slice(rder, 0, rtblx0, nzx, &rtblx0_idx, "rderiv");
+                copy_n(rtable, rtbl0, nzx);
+                copy_n(rtablex, rtblx0, nzx);
             } else if (iht >= rny - 1) {
-                for (i = 0; i < nzx; i++) {
-                    rtable[i] = rtbl[rny - 1][i];
-                    rtablex[i] = rtblx[rny - 1][i];
-                }
+                load_table_slice(rtim, rny - 1, rtbl0, nzx, &rtbl0_idx, "rtable");
+                load_table_slice(rder, rny - 1, rtblx0, nzx, &rtblx0_idx, "rderiv");
+                copy_n(rtable, rtbl0, nzx);
+                copy_n(rtablex, rtblx0, nzx);
             } else {
                 float rcoord = cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0;
+                load_table_slice(rtim, iht, rtbl0, nzx, &rtbl0_idx, "rtable");
+                load_table_slice(rtim, iht + 1, rtbl1, nzx, &rtbl1_idx, "rtable");
+                load_table_slice(rder, iht, rtblx0, nzx, &rtblx0_idx, "rderiv");
+                load_table_slice(rder, iht + 1, rtblx1, nzx, &rtblx1_idx, "rderiv");
                 switch (type[0]) {
                 case 'l': /* linear */
-                    tinterp_linear(false, rtable, rcoord, rtbl[iht], rtbl[iht + 1]);
-                    dinterp_linear(false, rtablex, rcoord, rtbl[iht], rtbl[iht + 1]);
+                    tinterp_linear(false, rtable, rcoord, rtbl0, rtbl1);
+                    dinterp_linear(false, rtablex, rcoord, rtbl0, rtbl1);
                     break;
 
                 case 'p': /* partial */
-                    tinterp_partial(false, rtable, rcoord, nz, nx, dx, rtbl[iht], rtbl[iht + 1]);
-                    dinterp_partial(false, rtablex, rcoord, nz, nx, dx, rtbl[iht], rtbl[iht + 1]);
+                    tinterp_partial(false, rtable, rcoord, nz, nx, dx, rtbl0, rtbl1);
+                    dinterp_partial(false, rtablex, rcoord, nz, nx, dx, rtbl0, rtbl1);
                     break;
 
                 case 'h': /* Hermite */
-                    tinterp_hermite(false, rtable, rcoord, rtbl[iht], rtbl[iht + 1], rtblx[iht], rtblx[iht + 1]);
-                    dinterp_hermite(false, rtablex, rcoord, rtbl[iht], rtbl[iht + 1], rtblx[iht], rtblx[iht + 1]);
+                    tinterp_hermite(false, rtable, rcoord, rtbl0, rtbl1, rtblx0, rtblx1);
+                    dinterp_hermite(false, rtablex, rcoord, rtbl0, rtbl1, rtblx0, rtblx1);
                     break;
                 }
             }
 
             if (use_input_angle_grad) {
                 float rpos = cmp ? (s + h) : h;
-                interp_volume_linear(rgradx, rgradx_tbl, rny, nzx, rpos, ry0, rdy);
-                interp_volume_linear(rgradz, rgradz_tbl, rny, nzx, rpos, ry0, rdy);
+                interp_volume_linear_stream(rgradx, rgradx_fp, rny, nzx, rpos, ry0, rdy,
+                                            grad_slice0, grad_slice1, "rgradx");
+                interp_volume_linear_stream(rgradz, rgradz_fp, rny, nzx, rpos, ry0, rdy,
+                                            grad_slice0, grad_slice1, "rgradz");
             }
 
 #ifdef _OPENMP
@@ -1024,6 +1119,14 @@ int main(int argc, char *argv[])
     se_par_destroy();
     sep_close(dat);
     sep_close(mig);
+    sep_close(stim);
+    sep_close(sder);
+    sep_close(rtim);
+    sep_close(rder);
+    if (sgradx_fp) sep_close(sgradx_fp);
+    if (sgradz_fp) sep_close(sgradz_fp);
+    if (rgradx_fp) sep_close(rgradx_fp);
+    if (rgradz_fp) sep_close(rgradz_fp);
 
     if (traces) free2float(traces);
     if (out) free2float(out);
@@ -1032,19 +1135,21 @@ int main(int argc, char *argv[])
     if (stablex) free1float(stablex);
     if (rtable) free1float(rtable);
     if (rtablex) free1float(rtablex);
-    if (stbl) free2float(stbl);
-    if (stblx) free2float(stblx);
-    if (rtbl) free2float(rtbl);
-    if (rtblx) free2float(rtblx);
+    if (stbl0) free1float(stbl0);
+    if (stbl1) free1float(stbl1);
+    if (stblx0) free1float(stblx0);
+    if (stblx1) free1float(stblx1);
+    if (rtbl0) free1float(rtbl0);
+    if (rtbl1) free1float(rtbl1);
+    if (rtblx0) free1float(rtblx0);
+    if (rtblx1) free1float(rtblx1);
+    if (grad_slice0) free1float(grad_slice0);
+    if (grad_slice1) free1float(grad_slice1);
 
     if (sgradx) free1float(sgradx);
     if (sgradz) free1float(sgradz);
     if (rgradx) free1float(rgradx);
     if (rgradz) free1float(rgradz);
-    if (sgradx_tbl) free2float(sgradx_tbl);
-    if (sgradz_tbl) free2float(sgradz_tbl);
-    if (rgradx_tbl) free2float(rgradx_tbl);
-    if (rgradz_tbl) free2float(rgradz_tbl);
 
     return 0;
 }
