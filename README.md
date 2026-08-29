@@ -11,8 +11,9 @@ direct_mute_intercept=0.02
 direct_mute_taper=0.05
 ```
 
-切除边界为
-`t = direct_mute_intercept + direct_mute_slope * abs(receiver_x - source_x)`。
+默认切除边界为
+`t = direct_mute_intercept + direct_mute_slope * abs(receiver_x - source_x)`；
+设置 `direct_mute_invert=1` 后改为减号，从而形成尖点位于震源位置的倒 V 形。
 边界之前的数据置零，边界之后在 `direct_mute_taper` 秒内使用升余弦从 0
 平滑恢复到 1，因此不会产生硬截断。`cmp=1` 时接收点位置按 `source + offset`
 计算；`cmp=0` 时第二维坐标直接作为接收点位置。该功能默认关闭，且
@@ -29,9 +30,14 @@ direct_mute_taper=0.05
 
 ## 五层盐丘 ADCIG 脚本
 
-`run_salt_adcig.sh` 为五个递归层分别设置平滑直达波切除参数。默认斜率从
-第一层的 `0.35 s/km` 逐层减小到第五层的 `0.15 s/km`，所以越深层的切除线
-越平；四组数组 `direct_mute_enable/direct_mute_slope/`
+`run_salt_adcig.sh` 为五个递归层分别设置平滑直达波切除参数。当前使用一套
+以震源为尖点的 V 形切除预设：五层均设置 `direct_mute_invert=0`、截距为
+`0 s`，斜率为 `50,40,30,20,10 s/km`，缓冲长度为
+`0.05,0.06,0.07,0.08,0.10 s`。由于模型横向坐标使用 km，第一层在距离震源
+`0.01 km`（10 m）处的切除时间正好为 `0.5 s`；距离越远，切除时间越大，
+并将小于该边界时间的全部能量去除。斜率随深度减小使深层切除线更平；
+五组数组 `direct_mute_enable/`
+`direct_mute_invert/direct_mute_slope/`
 `direct_mute_intercept/direct_mute_taper` 均可在脚本开头独立调整。运行方式：
 
 ```text

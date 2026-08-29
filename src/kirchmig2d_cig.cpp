@@ -115,7 +115,8 @@ static float angle_taper_weight(float angle, float start, float end)
  *
  * The mute boundary for a receiver at xr is
  *
- *     t_boundary = intercept + slope * |xr - xs|.
+ *     normal:   t_boundary = intercept + slope * |xr - xs|
+ *     inverted: t_boundary = intercept - slope * |xr - xs|.
  *
  * Samples before the boundary are removed.  A raised-cosine ramp after the
  * boundary avoids the high-frequency noise caused by a hard time cut.  The
@@ -125,9 +126,11 @@ static float angle_taper_weight(float angle, float start, float end)
 static void apply_direct_wave_mute(float *trace, int nt, float t0, float dt,
                                    float source_x, float receiver_x,
                                    float slope, float intercept,
-                                   float taper_length)
+                                   float taper_length, int inverted)
 {
-    const float boundary = intercept + slope * fabsf(receiver_x - source_x);
+    const float offset_time = slope * fabsf(receiver_x - source_x);
+    const float boundary = inverted ? intercept - offset_time
+                                    : intercept + offset_time;
 
     for (int it = 0; it < nt; it++) {
         const float time = t0 + (float)it * dt;
@@ -374,6 +377,7 @@ int main(int argc, char *argv[])
     int angle_grad_radius = 2;
     int aperture_trace_taper = 20;
     int direct_mute = 0;
+    int direct_mute_invert = 0;
     float direct_mute_slope = 0.0f;
     float direct_mute_intercept = 0.0f;
     float direct_mute_taper = 0.05f;
@@ -539,6 +543,8 @@ int main(int argc, char *argv[])
         direct_mute = se_get_par_int("direct_mute");
     if (se_have_par("direct_mute_slope"))
         direct_mute_slope = se_get_par_float("direct_mute_slope");
+    if (se_have_par("direct_mute_invert"))
+        direct_mute_invert = se_get_par_int("direct_mute_invert");
     if (se_have_par("direct_mute_intercept"))
         direct_mute_intercept = se_get_par_float("direct_mute_intercept");
     if (se_have_par("direct_mute_taper"))
@@ -553,9 +559,12 @@ int main(int argc, char *argv[])
             ERROR(("direct_mute_intercept must be finite."));
         if (!isfinite(direct_mute_taper) || direct_mute_taper <= 0.0f)
             ERROR(("direct_mute_taper must be finite and positive to avoid a hard cutoff."));
+        if (direct_mute_invert != 0 && direct_mute_invert != 1)
+            ERROR(("direct_mute_invert must be 0 or 1."));
 
-        INFO(("direct mute enabled: boundary = %g + %g*abs(receiver-source) s, cosine taper = %g s\n",
-              direct_mute_intercept, direct_mute_slope, direct_mute_taper));
+        INFO(("direct mute enabled: boundary = %g %c %g*abs(receiver-source) s, cosine taper = %g s\n",
+              direct_mute_intercept, direct_mute_invert ? '-' : '+',
+              direct_mute_slope, direct_mute_taper));
     }
 
     stim = sep_open(stim_f, SEP_READ, 0);
@@ -837,7 +846,7 @@ int main(int argc, char *argv[])
                     apply_direct_wave_mute(
                         trace, nt, t0, dt, s, receiver_x,
                         direct_mute_slope, direct_mute_intercept,
-                        direct_mute_taper);
+                        direct_mute_taper, direct_mute_invert);
                 }
 
                 trace_ap_weight = 1.0f;

@@ -33,14 +33,16 @@ angle_taper_end=60
 angle_smooth_rect=2
 cig_x_index="${1:-384}"
 
-# Source-centred early-time mute, one value per recursive layer.  The mute is
-# t = intercept + slope*abs(receiver-source), followed by a cosine recovery.
-# Lateral coordinates are in km here, so slope is s/km. Decreasing slopes make
-# the mute boundary progressively flatter in deeper recursive layers.
+# Source-centred V mute, one value per recursive layer. The boundary is
+# t = intercept + slope*abs(receiver-source), and every sample with a smaller
+# time is removed before a cosine recovery. Lateral coordinates use km, so the
+# first-layer slope 50 s/km gives t=0.5 s at +/-0.01 km (+/-10 m).
+# Decreasing slopes make the boundary progressively flatter with depth.
 direct_mute_enable=(1 1 1 1 1)
-direct_mute_slope=(0.35 0.30 0.25 0.20 0.15)
+direct_mute_invert=(0 0 0 0 0)
+direct_mute_slope=(50.0 40.0 30.0 20.0 10.0)
 direct_mute_intercept=(0.00 0.00 0.00 0.00 0.00)
-direct_mute_taper=(0.08 0.08 0.08 0.08 0.08)
+direct_mute_taper=(0.05 0.06 0.07 0.08 0.10)
 
 output_dir="./result/salt"
 stack_output="${output_dir}/mig_salt_reckir_nlayer5_ADCIG_stack.rsf"
@@ -88,7 +90,7 @@ done
 [[ "${cig_x_index}" =~ ^[0-9]+$ ]] || fail "cig_x_index must be a nonnegative integer"
 (( cig_x_index < nx )) || fail "cig_x_index must be in [0,$((nx - 1))]"
 (( angle_n == (angle_max - angle_min) / angle_step + 1 )) || fail "Inconsistent angle axis"
-for values in direct_mute_enable direct_mute_slope direct_mute_intercept direct_mute_taper; do
+for values in direct_mute_enable direct_mute_invert direct_mute_slope direct_mute_intercept direct_mute_taper; do
     declare -n array_ref="${values}"
     (( ${#array_ref[@]} == nlayers )) || fail "${values} must contain ${nlayers} values"
 done
@@ -132,6 +134,7 @@ make_layer_adcig()
         angle_interp="${angle_interp}" \
         angle_taper_start="${angle_taper_start}" angle_taper_end="${angle_taper_end}" \
         direct_mute="${direct_mute_enable[index]}" \
+        direct_mute_invert="${direct_mute_invert[index]}" \
         direct_mute_slope="${direct_mute_slope[index]}" \
         direct_mute_intercept="${direct_mute_intercept[index]}" \
         direct_mute_taper="${direct_mute_taper[index]}" \
