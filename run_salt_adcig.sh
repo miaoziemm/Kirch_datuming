@@ -43,6 +43,8 @@ direct_mute_invert=(0 0 0 0 0)
 direct_mute_slope=(50.0 40.0 30.0 20.0 10.0)
 direct_mute_intercept=(0.00 0.00 0.00 0.00 0.00)
 direct_mute_taper=(0.05 0.06 0.07 0.08 0.10)
+# Zero-based shot written before and after mute for per-layer quality control.
+direct_mute_qc_shot=384
 
 output_dir="./result/salt"
 stack_output="${output_dir}/mig_salt_reckir_nlayer5_ADCIG_stack.rsf"
@@ -89,6 +91,8 @@ done
 
 [[ "${cig_x_index}" =~ ^[0-9]+$ ]] || fail "cig_x_index must be a nonnegative integer"
 (( cig_x_index < nx )) || fail "cig_x_index must be in [0,$((nx - 1))]"
+[[ "${direct_mute_qc_shot}" =~ ^[0-9]+$ ]] || fail "direct_mute_qc_shot must be a nonnegative integer"
+(( direct_mute_qc_shot < nx )) || fail "direct_mute_qc_shot must be in [0,$((nx - 1))]"
 (( angle_n == (angle_max - angle_min) / angle_step + 1 )) || fail "Inconsistent angle axis"
 for values in direct_mute_enable direct_mute_invert direct_mute_slope direct_mute_intercept direct_mute_taper; do
     declare -n array_ref="${values}"
@@ -138,6 +142,9 @@ make_layer_adcig()
         direct_mute_slope="${direct_mute_slope[index]}" \
         direct_mute_intercept="${direct_mute_intercept[index]}" \
         direct_mute_taper="${direct_mute_taper[index]}" \
+        direct_mute_qc_shot="${direct_mute_qc_shot}" \
+        direct_mute_qc_before="${output_dir}/mute_layer${layer}_shot${direct_mute_qc_shot}_before.rsf" \
+        direct_mute_qc_after="${output_dir}/mute_layer${layer}_shot${direct_mute_qc_shot}_after.rsf" \
         cmp="${cmp}" tau="${tau}" antialias="${antialias}" \
         aperture="${aperkir}" aperture_trace="${trace_aperture}"
 

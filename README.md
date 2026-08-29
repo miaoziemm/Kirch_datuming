@@ -9,6 +9,9 @@ direct_mute=1
 direct_mute_slope=0.0005
 direct_mute_intercept=0.02
 direct_mute_taper=0.05
+direct_mute_qc_shot=384
+direct_mute_qc_before=mute_before.rsf
+direct_mute_qc_after=mute_after.rsf
 ```
 
 默认切除边界为
@@ -39,6 +42,12 @@ direct_mute_taper=0.05
 五组数组 `direct_mute_enable/`
 `direct_mute_invert/direct_mute_slope/`
 `direct_mute_intercept/direct_mute_taper` 均可在脚本开头独立调整。运行方式：
+
+脚本还通过 `direct_mute_qc_shot=384` 为每一层输出同一炮切除前、后的二维炮集，
+文件名分别为 `result/salt/mute_layerN_shot384_before.rsf` 和
+`result/salt/mute_layerN_shot384_after.rsf`。该炮号使用从 0 开始的编号，可在
+脚本开头修改；QC 数据在 `doubint` 等 Kirchhoff 预处理之前写出，因此可以直接
+观察 mute 本身的效果。
 
 ```text
 bash run_salt_adcig.sh [横向采样序号]

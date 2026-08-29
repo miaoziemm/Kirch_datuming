@@ -378,13 +378,16 @@ int main(int argc, char *argv[])
     int aperture_trace_taper = 20;
     int direct_mute = 0;
     int direct_mute_invert = 0;
+    int direct_mute_qc_shot = -1;
     float direct_mute_slope = 0.0f;
     float direct_mute_intercept = 0.0f;
     float direct_mute_taper = 0.05f;
     sep_t *dat = NULL, *mig = NULL, *stim = NULL, *sder = NULL, *rtim = NULL, *rder = NULL;
+    sep_t *mute_before = NULL, *mute_after = NULL;
     sep_t *sgradx_fp = NULL, *sgradz_fp = NULL, *rgradx_fp = NULL, *rgradz_fp = NULL;
     char *dat_f = NULL, *mig_f = NULL, *stim_f = NULL, *sder_f = NULL, *rtim_f = NULL, *rder_f = NULL;
     char *sgradx_f = NULL, *sgradz_f = NULL, *rgradx_f = NULL, *rgradz_f = NULL;
+    char *mute_before_f = NULL, *mute_after_f = NULL;
 
     int aperture_trace = -1; /* limit the number of traces used for imaging; -1 means no limit */
 
@@ -549,6 +552,8 @@ int main(int argc, char *argv[])
         direct_mute_intercept = se_get_par_float("direct_mute_intercept");
     if (se_have_par("direct_mute_taper"))
         direct_mute_taper = se_get_par_float("direct_mute_taper");
+    if (se_have_par("direct_mute_qc_shot"))
+        direct_mute_qc_shot = se_get_par_int("direct_mute_qc_shot");
 
     if (direct_mute) {
         if (!adj)
@@ -561,6 +566,35 @@ int main(int argc, char *argv[])
             ERROR(("direct_mute_taper must be finite and positive to avoid a hard cutoff."));
         if (direct_mute_invert != 0 && direct_mute_invert != 1)
             ERROR(("direct_mute_invert must be 0 or 1."));
+        if (direct_mute_qc_shot < -1)
+            ERROR(("direct_mute_qc_shot must be -1 (disabled) or a zero-based shot index."));
+        if (direct_mute_qc_shot >= ns)
+            ERROR(("direct_mute_qc_shot=%d is outside the input shot range [0,%d].",
+                   direct_mute_qc_shot, ns - 1));
+        if (direct_mute_qc_shot >= 0) {
+            if (!se_have_par("direct_mute_qc_before") ||
+                !se_have_par("direct_mute_qc_after"))
+                ERROR(("direct_mute_qc_shot requires direct_mute_qc_before= and direct_mute_qc_after=."));
+            mute_before_f = se_get_par_str("direct_mute_qc_before");
+            mute_after_f = se_get_par_str("direct_mute_qc_after");
+            mute_before = sep_open(mute_before_f, SEP_WRITE, 0);
+            mute_after = sep_open(mute_after_f, SEP_WRITE, 0);
+            sep_t *qc_files[2] = {mute_before, mute_after};
+            for (int iqc = 0; iqc < 2; iqc++) {
+                qc_files[iqc]->headers->ndim = 2;
+                qc_files[iqc]->headers->n[0] = nt;
+                qc_files[iqc]->headers->n[1] = nh;
+                qc_files[iqc]->headers->o[0] = t0;
+                qc_files[iqc]->headers->d[0] = dt;
+                qc_files[iqc]->headers->o[1] = h0;
+                qc_files[iqc]->headers->d[1] = dh;
+                sep_set_header(qc_files[iqc], "label1", "Time");
+                sep_set_header(qc_files[iqc], "unit1", "s");
+                sep_set_header(qc_files[iqc], "label2", cmp ? "Offset" : "Receiver");
+            }
+            INFO(("direct mute QC: write zero-based shot %d before/after mute to %s and %s\n",
+                  direct_mute_qc_shot, mute_before_f, mute_after_f));
+        }
 
         INFO(("direct mute enabled: boundary = %g %c %g*abs(receiver-source) s, cosine taper = %g s\n",
               direct_mute_intercept, direct_mute_invert ? '-' : '+',
@@ -841,6 +875,9 @@ int main(int argc, char *argv[])
                 /* read trace first to keep the input I/O position correct */
                 se_fsio_read_float(dat->data->io, trace, nt);
 
+                if (is == direct_mute_qc_shot)
+                    se_fsio_write_float(mute_before->data->io, trace, nt);
+
                 if (direct_mute) {
                     const float receiver_x = cmp ? (s + h) : h;
                     apply_direct_wave_mute(
@@ -848,6 +885,9 @@ int main(int argc, char *argv[])
                         direct_mute_slope, direct_mute_intercept,
                         direct_mute_taper, direct_mute_invert);
                 }
+
+                if (is == direct_mute_qc_shot)
+                    se_fsio_write_float(mute_after->data->io, trace, nt);
 
                 trace_ap_weight = 1.0f;
                 if (aperture_trace != -1) {
@@ -1136,6 +1176,8 @@ int main(int argc, char *argv[])
     if (sgradz_fp) sep_close(sgradz_fp);
     if (rgradx_fp) sep_close(rgradx_fp);
     if (rgradz_fp) sep_close(rgradz_fp);
+    if (mute_before) sep_close(mute_before);
+    if (mute_after) sep_close(mute_after);
 
     if (traces) free2float(traces);
     if (out) free2float(out);
