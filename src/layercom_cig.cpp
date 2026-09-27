@@ -525,9 +525,13 @@ int main(int argc, char** argv) {
                             const int k = g1 - start;
                             if (k < keep_upper || blend_count == 0) continue;
                             const int bi = k - keep_upper;
-                            const float w = (blend_count > 1)
-                                ? static_cast<float>(bi) / static_cast<float>(blend_count - 1)
-                                : 1.0f;
+                            // Complementary cosine weights preserve constant amplitudes
+                            // and have zero endpoint slope, reducing stitching kinks.
+                            const double u = (blend_count > 1)
+                                ? static_cast<double>(bi) / static_cast<double>(blend_count - 1)
+                                : 1.0;
+                            const float w = static_cast<float>(
+                                0.5 * (1.0 - std::cos(3.14159265358979323846 * u)));
                             output[oi] = output[oi] * (1.0f - w) + v * w;
                         } else {
                             output[oi] = v;

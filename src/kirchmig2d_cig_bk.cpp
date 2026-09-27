@@ -1,19 +1,24 @@
 #include <SEBASIC/include/se_basic.h>
 #include <SEFILESYSTEM/include/se_fs.h>
 #include <SERECKIRCH/include/se_reckirch.h>
+
 #include <chrono>
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
 #ifdef SE_USE_OMP
 #include <omp.h>
 #endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 static int str_ieq(const char *a, const char *b)
 {
     if (a == NULL || b == NULL) return 0;
@@ -24,14 +29,17 @@ static int str_ieq(const char *a, const char *b)
     }
     return (*a == '\0' && *b == '\0');
 }
+
 static inline int idx2d(int iz, int ix, int nz)
 {
     return ix * nz + iz;
 }
+
 static inline float clampf_local(float v, float lo, float hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
 static int value_to_nearest_bin(float value, float g0, float dg, int ng)
 {
     if (ng <= 0 || dg <= 0.0f || !isfinite(value)) return -1;
@@ -39,6 +47,7 @@ static int value_to_nearest_bin(float value, float g0, float dg, int ng)
     if (ig < 0 || ig >= ng) return -1;
     return ig;
 }
+
 /*
  * Distribute one continuous angle value to the two neighboring angle bins.
  *
@@ -55,8 +64,10 @@ static int value_to_linear_bins(float value, float g0, float dg, int ng,
                                 int *ig0, int *ig1, float *w0, float *w1)
 {
     if (ng <= 0 || dg <= 0.0f || !isfinite(value)) return 0;
+
     const float u = (value - g0) / dg;
     if (u < -1.0e-5f || u > (float)(ng - 1) + 1.0e-5f) return 0;
+
     if (u <= 0.0f) {
         *ig0 = 0;
         *ig1 = 0;
@@ -64,6 +75,7 @@ static int value_to_linear_bins(float value, float g0, float dg, int ng,
         *w1 = 0.0f;
         return 1;
     }
+
     if (u >= (float)(ng - 1)) {
         *ig0 = ng - 1;
         *ig1 = ng - 1;
@@ -71,12 +83,14 @@ static int value_to_linear_bins(float value, float g0, float dg, int ng,
         *w1 = 0.0f;
         return 1;
     }
+
     *ig0 = (int)floorf(u);
     *ig1 = *ig0 + 1;
     *w1 = u - (float)(*ig0);
     *w0 = 1.0f - *w1;
     return 1;
 }
+
 /*
  * Optional cosine taper for large reflection angles.
  *
@@ -91,9 +105,11 @@ static float angle_taper_weight(float angle, float start, float end)
     if (start < 0.0f || end <= start) return 1.0f;
     if (angle <= start) return 1.0f;
     if (angle >= end) return 0.0f;
+
     const float x = (angle - start) / (end - start);
     return 0.5f * (1.0f + cosf((float)M_PI * x));
 }
+
 /*
  * Mute the early-time fan that opens to both sides of a shot.
  *
@@ -115,104 +131,101 @@ static void apply_direct_wave_mute(float *trace, int nt, float t0, float dt,
     const float offset_time = slope * fabsf(receiver_x - source_x);
     const float boundary = inverted ? intercept - offset_time
                                     : intercept + offset_time;
+
     for (int it = 0; it < nt; it++) {
         const float time = t0 + (float)it * dt;
         float weight = 0.0f;
+
         if (time >= boundary + taper_length) {
             weight = 1.0f;
         } else if (time > boundary) {
             const float u = (time - boundary) / taper_length;
             weight = 0.5f * (1.0f - cosf((float)M_PI * u));
         }
+
         trace[it] *= weight;
     }
 }
+
 static float finite_diff_x_radius(const float *tab, int nz, int nx,
                                   int iz, int ix, float dx, int radius)
 {
     if (nx <= 1 || dx == 0.0f) return 0.0f;
     if (radius < 1) radius = 1;
+
     const int il = MAX(0, ix - radius);
     const int ir = MIN(nx - 1, ix + radius);
+
     if (ir == il) return 0.0f;
+
     return (tab[idx2d(iz, ir, nz)] - tab[idx2d(iz, il, nz)]) /
            ((float)(ir - il) * dx);
 }
+
 static float finite_diff_z_radius(const float *tab, int nz, int nx,
                                   int iz, int ix, float dz, int radius)
 {
     (void)nx;
     if (nz <= 1 || dz == 0.0f) return 0.0f;
     if (radius < 1) radius = 1;
+
     const int it = MAX(0, iz - radius);
     const int ib = MIN(nz - 1, iz + radius);
+
     if (ib == it) return 0.0f;
+
     return (tab[idx2d(ib, ix, nz)] - tab[idx2d(it, ix, nz)]) /
            ((float)(ib - it) * dz);
 }
+
 /*
  * A radius larger than one suppresses grid-scale fluctuations in the
  * traveltime gradient.  This is especially useful for Marmousi, where
  * first-arrival traveltime tables can contain locally rapid changes in
  * gradient direction.  The traveltime itself is not smoothed; only the
  * gradient used for angle classification is stabilized.
- *
- * Angle convention (matches Madagascar cram2):
- *   The output "scattering angle" is the FULL opening angle, i.e. the angle
- *   subtended at the image point by the source and receiver ray legs:
- *
- *       angle = angle(grad(Ts), grad(Tr))          in [0,180] deg.
- *
- *   cram2 writes this quantity directly (see cram_point3: acos(dot), and the
- *   "Limit scattering angle to 180" comment in cram_point2).  Set half_angle=1
- *   to instead output the half-opening (one-half of the opening, [0,90] deg),
- *   which is the older convention of this program.
  */
-static float scattering_angle_deg_from_grad(float sx, float sz, float rx, float rz,
-                                            int half_angle)
+static float half_opening_angle_deg_from_grad(float sx, float sz, float rx, float rz)
 {
     float ns = sqrtf(sx * sx + sz * sz);
     float nr = sqrtf(rx * rx + rz * rz);
     if (ns <= 1.0e-12f || nr <= 1.0e-12f) return NAN;
+
     /*
-       sx,sz and rx,rz are the source- and receiver-traveltime gradients at
-       the image point. atan2(|cross|, dot) equals acos(dot/(|a||b|)) but is
-       numerically better behaved when the opening angle is small.
+       Here sx,sz and rx,rz are the source- and receiver-traveltime
+       gradients at the image point. The half-opening angle is
+
+           alpha = 0.5 * angle(grad(Ts), grad(Tr)).
+
+       atan2(|cross|, dot) is mathematically equivalent to acos(dot/(|a||b|))
+       but is numerically better behaved when the opening angle is small.
     */
     const float dot = sx * rx + sz * rz;
     const float cross = sx * rz - sz * rx;
     const float opening = atan2f(fabsf(cross), dot);
-    float deg = opening * 180.0f / (float)M_PI; /* full opening, 0..180 */
-    return half_angle ? 0.5f * deg : deg;
+
+    return 0.5f * opening * 180.0f / (float)M_PI;
 }
-/*
- * cram2-style scattering-angle mute that varies with depth, followed by a
- * raised-cosine ramp (a hard cut would ring).
- *
- *   zf in [0,1] (relative depth), cutoff = amin + zf*(amax-amin)
- *   angle <= cutoff          : weight = 1
- *   cutoff < angle < cutoff+band : cosine ramp
- *   angle >= cutoff+band     : weight = 0
- *
- * All angles are in the OUTPUT angle convention (full opening by default).
- * Set amin=amax=180 (full) or 90 (half) to disable.
- */
-static float angle_depth_mute_weight(float angle, int iz, int nz,
-                                     float amin, float amax, float band)
+
+static float half_opening_angle_deg_from_tables(const float *stable,
+                                                const float *rtable,
+                                                int nz, int nx,
+                                                int iz, int ix,
+                                                float dx, float dz,
+                                                int radius)
 {
-    if (!isfinite(angle)) return 0.0f;
-    const float zf = (nz > 1) ? (float)iz / (float)(nz - 1) : 0.0f;
-    const float cutoff = amin + zf * (amax - amin);
-    if (band <= 0.0f) return (angle <= cutoff) ? 1.0f : 0.0f;
-    if (angle <= cutoff) return 1.0f;
-    if (angle >= cutoff + band) return 0.0f;
-    const float u = (angle - cutoff) / band;
-    return 0.5f * (1.0f + cosf((float)M_PI * u));
+    float sx = finite_diff_x_radius(stable, nz, nx, iz, ix, dx, radius);
+    float sz = finite_diff_z_radius(stable, nz, nx, iz, ix, dz, radius);
+    float rx = finite_diff_x_radius(rtable, nz, nx, iz, ix, dx, radius);
+    float rz = finite_diff_z_radius(rtable, nz, nx, iz, ix, dz, radius);
+    return half_opening_angle_deg_from_grad(sx, sz, rx, rz);
 }
+
 static void copy_n(float *dst, const float *src, off_t n)
 {
     for (off_t i = 0; i < n; i++) dst[i] = src[i];
 }
+
 static void load_table_slice(sep_t *fp, int index, float *buf, off_t nxy,
                              int *cached_index, const char *name)
 {
@@ -224,56 +237,45 @@ static void load_table_slice(sep_t *fp, int index, float *buf, off_t nxy,
         ERROR(("Failed to read %s slice %d", name, index));
     if (cached_index != NULL) *cached_index = index;
 }
-/*
- * Linearly interpolate a streamed 3-D volume along its third axis.
- *
- * The original implementation skipped the first interval (indices 0--1)
- * because interpolation was only allowed for i0 > 0.  That produced a
- * discontinuity whenever 0 < (coord-o)/d < 1.  Here every interior interval,
- * including 0--1, is interpolated; coordinates outside the table range are
- * clamped to the nearest boundary slice.
- */
+
+/* Preserve the original volume interpolation exactly while streaming slices. */
 static void interp_volume_linear_stream(float *out, sep_t *fp, int npos,
                                         off_t nxy, float coord, float o,
                                         float d, float *slice0, float *slice1,
                                         const char *name)
 {
-    if (npos <= 1 || d == 0.0f) {
-        load_table_slice(fp, 0, slice0, nxy, NULL, name);
-        copy_n(out, slice0, nxy);
-        return;
+    int i0 = 0;
+
+    if (npos > 1 && d != 0.0f) {
+        const float f = (coord - o) / d;
+        i0 = (int)floorf(f);
+
+        if (i0 > 0 && i0 < npos - 1) {
+            const float w = f - (float)i0;
+            load_table_slice(fp, i0, slice0, nxy, NULL, name);
+            load_table_slice(fp, i0 + 1, slice1, nxy, NULL, name);
+            for (off_t i = 0; i < nxy; i++)
+                out[i] = (1.0f - w) * slice0[i] + w * slice1[i];
+            return;
+        }
     }
-    const float f = (coord - o) / d;
-    if (f <= 0.0f) {
-        load_table_slice(fp, 0, slice0, nxy, NULL, name);
-        copy_n(out, slice0, nxy);
-        return;
-    }
-    if (f >= (float)(npos - 1)) {
-        load_table_slice(fp, npos - 1, slice0, nxy, NULL, name);
-        copy_n(out, slice0, nxy);
-        return;
-    }
-    const int i0 = (int)floorf(f);
-    const int i1 = i0 + 1;
-    const float w = f - (float)i0;
-    load_table_slice(fp, i0, slice0, nxy, NULL, name);
-    load_table_slice(fp, i1, slice1, nxy, NULL, name);
-    for (off_t i = 0; i < nxy; i++)
-        out[i] = (1.0f - w) * slice0[i] + w * slice1[i];
+
+    const int index = i0 >= npos - 1 ? npos - 1 : 0;
+    load_table_slice(fp, index, slice0, nxy, NULL, name);
+    copy_n(out, slice0, nxy);
 }
+
 static int parse_output_axis(int is_angle, int nh,
                              float h0, float dh,
-                             float *g0, float *dg, int *ng,
-                             int half_angle)
+                             float *g0, float *dg, int *ng)
 {
     float hend = h0 + (float)(nh - 1) * dh;
-    /* Full opening spans 0..180 (cram2); half opening spans 0..90. */
     float vmin = is_angle ? 0.0f : MIN(h0, hend);
-    float vmax = is_angle ? (half_angle ? 90.0f : 180.0f) : MAX(h0, hend);
+    float vmax = is_angle ? 90.0f : MAX(h0, hend);
     float vstep = is_angle ? 1.0f : (dh != 0.0f ? fabsf(dh) : 1.0f);
     int n_given = 0;
-    int nval = is_angle ? (half_angle ? 91 : 181) : nh;
+    int nval = is_angle ? 91 : nh;
+
     if (se_have_par("cig_min")) vmin = se_get_par_float("cig_min");
     if (se_have_par("cig_max")) vmax = se_get_par_float("cig_max");
     if (se_have_par("cig_step")) vstep = se_get_par_float("cig_step");
@@ -281,6 +283,7 @@ static int parse_output_axis(int is_angle, int nh,
         nval = se_get_par_int("cig_n");
         n_given = 1;
     }
+
     if (is_angle) {
         if (se_have_par("angle_min")) vmin = se_get_par_float("angle_min");
         if (se_have_par("angle_max")) vmax = se_get_par_float("angle_max");
@@ -298,16 +301,20 @@ static int parse_output_axis(int is_angle, int nh,
             n_given = 1;
         }
     }
+
     if (vstep <= 0.0f) ERROR(("CIG axis step must be positive."));
+
     if (!n_given) {
         nval = (int)floorf((vmax - vmin) / vstep + 0.5f) + 1;
     }
     if (nval <= 0) ERROR(("CIG axis sample number must be positive."));
+
     *g0 = vmin;
     *dg = vstep;
     *ng = nval;
     return 0;
 }
+
 static sep_t *open_grad_volume(const char *name, char *file,
                                int nz, int nx, int n3)
 {
@@ -320,6 +327,7 @@ static sep_t *open_grad_volume(const char *name, char *file,
     }
     return fp;
 }
+
 void diff2(float *trace, int n, float d)
 {
     int i;
@@ -335,107 +343,10 @@ void diff2(float *trace, int n, float d)
     free1float(tmp);
 }
 
-/*
- * =====================================================================
- * Stable angle gradients
- *
- * First-arrival traveltime tables contain "creases" (ray-family boundaries):
- * the traveltime stays continuous but its gradient jumps from one ray
- * direction to another.  A centered finite difference that straddles a crease
- * returns a spurious intermediate gradient, so the computed angle jumps from
- * sample to sample.  Enlarging the difference radius only widens the bad
- * band.
- *
- * The fix used here:
- *   1. build the source and receiver gradient VECTORS once (finite difference
- *      of the tables, or the supplied gradient files);
- *   2. smooth each vector component in (z,x) with a triangular kernel (two
- *      box averages).  Smoothing the vector, rather than the angle, avoids the
- *      angle wrap-around problem and turns crease jumps into continuous
- *      transitions.
- * The angle is then read from these stabilized vector fields.
- *
- * The kernel is the triangular (Bartlett) window, which is what two repeated
- * box averages produce.  Edges use the available samples (no zero padding),
- * so the image borders are not dimmed.
- * =====================================================================
- */
-
-/* Build the in-plane gradient (gx,gz) of a traveltime table over the whole
-   grid, using the widened finite-difference template. */
-static void compute_grad_plane(const float *tab, int nz, int nx,
-                               float dz, float dx, int diff_radius,
-                               float *gx, float *gz)
-{
-    for (int ix = 0; ix < nx; ix++) {
-        for (int iz = 0; iz < nz; iz++) {
-            const int i = idx2d(iz, ix, nz);
-            gx[i] = finite_diff_x_radius(tab, nz, nx, iz, ix, dx, diff_radius);
-            gz[i] = finite_diff_z_radius(tab, nz, nx, iz, ix, dz, diff_radius);
-        }
-    }
-}
-
-/* One box average along the z axis (stride 1), per x column. */
-static void boxsmooth_axis_z(const float *in, float *out, int nz, int nx, int r)
-{
-    for (int ix = 0; ix < nx; ix++) {
-        const float *c = in + (size_t)ix * nz;
-        float *o = out + (size_t)ix * nz;
-        for (int iz = 0; iz < nz; iz++) {
-            const int a = (iz - r < 0) ? 0 : iz - r;
-            const int b = (iz + r > nz - 1) ? nz - 1 : iz + r;
-            float s = 0.0f;
-            for (int k = a; k <= b; k++) s += c[k];
-            o[iz] = s / (float)(b - a + 1);
-        }
-    }
-}
-
-/* One box average along the x axis (stride nz), per z row. */
-static void boxsmooth_axis_x(const float *in, float *out, int nz, int nx, int r)
-{
-    for (int iz = 0; iz < nz; iz++) {
-        for (int ix = 0; ix < nx; ix++) {
-            const int a = (ix - r < 0) ? 0 : ix - r;
-            const int b = (ix + r > nx - 1) ? nx - 1 : ix + r;
-            float s = 0.0f;
-            for (int k = a; k <= b; k++) s += in[(size_t)k * nz + iz];
-            out[(size_t)ix * nz + iz] = s / (float)(b - a + 1);
-        }
-    }
-}
-
-/* One separable pass: box average along z (if rz>0) then x (if rx>0). */
-static void smooth_one_pass(const float *src, float *dst, float *work,
-                            int nz, int nx, int rz, int rx)
-{
-    const off_t n = (off_t)nz * (off_t)nx;
-    if (rz > 0) {
-        boxsmooth_axis_z(src, work, nz, nx, rz);
-    } else {
-        copy_n(work, src, n);
-    }
-    if (rx > 0) {
-        boxsmooth_axis_x(work, dst, nz, nx, rx);
-    } else {
-        copy_n(dst, work, n);
-    }
-}
-
-/* Triangular smoothing (two box averages) of one gradient component, in
-   place.  rz/rx are the box radii; 0 disables smoothing on that axis. */
-static void smooth_grad_component(float *f, int nz, int nx, int rz, int rx,
-                                  float *tmp1, float *tmp2)
-{
-    if (rz <= 0 && rx <= 0) return;
-    smooth_one_pass(f, tmp1, tmp2, nz, nx, rz, rx);   /* first box  */
-    smooth_one_pass(tmp1, f, tmp2, nz, nx, rz, rx);   /* second box */
-}
-
 int main(int argc, char *argv[])
 {
     se_par_init(argc, argv);
+
     char *unit;
     const char *type = NULL;
     const char *mode = NULL;
@@ -446,7 +357,7 @@ int main(int argc, char *argv[])
     int use_input_angle_grad = 0;
     off_t nzx = 0;
     int nt = 0, nx = 0, sny = 0, rny = 0, ns = 0, nh = 0, nz = 0;
-    int i = 0, ix = 0, iz = 0, ih = 0, is = 0, ist = 0, iht = 0, ng = 0, nthr = 0, ithr = 0;
+    int i = 0, ix = 0, iz = 0, ih = 0, is = 0, ist = 0, iht = 0, ng = 0, ithr = 0, nthr = 0;
     int ig = 0, ig_offset = 0;
     float *trace = NULL, **traces = NULL, **out = NULL;
     float *stable = NULL, *rtable = NULL, *stablex = NULL, *rtablex = NULL;
@@ -456,9 +367,6 @@ int main(int argc, char *argv[])
     int stbl0_idx = -1, stbl1_idx = -1, stblx0_idx = -1, stblx1_idx = -1;
     int rtbl0_idx = -1, rtbl1_idx = -1, rtblx0_idx = -1, rtblx1_idx = -1;
     float *sgradx = NULL, *sgradz = NULL, *rgradx = NULL, *rgradz = NULL;
-    /* stabilized gradient fields used for angle classification */
-    float *gsx = NULL, *gsz = NULL, *grx = NULL, *grz = NULL;
-    float *gsmtmp1 = NULL, *gsmtmp2 = NULL;
     float ds = 0.0f, s0 = 0.0f, x0 = 0.0f, sy0 = 0.0f, sdy = 0.0f, ry0 = 0.0f, rdy = 0.0f;
     float s = 0.0f, h = 0.0f, h0 = 0.0f, dh = 0.0f, dx = 0.0f;
     float ti = 0.0f, t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, dt = 0.0f, z0 = 0.0f, dz = 0.0f, tau = 0.0f;
@@ -467,10 +375,6 @@ int main(int argc, char *argv[])
     float angle_taper_start = -1.0f, angle_taper_end = -1.0f;
     int angle_interp = 1;
     int angle_grad_radius = 2;
-    int angle_smooth = 2;   /* triangular vector-smoothing radius for angle gradients; 0 = off */
-    int half_angle = 0;                       /* 0: full opening (cram2), 1: half opening */
-    float oazmin = 80.0f, oazmax = 50.0f;     /* depth-varying angle mute, output-angle degrees */
-    float oaztaper = 10.0f;                   /* cosine ramp width, degrees */
     int aperture_trace_taper = 20;
     int direct_mute = 0;
     int direct_mute_invert = 0;
@@ -484,12 +388,16 @@ int main(int argc, char *argv[])
     char *dat_f = NULL, *mig_f = NULL, *stim_f = NULL, *sder_f = NULL, *rtim_f = NULL, *rder_f = NULL;
     char *sgradx_f = NULL, *sgradz_f = NULL, *rgradx_f = NULL, *rgradz_f = NULL;
     char *mute_before_f = NULL, *mute_after_f = NULL;
+
     int aperture_trace = -1; /* limit the number of traces used for imaging; -1 means no limit */
+
     if (!se_have_par("aperture_trace"))
         aperture_trace = -1;
     else
         aperture_trace = se_get_par_int("aperture_trace");
+
     INFO(("aperture_trace = %d\n", aperture_trace));
+
     mode_given = se_have_par("mode") || se_have_par("cig_mode");
     if (se_have_par("mode"))
         mode = se_get_par_str("mode");
@@ -497,6 +405,7 @@ int main(int argc, char *argv[])
         mode = se_get_par_str("cig_mode");
     else
         mode = "offset";
+
     if (str_ieq(mode, "offset")) {
         cig_is_angle = 0;
     } else if (str_ieq(mode, "angle")) {
@@ -504,6 +413,7 @@ int main(int argc, char *argv[])
     } else {
         ERROR(("Unknown CIG mode: %s. Supported modes are offset and angle.", mode));
     }
+
     if (!se_have_par("adj"))
         adj = 1;
     else
@@ -516,29 +426,12 @@ int main(int argc, char *argv[])
         cmp = 1;
     else
         cmp = se_get_par_int("cmp");
-    /*
-     * Angle convention: half_angle=0 outputs the full opening angle (0..180,
-     * matching Madagascar cram2); half_angle=1 outputs the half-opening angle
-     * (0..90, the older convention of this program).
-     */
-    if (se_have_par("half_angle"))
-        half_angle = se_get_par_int("half_angle");
-    /* Depth-varying scattering-angle mute; cram2 defaults are 80 shallow and
-       50 deep in full-opening degrees (40/25 in half-opening degrees). */
-    if (half_angle) {
-        oazmin = 40.0f;
-        oazmax = 25.0f;
-    }
-    if (se_have_par("oazmin"))
-        oazmin = se_get_par_float("oazmin");
-    if (se_have_par("oazmax"))
-        oazmax = se_get_par_float("oazmax");
-    if (se_have_par("oaztaper"))
-        oaztaper = se_get_par_float("oaztaper");
+
     if (!se_have_par("diff"))
         isdiff = 0;
     else
         isdiff = se_get_par_int("diff");
+
     if (!se_have_par("seismic_data"))
         ERROR(("Need seismic_data="));
     else
@@ -563,6 +456,7 @@ int main(int argc, char *argv[])
         ERROR(("Need rderiv="));
     else
         rder_f = se_get_par_str("rderiv");
+
     if (cig && cig_is_angle) {
         int has_sgx = se_have_par("sgradx");
         int has_sgz = se_have_par("sgradz");
@@ -579,6 +473,7 @@ int main(int argc, char *argv[])
             rgradz_f = se_get_par_str("rgradz");
         }
     }
+
     if (adj) {
         dat = sep_open(dat_f, SEP_READ, 0);
         mig = sep_open(mig_f, SEP_WRITE, 0);
@@ -586,12 +481,14 @@ int main(int argc, char *argv[])
         mig = sep_open(mig_f, SEP_READ, 0);
         dat = sep_open(dat_f, SEP_WRITE, 0);
     }
+
     if (adj) {
         if (dat->headers->ndim < 3)
             ERROR(("Need 3D data volume for seismic_data= (t,h/r,s)"));
         nt = dat->headers->n[0]; /* time samples */
         nh = dat->headers->n[1]; /* offset samples */
         ns = dat->headers->n[2]; /* shot samples */
+
         t0 = (float)dat->headers->o[0]; /* time origin */
         dt = (float)dat->headers->d[0]; /* time sampling */
         h0 = (float)dat->headers->o[1]; /* offset origin */
@@ -636,8 +533,10 @@ int main(int argc, char *argv[])
         else
             ds = se_get_par_float("ds");
     }
+
     if (1 == nh) dh = 0.0f;
     if (1 == ns) ds = 0.0f;
+
     /*
      * Optional smooth direct-wave/side-noise mute for input shot gathers.
      * Receiver position is s+h for CMP/offset input and h for receiver input.
@@ -655,6 +554,7 @@ int main(int argc, char *argv[])
         direct_mute_taper = se_get_par_float("direct_mute_taper");
     if (se_have_par("direct_mute_qc_shot"))
         direct_mute_qc_shot = se_get_par_int("direct_mute_qc_shot");
+
     if (direct_mute) {
         if (!adj)
             ERROR(("direct_mute=1 is an input-data preprocessing option and requires adj=1."));
@@ -695,50 +595,45 @@ int main(int argc, char *argv[])
             INFO(("direct mute QC: write zero-based shot %d before/after mute to %s and %s\n",
                   direct_mute_qc_shot, mute_before_f, mute_after_f));
         }
+
         INFO(("direct mute enabled: boundary = %g %c %g*abs(receiver-source) s, cosine taper = %g s\n",
               direct_mute_intercept, direct_mute_invert ? '-' : '+',
               direct_mute_slope, direct_mute_taper));
     }
+
     stim = sep_open(stim_f, SEP_READ, 0);
     sder = sep_open(sder_f, SEP_READ, 0);
+
     if (stim->headers->ndim < 3)
         ERROR(("Need 3D data volume for stable= (z,x,s)"));
     if (sder->headers->ndim < 3)
         ERROR(("Need 3D data volume for sderiv= (z,x,s)"));
+
     nz = stim->headers->n[0];
     nx = stim->headers->n[1];
     sny = stim->headers->n[2];
-    if (sder->headers->n[0] != nz ||
-        sder->headers->n[1] != nx ||
-        sder->headers->n[2] != sny) {
-        ERROR(("Dimension mismatch between stable= and sderiv=. "
-               "Expected sderiv n1=%d n2=%d n3=%d", nz, nx, sny));
-    }
+
     z0 = (float)stim->headers->o[0];
     dz = (float)stim->headers->d[0];
     x0 = (float)stim->headers->o[1];
     dx = (float)stim->headers->d[1];
     sy0 = (float)stim->headers->o[2];
     sdy = (float)stim->headers->d[2];
+
     nzx = (off_t)nz * (off_t)nx;
+
     rtim = sep_open(rtim_f, SEP_READ, 0);
     rder = sep_open(rder_f, SEP_READ, 0);
+
     if (rtim->headers->ndim < 3)
         ERROR(("Need 3D data volume for rtable= (z,x,r)"));
     if (rder->headers->ndim < 3)
         ERROR(("Need 3D data volume for rderiv= (z,x,r)"));
-    if (rtim->headers->n[0] != nz || rtim->headers->n[1] != nx) {
-        ERROR(("Dimension mismatch in rtable=. Expected n1=%d n2=%d", nz, nx));
-    }
+
     rny = rtim->headers->n[2];
-    if (rder->headers->n[0] != nz ||
-        rder->headers->n[1] != nx ||
-        rder->headers->n[2] != rny) {
-        ERROR(("Dimension mismatch between rtable= and rderiv=. "
-               "Expected rderiv n1=%d n2=%d n3=%d", nz, nx, rny));
-    }
     ry0 = (float)rtim->headers->o[2];
     rdy = (float)rtim->headers->d[2];
+
     if (use_input_angle_grad) {
         sgradx_fp = open_grad_volume("sgradx", sgradx_f, nz, nx, sny);
         sgradz_fp = open_grad_volume("sgradz", sgradz_f, nz, nx, sny);
@@ -752,11 +647,13 @@ int main(int argc, char *argv[])
     } else if (cig && cig_is_angle) {
         INFO(("mode=angle: no spatial gradient files are provided; compute dT/dx and dT/dz by finite differences of traveltime tables.\n"));
     }
+
     if (!se_have_par("tau"))
         tau = 0.0f;
     else
         tau = se_get_par_float("tau"); /* static time-shift, in second */
     INFO(("tau = %f\n", tau));
+
     if (!se_have_par("aperture"))
         aper = 90.0f;
     else
@@ -765,6 +662,7 @@ int main(int argc, char *argv[])
         aal = 1.0f;
     else
         aal = se_get_par_float("antialias"); /* antialiasing */
+
     /*
      * Angle-domain cleanup controls.
      *
@@ -785,28 +683,30 @@ int main(int argc, char *argv[])
         angle_grad_radius = se_get_par_int("angle_grad_radius");
     if (angle_grad_radius < 1)
         angle_grad_radius = 1;
-    if (se_have_par("angle_smooth"))
-        angle_smooth = se_get_par_int("angle_smooth");
-    if (angle_smooth < 0)
-        angle_smooth = 0;
+
     if (se_have_par("aperture_trace_taper"))
         aperture_trace_taper = se_get_par_int("aperture_trace_taper");
     if (aperture_trace_taper < 0)
         aperture_trace_taper = 0;
+
     if (cig && cig_is_angle) {
-        INFO(("angle_interp = %d, angle_grad_radius = %d, angle_smooth = %d, angle_taper_start = %g, angle_taper_end = %g, aperture_trace_taper = %d\n",
-              angle_interp, angle_grad_radius, angle_smooth,
-              angle_taper_start, angle_taper_end, aperture_trace_taper));
+        INFO(("angle_interp = %d, angle_taper_start = %g, angle_taper_end = %g, angle_grad_radius = %d, aperture_trace_taper = %d\n",
+              angle_interp, angle_taper_start, angle_taper_end,
+              angle_grad_radius, aperture_trace_taper));
     }
+
     if (cig) {
-        parse_output_axis(cig_is_angle, nh, h0, dh, &cig0, &dcig, &ng, half_angle);
+        parse_output_axis(cig_is_angle, nh, h0, dh, &cig0, &dcig, &ng);
     } else {
         ng = 1;
         cig0 = 0.0f;
         dcig = 1.0f;
     }
+
     INFO(("cig = %d, mode = %s, n3 = %d, o3 = %g, d3 = %g\n", cig, cig_is_angle ? "angle" : "offset", ng, cig0, dcig));
+
     mig->headers->ndim = 3;
+
     if (adj) {
         mig->headers->n[0] = nz;
         mig->headers->n[1] = nx;
@@ -817,6 +717,7 @@ int main(int argc, char *argv[])
         sep_set_header(mig, "label1", "Depth");
         sep_set_header(mig, "label2", "Lateral");
         unit = sep_get_hdr(dat, "unit1", NULL);
+
         if (NULL != unit)
             sep_set_header(mig, "unit1", unit);
         if (cig) {
@@ -824,7 +725,7 @@ int main(int argc, char *argv[])
             mig->headers->o[2] = cig0;
             mig->headers->d[2] = dcig;
             if (cig_is_angle) {
-                sep_set_header(mig, "label3", half_angle ? "Half-opening angle" : "Scattering angle");
+                sep_set_header(mig, "label3", "Half-opening angle");
                 sep_set_header(mig, "unit3", "degree");
             } else {
                 sep_set_header(mig, "label3", cmp ? "Offset" : "Receiver");
@@ -840,23 +741,28 @@ int main(int argc, char *argv[])
         dat->headers->n[0] = nt;
         dat->headers->n[1] = nh;
         dat->headers->n[2] = ns;
+
         dat->headers->o[0] = t0;
         dat->headers->d[0] = dt;
         dat->headers->o[1] = h0;
         dat->headers->d[1] = dh;
         dat->headers->o[2] = s0;
         dat->headers->d[2] = ds;
+
         sep_set_header(dat, "label1", "Time");
         sep_set_header(dat, "unit1", "s");
+
         if (cmp)
             sep_set_header(dat, "label2", "Offset");
         else
             sep_set_header(dat, "label2", "Receiver");
         sep_set_header(dat, "label3", "Shot");
     }
+
     /* allocate temporary memory */
     out = alloc2float(nzx, ng);
     trace = alloc1float(nt);
+
     stable = alloc1float(nzx);
     stablex = alloc1float(nzx);
     rtable = alloc1float(nzx);
@@ -869,97 +775,87 @@ int main(int argc, char *argv[])
     rtbl1 = alloc1float(nzx);
     rtblx0 = alloc1float(nzx);
     rtblx1 = alloc1float(nzx);
-    if (cig && cig_is_angle) {
-        gsx = alloc1float(nzx);
-        gsz = alloc1float(nzx);
-        grx = alloc1float(nzx);
-        grz = alloc1float(nzx);
-        gsmtmp1 = alloc1float(nzx);
-        gsmtmp2 = alloc1float(nzx);
-    }
     if (use_input_angle_grad) {
         grad_slice0 = alloc1float(nzx);
         grad_slice1 = alloc1float(nzx);
     }
+
     /* type of interpolation, default Hermite */
     if (!se_have_par("type"))
         type = "hermit";
     else
         type = se_get_par_str("type");
+
     if (type[0] != 'l' && type[0] != 'p' && type[0] != 'h') {
         ERROR(("Unknown interpolation type: %s. Supported types are linear (l), partial (p), and hermite (h)", type));
     }
+
     /* initialize interpolation */
     tinterp_init(nzx, sdy, rdy);
+
     /* initialize summation */
     kirmig_init(nt, dt, t0);
+
     if (adj) {
         memset(out[0], 0, nzx * ng * sizeof(float));
     } else {
         sep_read_fromsep(mig, nzx * ng, 0, &out[0], NULL);
     }
+
     auto t_start = std::chrono::steady_clock::now();
+
     /* determine number of threads without a data race */
 #ifdef _OPENMP
     nthr = omp_get_max_threads();
 #else
     nthr = 1;
 #endif
+
     INFO((">>Using %d threads<<\n", nthr));
+
     if (!adj) {
         traces = alloc2float(nt, nthr);
     }
+
     for (is = 0; is < ns; is++) { /* shot */
         s = s0 + is * ds;
         INFO(("shot %d of %d;", is + 1, ns));
-        /*
-         * Interpolate source traveltime at the actual source coordinate.
-         * Use floor rather than integer truncation so coordinates below sy0
-         * are handled correctly, and do not skip the first table interval.
-         */
-        if (sny <= 1 || sdy == 0.0f) {
-            ist = 0;
+
+        /* cubic Hermite spline interpolation of source traveltime */
+        ist = (int)((s - sy0) / sdy);
+        if (ist <= 0) {
             load_table_slice(stim, 0, stbl0, nzx, &stbl0_idx, "stable");
             load_table_slice(sder, 0, stblx0, nzx, &stblx0_idx, "sderiv");
             copy_n(stable, stbl0, nzx);
             copy_n(stablex, stblx0, nzx);
+        } else if (ist >= sny - 1) {
+            load_table_slice(stim, sny - 1, stbl0, nzx, &stbl0_idx, "stable");
+            load_table_slice(sder, sny - 1, stblx0, nzx, &stblx0_idx, "sderiv");
+            copy_n(stable, stbl0, nzx);
+            copy_n(stablex, stblx0, nzx);
         } else {
-            const float sf = (s - sy0) / sdy;
-            ist = (int)floorf(sf);
-            if (sf <= 0.0f) {
-                ist = 0;
-                load_table_slice(stim, 0, stbl0, nzx, &stbl0_idx, "stable");
-                load_table_slice(sder, 0, stblx0, nzx, &stblx0_idx, "sderiv");
-                copy_n(stable, stbl0, nzx);
-                copy_n(stablex, stblx0, nzx);
-            } else if (sf >= (float)(sny - 1)) {
-                ist = sny - 1;
-                load_table_slice(stim, sny - 1, stbl0, nzx, &stbl0_idx, "stable");
-                load_table_slice(sder, sny - 1, stblx0, nzx, &stblx0_idx, "sderiv");
-                copy_n(stable, stbl0, nzx);
-                copy_n(stablex, stblx0, nzx);
-            } else {
-                const float scoord = s - (sy0 + (float)ist * sdy);
-                load_table_slice(stim, ist, stbl0, nzx, &stbl0_idx, "stable");
-                load_table_slice(stim, ist + 1, stbl1, nzx, &stbl1_idx, "stable");
-                load_table_slice(sder, ist, stblx0, nzx, &stblx0_idx, "sderiv");
-                load_table_slice(sder, ist + 1, stblx1, nzx, &stblx1_idx, "sderiv");
-                switch (type[0]) {
-                case 'l': /* linear */
-                    tinterp_linear(true, stable, scoord, stbl0, stbl1);
-                    dinterp_linear(true, stablex, scoord, stbl0, stbl1);
-                    break;
-                case 'p': /* partial */
-                    tinterp_partial(true, stable, scoord, nz, nx, dx, stbl0, stbl1);
-                    dinterp_partial(true, stablex, scoord, nz, nx, dx, stbl0, stbl1);
-                    break;
-                case 'h': /* Hermite */
-                    tinterp_hermite(true, stable, scoord, stbl0, stbl1, stblx0, stblx1);
-                    dinterp_hermite(true, stablex, scoord, stbl0, stbl1, stblx0, stblx1);
-                    break;
-                }
+            load_table_slice(stim, ist, stbl0, nzx, &stbl0_idx, "stable");
+            load_table_slice(stim, ist + 1, stbl1, nzx, &stbl1_idx, "stable");
+            load_table_slice(sder, ist, stblx0, nzx, &stblx0_idx, "sderiv");
+            load_table_slice(sder, ist + 1, stblx1, nzx, &stblx1_idx, "sderiv");
+            switch (type[0]) {
+            case 'l': /* linear */
+                tinterp_linear(true, stable, s - ist * sdy - sy0, stbl0, stbl1);
+                dinterp_linear(true, stablex, s - ist * sdy - sy0, stbl0, stbl1);
+                break;
+
+            case 'p': /* partial */
+                tinterp_partial(true, stable, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
+                dinterp_partial(true, stablex, s - ist * sdy - sy0, nz, nx, dx, stbl0, stbl1);
+                break;
+
+            case 'h': /* Hermite */
+                tinterp_hermite(true, stable, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
+                dinterp_hermite(true, stablex, s - ist * sdy - sy0, stbl0, stbl1, stblx0, stblx1);
+                break;
             }
         }
+
         if (use_input_angle_grad) {
             interp_volume_linear_stream(sgradx, sgradx_fp, sny, nzx, s, sy0, sdy,
                                         grad_slice0, grad_slice1, "sgradx");
@@ -967,41 +863,21 @@ int main(int argc, char *argv[])
                                         grad_slice0, grad_slice1, "sgradz");
         }
 
-        /*
-         * Stabilized SOURCE gradient field (depends only on this shot, so build
-         * it once per shot rather than once per trace).
-         */
-        if (cig && cig_is_angle) {
-            if (use_input_angle_grad) {
-                copy_n(gsx, sgradx, nzx);
-                copy_n(gsz, sgradz, nzx);
-            } else {
-                compute_grad_plane(stable, nz, nx, dz, dx, angle_grad_radius, gsx, gsz);
-            }
-            if (angle_smooth > 0) {
-                smooth_grad_component(gsx, nz, nx, angle_smooth, angle_smooth, gsmtmp1, gsmtmp2);
-                smooth_grad_component(gsz, nz, nx, angle_smooth, angle_smooth, gsmtmp1, gsmtmp2);
-            }
-        }
-
         for (ih = 0; ih < nh; ih++) { /* offset or receiver */
             h = h0 + ih * dh;
-            /*
-             * Receiver-table coordinate.  Keep both the physical receiver
-             * position and its table index so interpolation and aperture
-             * checks use a consistent definition.
-             */
-            const float receiver_pos = cmp ? (s + h) : h;
-            float rf = 0.0f;
-            if (rny > 1 && rdy != 0.0f)
-                rf = (receiver_pos - ry0) / rdy;
-            iht = (rny > 1 && rdy != 0.0f) ? (int)floorf(rf) : 0;
+
+            /* cubic Hermite spline interpolation of receiver traveltime */
+            iht = cmp ? (int)((s + h - ry0) / rdy) : (int)((h - ry0) / rdy);
+
             float trace_ap_weight = 1.0f;
+
             if (adj) {
                 /* read trace first to keep the input I/O position correct */
                 se_fsio_read_float(dat->data->io, trace, nt);
+
                 if (direct_mute && is == direct_mute_qc_shot)
                     se_fsio_write_float(mute_before->data->io, trace, nt);
+
                 if (direct_mute) {
                     const float receiver_x = cmp ? (s + h) : h;
                     apply_direct_wave_mute(
@@ -1009,19 +885,25 @@ int main(int argc, char *argv[])
                         direct_mute_slope, direct_mute_intercept,
                         direct_mute_taper, direct_mute_invert);
                 }
+
                 if (direct_mute && is == direct_mute_qc_shot)
                     se_fsio_write_float(mute_after->data->io, trace, nt);
+
                 trace_ap_weight = 1.0f;
                 if (aperture_trace != -1) {
                     const float ad = fabsf((float)(iht - ist));
+
                     if (ad >= (float)aperture_trace)
                         continue;
+
                     if (aperture_trace_taper > 0) {
                         const float taper_begin =
                             MAX(0.0f, (float)(aperture_trace - aperture_trace_taper));
+
                         if (ad > taper_begin) {
                             const float denom =
                                 (float)aperture_trace - taper_begin;
+
                             if (denom > 0.0f) {
                                 const float x = (ad - taper_begin) / denom;
                                 trace_ap_weight =
@@ -1030,30 +912,37 @@ int main(int argc, char *argv[])
                         }
                     }
                 }
+
                 if (cig && !cig_is_angle) {
                     ig_offset = value_to_nearest_bin(h, cig0, dcig, ng);
                     if (ig_offset < 0) continue;
                 } else {
                     ig_offset = 0;
                 }
+
                 doubint(nt, trace);
+
                 if (isdiff == 1) {
                     diff2(trace, nt, dt);
                 }
             } else {
                 if (aperture_trace != -1) {
                     const float ad = fabsf((float)(iht - ist));
+
                     if (ad >= (float)aperture_trace) {
                         for (i = 0; i < nt; i++) trace[i] = 0.0f;
                         se_fsio_write_float(dat->data->io, trace, nt);
                         continue;
                     }
+
                     if (aperture_trace_taper > 0) {
                         const float taper_begin =
                             MAX(0.0f, (float)(aperture_trace - aperture_trace_taper));
+
                         if (ad > taper_begin) {
                             const float denom =
                                 (float)aperture_trace - taper_begin;
+
                             if (denom > 0.0f) {
                                 const float x = (ad - taper_begin) / denom;
                                 trace_ap_weight =
@@ -1062,6 +951,7 @@ int main(int argc, char *argv[])
                         }
                     }
                 }
+
                 if (cig && !cig_is_angle) {
                     ig_offset = value_to_nearest_bin(h, cig0, dcig, ng);
                     if (ig_offset < 0) {
@@ -1078,20 +968,19 @@ int main(int argc, char *argv[])
                     }
                 }
             }
-            if (rny <= 1 || rdy == 0.0f || rf <= 0.0f) {
-                iht = 0;
+
+            if (iht <= 0) {
                 load_table_slice(rtim, 0, rtbl0, nzx, &rtbl0_idx, "rtable");
                 load_table_slice(rder, 0, rtblx0, nzx, &rtblx0_idx, "rderiv");
                 copy_n(rtable, rtbl0, nzx);
                 copy_n(rtablex, rtblx0, nzx);
-            } else if (rf >= (float)(rny - 1)) {
-                iht = rny - 1;
+            } else if (iht >= rny - 1) {
                 load_table_slice(rtim, rny - 1, rtbl0, nzx, &rtbl0_idx, "rtable");
                 load_table_slice(rder, rny - 1, rtblx0, nzx, &rtblx0_idx, "rderiv");
                 copy_n(rtable, rtbl0, nzx);
                 copy_n(rtablex, rtblx0, nzx);
             } else {
-                const float rcoord = receiver_pos - (ry0 + (float)iht * rdy);
+                float rcoord = cmp ? s + h - iht * rdy - ry0 : h - iht * rdy - ry0;
                 load_table_slice(rtim, iht, rtbl0, nzx, &rtbl0_idx, "rtable");
                 load_table_slice(rtim, iht + 1, rtbl1, nzx, &rtbl1_idx, "rtable");
                 load_table_slice(rder, iht, rtblx0, nzx, &rtblx0_idx, "rderiv");
@@ -1101,36 +990,25 @@ int main(int argc, char *argv[])
                     tinterp_linear(false, rtable, rcoord, rtbl0, rtbl1);
                     dinterp_linear(false, rtablex, rcoord, rtbl0, rtbl1);
                     break;
+
                 case 'p': /* partial */
                     tinterp_partial(false, rtable, rcoord, nz, nx, dx, rtbl0, rtbl1);
                     dinterp_partial(false, rtablex, rcoord, nz, nx, dx, rtbl0, rtbl1);
                     break;
+
                 case 'h': /* Hermite */
                     tinterp_hermite(false, rtable, rcoord, rtbl0, rtbl1, rtblx0, rtblx1);
                     dinterp_hermite(false, rtablex, rcoord, rtbl0, rtbl1, rtblx0, rtblx1);
                     break;
                 }
             }
+
             if (use_input_angle_grad) {
-                const float rpos = receiver_pos;
+                float rpos = cmp ? (s + h) : h;
                 interp_volume_linear_stream(rgradx, rgradx_fp, rny, nzx, rpos, ry0, rdy,
                                             grad_slice0, grad_slice1, "rgradx");
                 interp_volume_linear_stream(rgradz, rgradz_fp, rny, nzx, rpos, ry0, rdy,
                                             grad_slice0, grad_slice1, "rgradz");
-            }
-
-            /* Stabilized RECEIVER gradient field (rebuilt for each trace). */
-            if (cig && cig_is_angle) {
-                if (use_input_angle_grad) {
-                    copy_n(grx, rgradx, nzx);
-                    copy_n(grz, rgradz, nzx);
-                } else {
-                    compute_grad_plane(rtable, nz, nx, dz, dx, angle_grad_radius, grx, grz);
-                }
-                if (angle_smooth > 0) {
-                    smooth_grad_component(grx, nz, nx, angle_smooth, angle_smooth, gsmtmp1, gsmtmp2);
-                    smooth_grad_component(grz, nz, nx, angle_smooth, angle_smooth, gsmtmp1, gsmtmp2);
-                }
             }
 
 #ifdef _OPENMP
@@ -1144,66 +1022,68 @@ int main(int argc, char *argv[])
 #endif
                 iz = i % nz;
                 ix = (i - iz) / nz;
-                /*
-                 * Vertical distance from the current datum.  At iz=0 use a
-                 * tiny positive denominator instead of dividing by zero.  This
-                 * preserves the original aperture behavior at the datum while
-                 * avoiding inf/NaN arithmetic and does not create a blank row
-                 * at recursive layer boundaries.
-                 */
-                const float zdist = MAX(
-                    fabsf((float)iz * dz),
-                    MAX(1.0e-12f, 1.0e-6f * fabsf(dz)));
+
                 /* aperture, cone angle */
                 if (cmp) {
                     if (h >= 0.0f) {
-                        if (atanf((s - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((s - x0 - ix * dx) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
-                        if (atanf((x0 + ix * dx - s - h) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((x0 + ix * dx - s - h) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
                     } else {
-                        if (atanf((s + h - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((s + h - x0 - ix * dx) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
-                        if (atanf((x0 + ix * dx - s) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((x0 + ix * dx - s) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
                     }
                 } else {
                     if (h - s >= 0.0f) {
-                        if (atanf((s - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((s - x0 - ix * dx) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
-                        if (atanf((x0 + ix * dx - h) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((x0 + ix * dx - h) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
                     } else {
-                        if (atanf((h - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((h - x0 - ix * dx) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
-                        if (atanf((x0 + ix * dx - s) / zdist) * 180.0f / (float)M_PI > aper)
+                        if (atanf((x0 + ix * dx - s) / (iz * dz)) * 180.0f / (float)M_PI > aper)
                             continue;
                     }
                 }
+
                 t1 = stable[i];
                 t2 = rtable[i];
                 ti = t1 + t2 + tau;
+
                 tx = MAX(fabsf(stablex[i] * ds), fabsf(rtablex[i] * dh));
+
                 if (cig && cig_is_angle) {
-                    angle = scattering_angle_deg_from_grad(
-                        gsx[i], gsz[i], grx[i], grz[i], half_angle);
+                    if (use_input_angle_grad) {
+                        angle = half_opening_angle_deg_from_grad(
+                            sgradx[i], sgradz[i], rgradx[i], rgradz[i]);
+                    } else {
+                        angle = half_opening_angle_deg_from_tables(
+                            stable, rtable, nz, nx, iz, ix, dx, dz,
+                            angle_grad_radius);
+                    }
 
                     const float aw =
                         angle_taper_weight(
                             angle, angle_taper_start, angle_taper_end) *
-                        angle_depth_mute_weight(
-                            angle, iz, nz, oazmin, oazmax, oaztaper) *
                         trace_ap_weight;
+
                     if (aw <= 0.0f) continue;
+
                     if (angle_interp) {
                         int ig0_local = -1, ig1_local = -1;
                         float w0_local = 0.0f, w1_local = 0.0f;
+
                         if (!value_to_linear_bins(
                                 angle, cig0, dcig, ng,
                                 &ig0_local, &ig1_local,
                                 &w0_local, &w1_local)) {
                             continue;
                         }
+
                         if (adj) {
                             /*
                              * First evaluate the Kirchhoff sample once, then
@@ -1214,6 +1094,7 @@ int main(int argc, char *argv[])
                             float picked = 0.0f;
                             kirmig_pick(1, ti, tx * aal, &picked, trace);
                             picked *= aw;
+
                             out[ig0_local][i] += w0_local * picked;
                             if (ig1_local != ig0_local && w1_local > 0.0f)
                                 out[ig1_local][i] += w1_local * picked;
@@ -1225,6 +1106,7 @@ int main(int argc, char *argv[])
                              */
                             float v0 = aw * w0_local * out[ig0_local][i];
                             kirmig_pick(0, ti, tx * aal, &v0, traces[ithr]);
+
                             if (ig1_local != ig0_local && w1_local > 0.0f) {
                                 float v1 = aw * w1_local * out[ig1_local][i];
                                 kirmig_pick(0, ti, tx * aal, &v1, traces[ithr]);
@@ -1233,6 +1115,7 @@ int main(int argc, char *argv[])
                     } else {
                         ig = value_to_nearest_bin(angle, cig0, dcig, ng);
                         if (ig < 0) continue;
+
                         if (adj) {
                             float picked = 0.0f;
                             kirmig_pick(1, ti, tx * aal, &picked, trace);
@@ -1247,6 +1130,7 @@ int main(int argc, char *argv[])
                         ig = ig_offset;
                     else
                         ig = 0;
+
                     if (adj) {
                         float picked = 0.0f;
                         kirmig_pick(1, ti, tx * aal, &picked, trace);
@@ -1257,6 +1141,7 @@ int main(int argc, char *argv[])
                     }
                 }
             }
+
             if (!adj) {
                 for (i = 0; i < nt; i++) {
                     trace[i] = 0.0f;
@@ -1271,12 +1156,15 @@ int main(int argc, char *argv[])
             }
         } /* ih */
     }
+
     INFO(("FINISH."));
     auto t_end = std::chrono::steady_clock::now();
     double elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
     INFO(("Done. Elapsed time: %.3f s.", elapsed_seconds));
+
     if (adj)
         se_fsio_write_float(mig->data->io, out[0], nzx * ng);
+
     se_par_destroy();
     sep_close(dat);
     sep_close(mig);
@@ -1290,6 +1178,7 @@ int main(int argc, char *argv[])
     if (rgradz_fp) sep_close(rgradz_fp);
     if (mute_before) sep_close(mute_before);
     if (mute_after) sep_close(mute_after);
+
     if (traces) free2float(traces);
     if (out) free2float(out);
     if (trace) free1float(trace);
@@ -1307,15 +1196,11 @@ int main(int argc, char *argv[])
     if (rtblx1) free1float(rtblx1);
     if (grad_slice0) free1float(grad_slice0);
     if (grad_slice1) free1float(grad_slice1);
-    if (gsx) free1float(gsx);
-    if (gsz) free1float(gsz);
-    if (grx) free1float(grx);
-    if (grz) free1float(grz);
-    if (gsmtmp1) free1float(gsmtmp1);
-    if (gsmtmp2) free1float(gsmtmp2);
+
     if (sgradx) free1float(sgradx);
     if (sgradz) free1float(sgradz);
     if (rgradx) free1float(rgradx);
     if (rgradz) free1float(rgradz);
+
     return 0;
 }

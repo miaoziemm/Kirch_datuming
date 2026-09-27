@@ -24,7 +24,7 @@ namespace sewave
         inline int idx(int iz, int ix, int nz) { return ix * nz + iz; }
         float ricker(float t, float f)
         {
-            float tau = t - 1.5f / f;
+            float tau = t - 1.0f / f;
             float a = PI * f * tau;
             return (1.0f - 2.0f * a * a) * std::exp(-a * a);
         }
@@ -315,6 +315,98 @@ namespace sewave
                 }
         }
 
+        // Smooth first-arrival/direct-wave mute used only during RTM data loading.
+        // The mute removes the strong coherent energy that otherwise correlates with
+        // the source wavefield and produces broad arcs / false horizontal events.
+        inline float direct_wave_mute_weight(float t, float t_direct, float fdom)
+        {
+            const float period = 1.0f / std::max(fdom, 1.0f);
+            const float mute_end = t_direct + 0.75f * period;
+            const float taper = 1.50f * period;
+            if (t <= mute_end)
+                return 0.0f;
+            if (t >= mute_end + taper)
+                return 1.0f;
+            const float a = (t - mute_end) / taper;
+            return 0.5f - 0.5f * std::cos(PI * a);
+        }
+
+        // Conservative low-wavenumber filter for the final stacked RTM image.
+        // It targets the long-wavelength back-scattering / source-receiver
+        // correlation noise while leaving the band-limited reflector wavenumbers
+        // essentially unchanged.
+        void suppress_low_wavenumber_rtm_noise(const Grid2D &g, float fdom,
+                                                const std::vector<float> &vel,
+                                                std::vector<float> &image)
+        {
+            if (image.empty() || g.nx < 4 || g.nz < 4 || g.dx <= 0.0f || g.dz <= 0.0f)
+                return;
+
+            const float vmax = *std::max_element(vel.begin(), vel.end());
+            if (vmax <= 0.0f || fdom <= 0.0f)
+                return;
+
+            const int nx = g.nx;
+            const int nz = g.nz;
+            const int nc = nz / 2 + 1;
+            const int n = nx * nz;
+            std::vector<float> in(image), out((size_t)n, 0.0f);
+            std::vector<fftwf_complex> spec((size_t)nx * nc);
+
+            fftwf_plan pf = nullptr, pb = nullptr;
+#pragma omp critical(sewave_fftw_plan)
+            {
+                pf = fftwf_plan_dft_r2c_2d(nx, nz, in.data(), spec.data(), FFTW_ESTIMATE);
+                pb = fftwf_plan_dft_c2r_2d(nx, nz, spec.data(), out.data(), FFTW_ESTIMATE);
+            }
+            if (!pf || !pb)
+            {
+#pragma omp critical(sewave_fftw_plan)
+                {
+                    if (pf) fftwf_destroy_plan(pf);
+                    if (pb) fftwf_destroy_plan(pb);
+                }
+                return;
+            }
+
+            fftwf_execute(pf);
+
+            // The migrated reflector generally carries approximately twice the
+            // propagation wavenumber.  A cutoff at 0.45*kdom is therefore well
+            // below the principal reflector band but removes broad RTM artifacts.
+            const float kdom = 2.0f * PI * fdom / vmax;
+            const float kc = std::max(1.0e-8f, 0.45f * kdom);
+            const float kc2 = kc * kc;
+
+            for (int ix = 0; ix < nx; ++ix)
+            {
+                const float kx = 2.0f * PI * (ix <= nx / 2 ? ix : ix - nx) / (nx * g.dx);
+                for (int iz = 0; iz < nc; ++iz)
+                {
+                    const float kz = 2.0f * PI * iz / (nz * g.dz);
+                    const float k2 = kx * kx + kz * kz;
+                    // Second-order smooth high-pass: H = k^4 / (k^4 + kc^4).
+                    const float k4 = k2 * k2;
+                    const float kc4 = kc2 * kc2;
+                    const float h = k4 / (k4 + kc4 + 1.0e-30f);
+                    const size_t si = (size_t)ix * nc + iz;
+                    spec[si][0] *= h;
+                    spec[si][1] *= h;
+                }
+            }
+
+            fftwf_execute(pb);
+            const float scale = 1.0f / n;
+            for (int i = 0; i < n; ++i)
+                image[(size_t)i] = out[(size_t)i] * scale;
+
+#pragma omp critical(sewave_fftw_plan)
+            {
+                fftwf_destroy_plan(pf);
+                fftwf_destroy_plan(pb);
+            }
+        }
+
         void write_debug_gather(const std::vector<float> &gather, int nx, int nt, float x0, float dx, float dt, const std::string &path)
         {
             sep_t *out = sep_open(path.c_str(), SEP_WRITE, 0);
@@ -525,6 +617,11 @@ namespace sewave
                 else if (receiver_gather)
                 {
                     int rit = nt - it - 1;
+                    // This code reconstructs the receiver wavefield from a recorded
+                    // pressure boundary.  Keep the original Dirichlet boundary
+                    // injection here.  Additive injection at every receiver sample
+                    // repeatedly re-radiates the same trace energy and produces
+                    // strong coherent ringing in the RTM image.
                     for (int ix = e.nbc; ix < e.nx - e.nbc; ++ix)
                         cur[idx(srcz, ix, e.nz)] = (*inject)[(size_t)(ix - e.nbc) * nt + rit];
                 }
@@ -556,6 +653,7 @@ namespace sewave
                         }
                     }
                 absorb(e, nxt, cur, old, dt);
+
                 old.swap(cur);
                 cur.swap(nxt);
                 maybe_write_debug_snapshot(e, debug_grid, cur, it + 1, debug_steps, debug_prefix, debug_kind, debug_shot);
@@ -793,10 +891,15 @@ namespace sewave
             int six = six0 + e.nbc, siz = siz0 + e.nbc;
             if (p.flag_homo)
                 apply_homo(e, six, siz);
+            // Use the original source prescription for RTM source-wavefield
+            // reconstruction.  The previous additive change increased coherent
+            // source-side ringing for this data set.
             propagate(e, data.nt, data.dt, p.type_compute_laplace, true, amp_sign, six, siz, siz, false, p.progress_interval, src_label, &src, nullptr, p.in_memory_snapshots ? &snaps : nullptr, nullptr, nullptr, snap_tmp, nullptr,
                       snapshot_interval, src_snapshot_offset, snapshot_interval, src_snapshot_offset,
                       &vel, &p.debug_snapshot_steps, &p.debug_wavefield_prefix, "src", is);
             int skipped_receivers = 0;
+            const int irz0 = zindex(vel, p.rz);
+            const float vsrc_surface = std::max(1.0f, vel.v[idx(irz0, six0, vel.nz)]);
             for (int ir = 0; ir < data.nr; ++ir)
             {
                 float rx = p.cmp ? sx + data.r0 + ir * data.dr : data.r0 + ir * data.dr;
@@ -806,8 +909,22 @@ namespace sewave
                     ++skipped_receivers;
                     continue;
                 }
+
+                // Estimate the surface direct-arrival time from the local source/
+                // receiver velocities and apply a smooth top mute.  This is only
+                // used for RTM back propagation; the input RSF is not modified.
+                const float vrec_surface = std::max(1.0f, vel.v[idx(irz0, ix, vel.nz)]);
+                const float vdirect = 0.5f * (vsrc_surface + vrec_surface);
+                const float dxsr = rx - sx;
+                const float dzsr = p.rz - p.sz;
+                const float t_direct = std::sqrt(dxsr * dxsr + dzsr * dzsr) / std::max(vdirect, 1.0f);
                 for (int it = 0; it < data.nt; ++it)
-                    shot[(size_t)ix * data.nt + it] += data.d[((size_t)is * data.nr + ir) * data.nt + it];
+                {
+                    const float t = data.t0 + it * data.dt;
+                    const float w = direct_wave_mute_weight(t, t_direct, p.fdom);
+                    shot[(size_t)ix * data.nt + it] +=
+                        w * data.d[((size_t)is * data.nr + ir) * data.nt + it];
+                }
             }
             if (skipped_receivers > 0)
                 INFO(("image shot %d: skipped %d receivers outside velocity model", is, skipped_receivers));
@@ -855,6 +972,12 @@ namespace sewave
         else if (stacked_shots < shot1 - shot0 + 1)
             INFO(("image shot stack: stacked %d/%d shots; skipped %d shots outside the velocity model",
                   stacked_shots, shot1 - shot0 + 1, shot1 - shot0 + 1 - stacked_shots));
+
+        if (stacked_shots > 0)
+        {
+            INFO(("RTM artifact suppression: direct-wave top mute enabled; applying conservative low-wavenumber image filter"));
+            suppress_low_wavenumber_rtm_noise(vel, p.fdom, vel.v, image);
+        }
         return image;
     }
 } // namespace sewave

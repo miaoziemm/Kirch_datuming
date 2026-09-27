@@ -46,7 +46,7 @@ typedef struct
 {
     int nt, nh, ns;
     int nsg, nrg;
-    int aper, tap, cmp, verb;
+    int aper, tap, data_tap, cmp, verb;
     int nfft, nw, nsam;
     float dt, df, h0, dh, s0, ds, sg0, dsg, rg0, drg;
     float sdatum, rdatum;
@@ -231,19 +231,51 @@ static inline float antialias_weight_iw(const FreqContext *ctx, int iw, float dt
     return 0.5f * (1.0f + cosf((float)M_PI * x));
 }
 
+// Cosine aperture taper. tap is measured in summation samples;
+// stride converts that width to the coordinate-index spacing.
 static inline float taper_weight(int left, int center, int right, int tap, int stride)
 {
-    if (tap <= 0)
+    if (center < left || center > right) return 0.0f;
+    if (tap <= 0) return 1.0f;
+    if (stride < 1) stride = 1;
+    const float width = (float)tap * (float)stride;
+    const float ul = fminf(1.0f, fmaxf(0.0f, (float)(center - left) / width));
+    const float ur = fminf(1.0f, fmaxf(0.0f, (float)(right - center) / width));
+    return 0.5f * (1.0f - cosf((float)M_PI * ul)) *
+           0.5f * (1.0f - cosf((float)M_PI * ur));
+}
+
+/*
+ * Optional acquisition-edge taper for the input data cube.
+ * data_taper=N applies a half-cosine taper to the first/last N samples
+ * along both the source axis and the receiver/offset axis before FFT.
+ * This is independent of taper=, which tapers each Kirchhoff summation aperture.
+ */
+static inline float data_edge_taper_weight(int i, int n, int tap)
+{
+    if (tap <= 0 || n <= 1)
         return 1.0f;
-    /*
-     * Match kirchdat2d_auto_cs.cpp exactly:
-     *   cmp=0/receiver pass: (ic-left)/tap and (right-ic)/tap (integer division)
-     *   cmp=1/source pass:   (ic-left)/jump/tap and (right-ic)/jump/tap (integer division)
-     * We intentionally keep integer-division semantics here for numerical equivalence.
-     */
-    float wl = (center - left >= tap) ? 1.0f : (float)(((center - left) / stride) / tap);
-    float wr = (right - center >= tap) ? 1.0f : (float)(((right - center) / stride) / tap);
-    return wl * wr;
+
+    int ntap = tap;
+    int max_tap = (n - 1) / 2;
+    if (ntap > max_tap)
+        ntap = max_tap;
+    if (ntap <= 0)
+        return 1.0f;
+
+    if (i < ntap)
+    {
+        float x = (float)i / (float)ntap;
+        return 0.5f * (1.0f - cosf((float)M_PI * x));
+    }
+
+    if (i > n - 1 - ntap)
+    {
+        float x = (float)(n - 1 - i) / (float)ntap;
+        return 0.5f * (1.0f - cosf((float)M_PI * x));
+    }
+
+    return 1.0f;
 }
 
 static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **shot,
@@ -257,10 +289,23 @@ static void read_traces_to_freq(se_fsio *io, const FreqContext *ctx, float **sho
     {
         se_fsio_read_float(io, shot[0], shot_size);
         reverse_traces_2d(ctx->nt, ctx->nh, shot);
+        float ws = data_edge_taper_weight(is, ctx->ns, ctx->data_tap);
         for (int ih = 0; ih < ctx->nh; ih++)
         {
+            float wh = data_edge_taper_weight(ih, ctx->nh, ctx->data_tap);
+            float wd = ws * wh;
+
             memset(pad, 0, (size_t)ctx->nfft * sizeof(float));
-            memcpy(pad, shot[ih], (size_t)ctx->nt * sizeof(float));
+            if (wd == 1.0f)
+            {
+                memcpy(pad, shot[ih], (size_t)ctx->nt * sizeof(float));
+            }
+            else
+            {
+                for (int it = 0; it < ctx->nt; it++)
+                    pad[it] = wd * shot[ih][it];
+            }
+
             fftwf_execute(p_f);
             memcpy(&U[IDX3(is, ih, 0, ctx->nh, ctx->nw)], spec, (size_t)ctx->nw * sizeof(fftwf_complex));
         }
@@ -1212,6 +1257,9 @@ int main(int argc, char **argv)
 
     ctx.aper = se_have_par("aperture") ? se_get_par_int("aperture") : 50;
     ctx.tap = se_have_par("taper") ? se_get_par_int("taper") : 10;
+    ctx.data_tap = se_have_par("data_taper") ? se_get_par_int("data_taper") : 0;
+    if (ctx.data_tap < 0)
+        ERROR(("data_taper must be >= 0."));
     ctx.antialias = se_have_par("antialias") ? se_get_par_float("antialias") : 1.0f;
     if (ctx.antialias < 0.0f)
         ERROR(("antialias must be >= 0."));
@@ -1267,6 +1315,7 @@ int main(int argc, char **argv)
 
     if (ctx.verb)
     {
+        INFO(("data_taper = %d traces on both source and receiver/offset edges; set data_taper=0 to disable.", ctx.data_tap));
         INFO(("antialias = %g; set antialias=0 to disable frequency-domain operator anti-aliasing.", ctx.antialias));
     }
 
