@@ -209,6 +209,30 @@ static float angle_depth_mute_weight(float angle, int iz, int nz,
     const float u = (angle - cutoff) / band;
     return 0.5f * (1.0f + cosf((float)M_PI * u));
 }
+/*
+ * Tapered migration-aperture weight for one ray leg.
+ *
+ * The cone opens downward from the surface point (source or receiver); at an
+ * image point the leg angle from the vertical is
+ *
+ *     leg_angle = atan(|surface_point - x_image| / z_image)  (degrees).
+ *
+ *   leg_angle <= aper - band : weight = 1
+ *   aper-band < leg < aper   : raised-cosine ramp
+ *   leg_angle >= aper        : weight = 0
+ *
+ * band <= 0 reproduces the legacy hard (1/0) aperture.
+ */
+static float aperture_leg_weight(float leg_angle, float aper, float band)
+{
+    if (!isfinite(leg_angle)) return 0.0f;
+    if (band <= 0.0f) return (leg_angle <= aper) ? 1.0f : 0.0f;
+    const float inner = aper - band;
+    if (leg_angle <= inner) return 1.0f;
+    if (leg_angle >= aper) return 0.0f;
+    const float u = (leg_angle - inner) / band;
+    return 0.5f * (1.0f + cosf((float)M_PI * u));
+}
 static void copy_n(float *dst, const float *src, off_t n)
 {
     for (off_t i = 0; i < n; i++) dst[i] = src[i];
@@ -463,6 +487,7 @@ int main(int argc, char *argv[])
     float s = 0.0f, h = 0.0f, h0 = 0.0f, dh = 0.0f, dx = 0.0f;
     float ti = 0.0f, t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, dt = 0.0f, z0 = 0.0f, dz = 0.0f, tau = 0.0f;
     float aal = 0.0f, tx = 0.0f, aper = 0.0f;
+    float aperture_taper = 10.0f; /* 孔径锥的余弦过渡宽度，度；0 = 旧版硬切 */
     float cig0 = 0.0f, dcig = 1.0f, angle = 0.0f;
     float angle_taper_start = -1.0f, angle_taper_end = -1.0f;
     int angle_interp = 1;
@@ -761,6 +786,8 @@ int main(int argc, char *argv[])
         aper = 90.0f;
     else
         aper = se_get_par_float("aperture"); /* migration aperture, in degree */
+    if (se_have_par("aperture_taper"))
+        aperture_taper = se_get_par_float("aperture_taper");
     if (!se_have_par("antialias"))
         aal = 1.0f;
     else
@@ -1154,32 +1181,33 @@ int main(int argc, char *argv[])
                 const float zdist = MAX(
                     fabsf((float)iz * dz),
                     MAX(1.0e-12f, 1.0e-6f * fabsf(dz)));
-                /* aperture, cone angle */
-                if (cmp) {
-                    if (h >= 0.0f) {
-                        if (atanf((s - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                        if (atanf((x0 + ix * dx - s - h) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                    } else {
-                        if (atanf((s + h - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                        if (atanf((x0 + ix * dx - s) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                    }
-                } else {
-                    if (h - s >= 0.0f) {
-                        if (atanf((s - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                        if (atanf((x0 + ix * dx - h) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                    } else {
-                        if (atanf((h - x0 - ix * dx) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                        if (atanf((x0 + ix * dx - s) / zdist) * 180.0f / (float)M_PI > aper)
-                            continue;
-                    }
-                }
+                /*
+                 * Tapered migration aperture.
+                 *
+                 * Two cones open DOWNWARD with their vertices at the surface
+                 * source and receiver positions.  At this image point a leg's
+                 * angle from the vertical is
+                 *
+                 *     leg_angle = atan(|surface_point - x_image| / z_image).
+                 *
+                 * Each leg weight equals 1 inside (aper - aperture_taper),
+                 * follows a raised-cosine ramp across the taper band, and is 0
+                 * beyond aper.  The combined aperture weight is the product of
+                 * both legs, so an image point is used only when BOTH legs lie
+                 * inside their cones.  The traveltime tables themselves are
+                 * left untouched over the full grid.
+                 */
+                const float ximg = x0 + ix * dx;
+                const float rec_surface_x = cmp ? (s + h) : h;
+                const float as_deg =
+                    atanf(fabsf(s - ximg) / zdist) * 180.0f / (float)M_PI;
+                const float ar_deg =
+                    atanf(fabsf(rec_surface_x - ximg) / zdist) *
+                    180.0f / (float)M_PI;
+                const float apw =
+                    aperture_leg_weight(as_deg, aper, aperture_taper) *
+                    aperture_leg_weight(ar_deg, aper, aperture_taper);
+                if (apw <= 0.0f) continue;
                 t1 = stable[i];
                 t2 = rtable[i];
                 ti = t1 + t2 + tau;
@@ -1193,7 +1221,7 @@ int main(int argc, char *argv[])
                             angle, angle_taper_start, angle_taper_end) *
                         angle_depth_mute_weight(
                             angle, iz, nz, oazmin, oazmax, oaztaper) *
-                        trace_ap_weight;
+                        trace_ap_weight * apw;
                     if (aw <= 0.0f) continue;
                     if (angle_interp) {
                         int ig0_local = -1, ig1_local = -1;
@@ -1250,9 +1278,9 @@ int main(int argc, char *argv[])
                     if (adj) {
                         float picked = 0.0f;
                         kirmig_pick(1, ti, tx * aal, &picked, trace);
-                        out[ig][i] += trace_ap_weight * picked;
+                        out[ig][i] += trace_ap_weight * apw * picked;
                     } else {
-                        float v = trace_ap_weight * out[ig][i];
+                        float v = trace_ap_weight * apw * out[ig][i];
                         kirmig_pick(0, ti, tx * aal, &v, traces[ithr]);
                     }
                 }
