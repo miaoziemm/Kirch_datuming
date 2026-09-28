@@ -14,6 +14,58 @@
 #include <omp.h>
 #endif
 
+/*
+ * Branch-aware spatial traveltime gradient along one axis.
+ *
+ * A centered finite difference, (T[i+1]-T[i-1])/(2 d), straddles the
+ * first-arrival crease and averages two different ray branches, which makes
+ * the scattering angle jump.  This routine instead back-traces the ray: it
+ * uses only the axis neighbor with the SMALLER traveltime (an upwind,
+ * one-sided stencil; a 3-point upwind stencil when it stays on the same
+ * branch).  At a crease it therefore follows one ray leg, exactly like the
+ * ray-vector angle used by Madagascar cram.
+ *
+ * Flat indexing is axis0-fast (z): ss0=1, ss1=n1, ss2=n1*n2.
+ */
+static float upwind_grad_axis(const float *t, int i0, int axis,
+                              const int nn[3], const int ss[3],
+                              const float dd[3])
+{
+    int ii[3], i1, i2;
+
+    ii[0] = i0 % nn[0];
+    ii[1] = (i0 / ss[1]) % nn[1];
+    ii[2] = i0 / ss[2];
+
+    const int a = i0 - ss[axis];
+    const int b = i0 + ss[axis];
+
+    if (ii[axis] == 0) {
+        i1 = b;                                   /* boundary: only + side */
+    } else if (ii[axis] != nn[axis] - 1 && t[b] < t[a]) {
+        i1 = b;                                   /* upwind is the + side */
+    } else {
+        i1 = a;                                   /* upwind is the - side */
+    }
+
+    if (!(t[i1] < t[i0])) return 0.0f;            /* no upwind along axis */
+
+    float g;
+    if (i1 == b) {
+        i2 = i1 + ss[axis];
+        if (ii[axis] < nn[axis] - 2 && t[i2] < t[i1])
+            g = (-t[i2] + 4.0f * t[i1] - 3.0f * t[i0]) / (2.0f * dd[axis]);
+        else
+            g = (t[i1] - t[i0]) / dd[axis];
+    } else {
+        i2 = i1 - ss[axis];
+        if (ii[axis] > 1 && t[i2] < t[i1])
+            g = (3.0f * t[i0] - 4.0f * t[i1] + t[i2]) / (2.0f * dd[axis]);
+        else
+            g = (t[i0] - t[i1]) / dd[axis];
+    }
+    return g;
+}
 
 static void write_float_shot_at(sep_t *sep, const float *buf, size_t nsample, int ishot, const char *label)
 {
@@ -106,10 +158,10 @@ int main(int argc, char *argv[])
     size_t n123 = 0;
     float br1 = 0.0f, br2 = 0.0f, br3 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     float **s, *v;
-    const char *sfile = NULL, *in_f = NULL, *out_f = NULL, *tdl1_f = NULL, *tds1_f = NULL, *tdl2_f = NULL, *tds2_f = NULL;
+    const char *sfile = NULL, *in_f = NULL, *out_f = NULL, *gradz_f = NULL, *gradx_f = NULL, *tdl1_f = NULL, *tds1_f = NULL, *tdl2_f = NULL, *tds2_f = NULL;
     bool isvel = true, plane[3] = {false, false, false};
     int efmm = 0;
-    sep_t *vel = NULL, *time = NULL, *shots = NULL, *tdl1 = NULL, *tds1 = NULL, *tdl2 = NULL, *tds2 = NULL;
+    sep_t *vel = NULL, *time = NULL, *shots = NULL, *gradz = NULL, *gradx = NULL, *tdl1 = NULL, *tds1 = NULL, *tdl2 = NULL, *tds2 = NULL;
 
     se_par_init(argc, argv);
 
@@ -316,6 +368,22 @@ int main(int argc, char *argv[])
     tdl1->headers->ndim = 3;
     tds1->headers->ndim = 3;
 
+    /* Optional branch-aware spatial gradients of the traveltime, computed by
+       an upwind (ray-backtracing) stencil: gradz=dT/dz, gradx=dT/dx. These
+       feed the scattering-angle classification directly. */
+    if (se_have_par("gradz"))
+    {
+        gradz_f = se_get_par_str("gradz");
+        gradz = sep_open(gradz_f, SEP_WRITE, 0);
+        gradz->headers->ndim = 3;
+    }
+    if (se_have_par("gradx"))
+    {
+        gradx_f = se_get_par_str("gradx");
+        gradx = sep_open(gradx_f, SEP_WRITE, 0);
+        gradx->headers->ndim = 3;
+    }
+
     /* second-order derivative */
     if (se_have_par("tdl2"))
     {
@@ -366,6 +434,31 @@ int main(int argc, char *argv[])
     tds1->headers->d[2] = dshot;
     tds1->headers->o[2] = oshot;
 
+    if (gradz != NULL)
+    {
+        gradz->headers->n[0] = n1;
+        gradz->headers->d[0] = d1;
+        gradz->headers->o[0] = o1;
+        gradz->headers->n[1] = n2;
+        gradz->headers->d[1] = d2;
+        gradz->headers->o[1] = o2;
+        gradz->headers->n[2] = nshot;
+        gradz->headers->d[2] = dshot;
+        gradz->headers->o[2] = oshot;
+    }
+    if (gradx != NULL)
+    {
+        gradx->headers->n[0] = n1;
+        gradx->headers->d[0] = d1;
+        gradx->headers->o[0] = o1;
+        gradx->headers->n[1] = n2;
+        gradx->headers->d[1] = d2;
+        gradx->headers->o[1] = o2;
+        gradx->headers->n[2] = nshot;
+        gradx->headers->d[2] = dshot;
+        gradx->headers->o[2] = oshot;
+    }
+
     if (tdl2 != NULL)
     {
         tdl2->headers->n[0] = n1;
@@ -394,6 +487,10 @@ int main(int argc, char *argv[])
     preallocate_float_output(time, n123, nshot, "time");
     preallocate_float_output(tdl1, n123, nshot, "tdl1");
     preallocate_float_output(tds1, n123, nshot, "tds1");
+    if (gradz != NULL)
+        preallocate_float_output(gradz, n123, nshot, "gradz");
+    if (gradx != NULL)
+        preallocate_float_output(gradx, n123, nshot, "gradx");
     if (tdl2 != NULL)
         preallocate_float_output(tdl2, n123, nshot, "tdl2");
     if (tds2 != NULL)
@@ -415,12 +512,16 @@ int main(int argc, char *argv[])
     size_t buffer_limit = (size_t)buffer_mb * 1024u * 1024u;
     const bool buffered_output = (buffer_limit > 0 && buffered_bytes <= buffer_limit);
 
-    std::vector<float> time_all, dl1_all, ds1_all, dl2_all, ds2_all;
+    std::vector<float> time_all, gzall, gxall, dl1_all, ds1_all, dl2_all, ds2_all;
     if (buffered_output)
     {
         time_all.resize(samples_total);
         dl1_all.resize(samples_total);
         ds1_all.resize(samples_total);
+        if (gradz != NULL)
+            gzall.resize(samples_total);
+        if (gradx != NULL)
+            gxall.resize(samples_total);
         if (tdl2 != NULL)
             dl2_all.resize(samples_total);
         if (tds2 != NULL)
@@ -446,6 +547,11 @@ int main(int argc, char *argv[])
             efmm_eikods_init(n3, n2, n1);
 
         std::vector<float> t(n123), dl1(n123), ds1(n123);
+        std::vector<float> gz, gx;         /* branch-aware spatial gradients */
+        if (gradz != NULL)
+            gz.resize(n123);
+        if (gradx != NULL)
+            gx.resize(n123);
         std::vector<float> dl2_buf, ds2_buf;
         if (tdl2 != NULL || tds2 != NULL)
         {
@@ -476,12 +582,34 @@ int main(int argc, char *argv[])
                        dl2_buf.empty() ? NULL : dl2_buf.data(),
                        ds2_buf.empty() ? NULL : ds2_buf.data());
 
+            /* Branch-aware spatial gradients via upwind (ray-backtracing)
+               stencils. At a first-arrival crease each component uses only
+               the smaller-traveltime neighbor, so it follows the correct ray
+               leg instead of straddling it like a centered FD. */
+            if (gradz != NULL || gradx != NULL)
+            {
+                const int nn[3] = {n1, n2, n3};
+                const int ss[3] = {1, n1, n1 * n2};
+                const float dd[3] = {d1, d2, d3};
+                for (int q = 0; q < (int)n123; q++)
+                {
+                    if (gradz != NULL)
+                        gz[q] = upwind_grad_axis(t.data(), q, 0, nn, ss, dd);
+                    if (gradx != NULL)
+                        gx[q] = upwind_grad_axis(t.data(), q, 1, nn, ss, dd);
+                }
+            }
+
             if (buffered_output)
             {
                 const size_t off = (size_t)is * n123;
                 std::copy(t.begin(), t.end(), time_all.begin() + off);
                 std::copy(dl1.begin(), dl1.end(), dl1_all.begin() + off);
                 std::copy(ds1.begin(), ds1.end(), ds1_all.begin() + off);
+                if (gradz != NULL)
+                    std::copy(gz.begin(), gz.end(), gzall.begin() + off);
+                if (gradx != NULL)
+                    std::copy(gx.begin(), gx.end(), gxall.begin() + off);
                 if (tdl2 != NULL)
                     std::copy(dl2_buf.begin(), dl2_buf.end(), dl2_all.begin() + off);
                 if (tds2 != NULL)
@@ -492,6 +620,10 @@ int main(int argc, char *argv[])
                 write_float_shot_at(time, t.data(), n123, is, "time");
                 write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
                 write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+                if (gradz != NULL)
+                    write_float_shot_at(gradz, gz.data(), n123, is, "gradz");
+                if (gradx != NULL)
+                    write_float_shot_at(gradx, gx.data(), n123, is, "gradx");
                 if (tdl2 != NULL)
                     write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
                 if (tds2 != NULL)
@@ -511,6 +643,11 @@ int main(int argc, char *argv[])
         efmm_eikods_init(n3, n2, n1);
 
     std::vector<float> t(n123), dl1(n123), ds1(n123);
+    std::vector<float> gz, gx;         /* branch-aware spatial gradients */
+    if (gradz != NULL)
+        gz.resize(n123);
+    if (gradx != NULL)
+        gx.resize(n123);
     std::vector<float> dl2_buf, ds2_buf;
     if (tdl2 != NULL || tds2 != NULL)
     {
@@ -539,12 +676,31 @@ int main(int argc, char *argv[])
                    dl2_buf.empty() ? NULL : dl2_buf.data(),
                    ds2_buf.empty() ? NULL : ds2_buf.data());
 
+        /* Branch-aware spatial gradients via upwind (ray-backtracing). */
+        if (gradz != NULL || gradx != NULL)
+        {
+            const int nn[3] = {n1, n2, n3};
+            const int ss[3] = {1, n1, n1 * n2};
+            const float dd[3] = {d1, d2, d3};
+            for (int q = 0; q < (int)n123; q++)
+            {
+                if (gradz != NULL)
+                    gz[q] = upwind_grad_axis(t.data(), q, 0, nn, ss, dd);
+                if (gradx != NULL)
+                    gx[q] = upwind_grad_axis(t.data(), q, 1, nn, ss, dd);
+            }
+        }
+
         if (buffered_output)
         {
             const size_t off = (size_t)is * n123;
             std::copy(t.begin(), t.end(), time_all.begin() + off);
             std::copy(dl1.begin(), dl1.end(), dl1_all.begin() + off);
             std::copy(ds1.begin(), ds1.end(), ds1_all.begin() + off);
+            if (gradz != NULL)
+                std::copy(gz.begin(), gz.end(), gzall.begin() + off);
+            if (gradx != NULL)
+                std::copy(gx.begin(), gx.end(), gxall.begin() + off);
             if (tdl2 != NULL)
                 std::copy(dl2_buf.begin(), dl2_buf.end(), dl2_all.begin() + off);
             if (tds2 != NULL)
@@ -555,6 +711,10 @@ int main(int argc, char *argv[])
             write_float_shot_at(time, t.data(), n123, is, "time");
             write_float_shot_at(tdl1, dl1.data(), n123, is, "tdl1");
             write_float_shot_at(tds1, ds1.data(), n123, is, "tds1");
+            if (gradz != NULL)
+                write_float_shot_at(gradz, gz.data(), n123, is, "gradz");
+            if (gradx != NULL)
+                write_float_shot_at(gradx, gx.data(), n123, is, "gradx");
             if (tdl2 != NULL)
                 write_float_shot_at(tdl2, dl2_buf.data(), n123, is, "tdl2");
             if (tds2 != NULL)
@@ -571,6 +731,10 @@ int main(int argc, char *argv[])
         write_float_all(time, time_all.data(), n123, nshot, "time");
         write_float_all(tdl1, dl1_all.data(), n123, nshot, "tdl1");
         write_float_all(tds1, ds1_all.data(), n123, nshot, "tds1");
+        if (gradz != NULL)
+            write_float_all(gradz, gzall.data(), n123, nshot, "gradz");
+        if (gradx != NULL)
+            write_float_all(gradx, gxall.data(), n123, nshot, "gradx");
         if (tdl2 != NULL)
             write_float_all(tdl2, dl2_all.data(), n123, nshot, "tdl2");
         if (tds2 != NULL)
@@ -586,6 +750,10 @@ int main(int argc, char *argv[])
     sep_close(time);
     sep_close(tdl1);
     sep_close(tds1);
+    if (gradz != NULL)
+        sep_close(gradz);
+    if (gradx != NULL)
+        sep_close(gradx);
     if (tdl2 != NULL)
         sep_close(tdl2);
     if (tds2 != NULL)
