@@ -233,6 +233,40 @@ static float aperture_leg_weight(float leg_angle, float aper, float band)
     const float u = (leg_angle - inner) / band;
     return 0.5f * (1.0f + cosf((float)M_PI * u));
 }
+/*
+ * Shallow aperture floor: a fixed horizontal disk for one ray leg.
+ *
+ * The downward angle cone narrows to zero at the surface (its half-width is
+ * z*tan(aper)), so a shallow image point is starved of source/receiver fold and
+ * the shallow part of the gather becomes weak.  This disk guarantees a minimum
+ * surface footprint regardless of depth.  d is the horizontal distance from
+ * the surface point (source or receiver) to the image point's x coordinate:
+ *
+ *   d <= rmin - rt : weight = 1
+ *   rmin-rt < d < rmin : raised-cosine ramp
+ *   d >= rmin      : weight = 0
+ *
+ * The leg weight is the UNION (max) of the angle-cone weight and this disk
+ * weight.  At depth the cone is much wider than rmin, so the disk has no effect
+ * there; it only fills in where the cone is shallower than rmin.
+ *
+ * rmin <= 0 disables the floor (returns 0, leaving the cone unchanged).
+ */
+static float aperture_floor_weight(float d, float rmin, float rt)
+{
+    if (rmin <= 0.0f) return 0.0f;
+    if (rt <= 0.0f) return (d <= rmin) ? 1.0f : 0.0f;
+    const float inner = rmin - rt;
+    if (inner <= 0.0f) {
+        if (d >= rmin) return 0.0f;
+        const float u = d / rmin;
+        return 0.5f * (1.0f + cosf((float)M_PI * u));
+    }
+    if (d <= inner) return 1.0f;
+    if (d >= rmin) return 0.0f;
+    const float u = (d - inner) / rt;
+    return 0.5f * (1.0f + cosf((float)M_PI * u));
+}
 static void copy_n(float *dst, const float *src, off_t n)
 {
     for (off_t i = 0; i < n; i++) dst[i] = src[i];
@@ -488,6 +522,8 @@ int main(int argc, char *argv[])
     float ti = 0.0f, t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, dt = 0.0f, z0 = 0.0f, dz = 0.0f, tau = 0.0f;
     float aal = 0.0f, tx = 0.0f, aper = 0.0f;
     float aperture_taper = 10.0f; /* 孔径锥的余弦过渡宽度，度；0 = 旧版硬切 */
+    float aperture_rmin = 0.0f;   /* 浅部孔径地板：最小横向半宽(与x同单位，km)；0=关闭 */
+    float aperture_rtaper = 0.05f;/* 地板半径的余弦过渡宽度(km) */
     float cig0 = 0.0f, dcig = 1.0f, angle = 0.0f;
     float angle_taper_start = -1.0f, angle_taper_end = -1.0f;
     int angle_interp = 1;
@@ -788,6 +824,10 @@ int main(int argc, char *argv[])
         aper = se_get_par_float("aperture"); /* migration aperture, in degree */
     if (se_have_par("aperture_taper"))
         aperture_taper = se_get_par_float("aperture_taper");
+    if (se_have_par("aperture_rmin"))
+        aperture_rmin = se_get_par_float("aperture_rmin");
+    if (se_have_par("aperture_rtaper"))
+        aperture_rtaper = se_get_par_float("aperture_rtaper");
     if (!se_have_par("antialias"))
         aal = 1.0f;
     else
@@ -1199,14 +1239,26 @@ int main(int argc, char *argv[])
                  */
                 const float ximg = x0 + ix * dx;
                 const float rec_surface_x = cmp ? (s + h) : h;
+                const float dsx = fabsf(s - ximg);           /* source horizontal distance */
+                const float drx = fabsf(rec_surface_x - ximg); /* receiver horizontal distance */
                 const float as_deg =
-                    atanf(fabsf(s - ximg) / zdist) * 180.0f / (float)M_PI;
+                    atanf(dsx / zdist) * 180.0f / (float)M_PI;
                 const float ar_deg =
-                    atanf(fabsf(rec_surface_x - ximg) / zdist) *
-                    180.0f / (float)M_PI;
-                const float apw =
-                    aperture_leg_weight(as_deg, aper, aperture_taper) *
-                    aperture_leg_weight(ar_deg, aper, aperture_taper);
+                    atanf(drx / zdist) * 180.0f / (float)M_PI;
+                /*
+                 * Each leg weight is the UNION (max) of the downward angle
+                 * cone and the shallow minimum-radius disk.  The cone governs
+                 * at depth (wide footprint); the disk only fills in at shallow
+                 * depth, where the cone narrows below aperture_rmin and would
+                 * otherwise starve the gather of fold.
+                 */
+                const float ws_leg = MAX(
+                    aperture_leg_weight(as_deg, aper, aperture_taper),
+                    aperture_floor_weight(dsx, aperture_rmin, aperture_rtaper));
+                const float wr_leg = MAX(
+                    aperture_leg_weight(ar_deg, aper, aperture_taper),
+                    aperture_floor_weight(drx, aperture_rmin, aperture_rtaper));
+                const float apw = ws_leg * wr_leg;
                 if (apw <= 0.0f) continue;
                 t1 = stable[i];
                 t2 = rtable[i];

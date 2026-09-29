@@ -483,7 +483,7 @@ static void sep_headers_parse( sep_headers_t* headers,
                c != SEP_EOL && c != SEP_EOT) {
                 ++nontext_counter;
                 if (nontext_counter >= SEP_MAX_NONTEXT_CHARS) {
-                    ERROR(("SEP header parser: too many non-text characters "
+                    WARN(("SEP header parser: too many non-text characters "
                            "found in file %s. Probably this is a binary file.",
                            headers->filename));
                 }
